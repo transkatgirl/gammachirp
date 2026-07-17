@@ -1,0 +1,30 @@
+[package]
+name = "gammachirpy"
+version = "0.1.0"
+edition = "2024"
+description = "Dynamic compressive gammachirp auditory filterbanks"
+license = "Apache-2.0"
+repository = "https://github.com/kyama0321/gammachirpy"
+keywords = ["audio", "auditory", "filterbank", "gammachirp", "dsp"]
+categories = ["multimedia::audio", "science"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE.md",
+    "/README.md",
+    "/src/**/*.rs",
+    "/examples/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/fixtures/*.json",
+    "/tests/*.py",
+]
+
+[dependencies]
+ndarray = "0.17"
+num-complex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+approx = "0.5"
+proptest = "1.11"
+serde_json = "1"

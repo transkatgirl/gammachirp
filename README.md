@@ -1,6 +1,74 @@
-# GammachirPy
+# GammachirPy / `gammachirpy` Rust crate
 
-A Python package of the dynamic compressive gammachirp filterbank
+Dynamic compressive gammachirp filterbanks, now available as a Rust crate as
+well as the original Python implementation.
+
+## Rust crate
+
+The Rust port keeps the original versioned structure:
+
+- `gcfb_v211::{gammachirp, utils, gcfb_v211}` implements sample-by-sample
+  processing.
+- `gcfb_v234::{gammachirp, utils, gcfb_v234}` implements frame processing,
+  audiograms, cochlear hearing loss, synthesis, and envelope-modulation tools.
+
+Filterbank matrices use the same channel-major orientation as Python: rows are
+channels and columns are samples or frames. Parameters are typed structs, and
+invalid inputs return `gammachirpy::Result`.
+
+```rust
+use gammachirpy::gcfb_v234::{GcParam, gcfb_v234};
+
+let input = [1.0, 0.0, 0.0, 0.0];
+let parameters = GcParam {
+    num_ch: 32,
+    out_mid_crct: "No".into(),
+    ..GcParam::default()
+};
+
+let output = gcfb_v234(&input, parameters)?;
+assert_eq!(output.dcgc_out.nrows(), 32);
+# Ok::<(), gammachirpy::Error>(())
+```
+
+Build and test with:
+
+```bash
+cargo test
+cargo doc --no-deps --open
+```
+
+### Rust/Python parity properties
+
+In addition to fixed Python-generated regression fixtures, the integration
+suite generates and shrinks live differential cases with Python as the oracle.
+It covers auditory scales, level calibration, windows, convolution, cepstra,
+framing, gammachirp impulse/frequency responses, asymmetric and compressive
+filters, frequency conversion, field-to-cochlea transfer functions, hearing
+level utilities, and both end-to-end filterbanks.
+
+Activate a Python environment containing NumPy and SciPy, then run:
+
+```bash
+GAMMACHIRPY_REQUIRE_PYTHON=1 cargo test --test python_properties
+```
+
+If that environment's interpreter is not named `python3`, select it explicitly:
+
+```bash
+GAMMACHIRPY_PYTHON=/path/to/python \
+GAMMACHIRPY_REQUIRE_PYTHON=1 \
+cargo test --test python_properties
+```
+
+Without the strict switch, the live suite skips when its Python dependencies
+are unavailable so that the Rust crate can still be tested on its own. CI
+should always set `GAMMACHIRPY_REQUIRE_PYTHON=1` so a missing reference runtime
+is reported as a failure. `PROPTEST_CASES` can raise the generated case count
+for longer stress runs.
+
+The original Python modules, notebooks, reference MATLAB outputs, figures, and
+instructions remain in `gcfb_v211/` and `gcfb_v234/`.
 
 <div style="text-align: center">
     <img src="./figs/gammachirpy_pulse.jpg" width="425px">

@@ -1,0 +1,19 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3b7a3dd52b444bb83436f923db27c5df7a8e027291356d1a4dcaaceaf632d0b0 # shrinks to fs_index = 0, bins_index = 0, calibration_ratio = 0.02, field_index = 0
+cc 9a5fe6630e0f06ba8528504e4d947551a5c4d26fe73ab8c351c3840d2bc9dae2 # shrinks to fs_index = 0, frequency_ratio = 0.015, order = 2.0, bandwidth = 0.65, chirp = 0.0, phase = 0.0, carrier_index = 0, normalize_peak = false
+cc 2221b7430cd1141f650e43bd117b7f0a3c0aaa88f35846c48f265ed4e1b8f749 # shrinks to order = 3.0, b1 = 1.4, c1 = -1.5, b2 = 1.7, c2 = 1.3, ratio = 0.72, fr1 = 100.0
+cc 92aef41a813919c7f66924acbbd059a19a34a235da66bde4a0673bfbf553280f # shrinks to fs_index = 0, frequency_ratios = [0.01], order = 2.0, bandwidth = 0.65, chirp = 0.0, phase = 0.0, bins_index = 0
+cc b7b853f95693ce89f811eaa13ad6ebab82167f4fb7294a492dedf347d2bb9c41 # shrinks to channels = 3, low = 100.0, high = 1000.0, query_position = 0.0, health = 0.05, pins = [0.0], impaired = false
+cc 09cad510b8ebda7e1cb56e39fbde07447fa92ef3a140455c0549e2b9f80b704c # shrinks to fs_index = 0, channels = 1, raw = [(0.025, 1.3, -1.0, 0.65, 1.5, 1.0), (0.025, 1.3, -1.0, 0.65, 1.5, 1.0), (0.025, 1.3, -1.0, 0.65, 1.5, 1.0)], order = 3.0
+cc 288aeec767177bb31048c6fa4d741c2994be3cdc91a2dff774cc9846f5c6d1aa # shrinks to fs_index = 0, channels = 1, raw = [(0.02, 1.2, 0.2), (0.02, 1.2, 0.2), (0.02, 1.2, 0.2)], sequence = [[0.0, 0.0, 0.0]], reverse = false
+cc 1a3523774e046430a2ea266dfbccae69b60b3a81b3cfc2697d0e37ca9a2bf736 # shrinks to signal = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], channels = 3, low = 100.0, high = 1000.0, impaired = false
+cc 7ca6510f9dd756223c74e2949fb4f23ce551c51f6825a13b0223a879a6f31a76 # shrinks to signal = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], channels = 3, low = 100.0, high = 1000.0, control_index = 0
+cc f028d684f128f64c271af69bbbfd72d44c3881d4023a4e18778a03052822f84e # shrinks to frequencies = [0.0], mel = [0.0], signal = [0.0], integer = 1, channels = 2, low = 20.0, span = 50.0
+cc a79a3d6d4f66c3963c203a4de48e416e77acde09a84049bcd04837e9216fa4cf # shrinks to fs = 500.0, frequency_ratios = [0.001], signal = [0.0, 0.0]
+cc 38c6c5cdd992550353487449e44f446d8378996c08379a5703eaae9812e483dd # shrinks to y = [0.0, 0.0, 0.0, 0.0], query_positions = [0.0], signal = [0.0], out_level = 0.0, rms1_spl = 30.0, precise = false, floor_values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], zero_floor = false, hl_index = 0, hl_db = 0.0
+cc 82f042a919279dac37249bc941efdaf20ac1ebc7f99ab7b816aadb1d530baa4d # shrinks to signal = [0.0, 0.0, 0.0], coefficients = [0.0], cepstrum_tail = [], out_level = 0.0, window_selector = 0, window_length = 4, taper_fraction = 0, sigma = 0.5, frame_selector = 0, shift_selector = 0
