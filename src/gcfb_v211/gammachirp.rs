@@ -54,13 +54,20 @@ pub fn gammachirp(
     normalization: Normalization,
 ) -> Result<Gammachirp> {
     if frs.is_empty()
+        || !sr.is_finite()
         || sr <= 0.0
+        || !order_g.is_finite()
         || order_g <= 0.0
+        || !coef_erbw.is_finite()
         || coef_erbw <= 0.0
-        || frs.iter().any(|f| *f <= 0.0)
+        || !coef_c.is_finite()
+        || !phase.is_finite()
+        || frs
+            .iter()
+            .any(|f| !f.is_finite() || *f <= 0.0 || *f >= sr / 2.0)
     {
         return Err(Error::InvalidParameter(
-            "gammachirp frequencies, sample rate, order, and bandwidth must be positive".into(),
+            "gammachirp parameters must be finite, with positive frequencies below Nyquist".into(),
         ));
     }
     let (_, erbw) = freq2erb(frs);
@@ -137,14 +144,31 @@ pub fn gammachirp_frsp(
     phase: f64,
     n_frq_rsl: usize,
 ) -> Result<FrequencyResponse> {
-    if frs.is_empty() || n_frq_rsl < 256 || sr <= 0.0 {
+    if frs.is_empty()
+        || n_frq_rsl < 256
+        || !sr.is_finite()
+        || sr <= 0.0
+        || !order_g.is_finite()
+        || order_g <= 0.0
+        || !phase.is_finite()
+        || frs
+            .iter()
+            .any(|f| !f.is_finite() || *f <= 0.0 || *f >= sr / 2.0)
+    {
         return Err(Error::InvalidParameter(
-            "frequency response requires frequencies, positive sample rate, and at least 256 bins"
-                .into(),
+            "frequency response requires finite positive frequencies below Nyquist, a positive order, and at least 256 bins".into(),
         ));
     }
     let b = broadcast(coef_erbw, frs.len(), "coef_erbw")?;
     let c = broadcast(coef_c, frs.len(), "coef_c")?;
+    if b.iter().any(|value| !value.is_finite() || *value <= 0.0)
+        || c.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidParameter(
+            "gammachirp bandwidths must be finite and positive; chirp coefficients must be finite"
+                .into(),
+        ));
+    }
     let (_, erbw) = freq2erb(frs);
     let freq = Array1::from_iter((0..n_frq_rsl).map(|i| i as f64 / n_frq_rsl as f64 * sr / 2.0));
     let mut amp = Array2::zeros((frs.len(), n_frq_rsl));
@@ -212,5 +236,23 @@ mod tests {
         // The analytic response is unity at f_peak; the sampled grid misses
         // that frequency slightly, matching the Python implementation.
         assert_relative_eq!(max, 0.9976977824713469, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn digital_gammachirp_rejects_frequencies_at_or_above_nyquist() {
+        assert!(
+            gammachirp(
+                &[4000.0],
+                8000.0,
+                4.0,
+                1.019,
+                -2.0,
+                0.0,
+                Carrier::Cosine,
+                Normalization::None,
+            )
+            .is_err()
+        );
+        assert!(gammachirp_frsp(&[5000.0], 8000.0, 4.0, &[1.019], &[-2.0], 0.0, 256).is_err());
     }
 }

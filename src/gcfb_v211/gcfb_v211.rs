@@ -165,9 +165,11 @@ impl AcfStatus {
         if input.len() != channels
             || coefficients.ap.dim() != (channels, taps, sections)
             || taps != 3
+            || self.input_history.dim() != (channels, taps)
+            || self.output_history.dim() != (channels, taps, sections)
         {
             return Err(Error::InvalidParameter(
-                "AC filter input/coefficient dimensions do not match".into(),
+                "AC filter input, coefficient, and state dimensions do not match".into(),
             ));
         }
         self.count += 1;
@@ -227,9 +229,17 @@ pub struct CgcResponse {
 
 /// Fill derived v2.11 parameters and channel responses.
 pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
-    if param.fs <= 0.0 || param.num_ch < 2 || param.num_update_asym_cmp == 0 {
+    if !param.fs.is_finite()
+        || param.fs <= 0.0
+        || param.num_ch < 2
+        || param.num_update_asym_cmp == 0
+        || !param.n.is_finite()
+        || param.n <= 0.0
+        || param.f_range.iter().any(|value| !value.is_finite())
+        || param.f_range[1] >= param.fs / 2.0
+    {
         return Err(Error::InvalidParameter(
-            "sample rate, channel count, and coefficient update period must be positive".into(),
+            "v2.11 requires finite parameters, positive order and sample rate, and a frequency range below Nyquist".into(),
         ));
     }
     let (fr1, erb_rate1) =
@@ -284,13 +294,24 @@ pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
 
 /// Compute coefficients for the four-section asymmetric compensation filterbank.
 pub fn make_asym_cmp_filters_v2(fs: f64, frs: &[f64], b: &[f64], c: &[f64]) -> Result<AcfCoef> {
-    if fs <= 0.0 || frs.is_empty() {
+    if !fs.is_finite()
+        || fs <= 0.0
+        || frs.is_empty()
+        || frs
+            .iter()
+            .any(|frequency| !frequency.is_finite() || *frequency <= 0.0 || *frequency >= fs / 2.0)
+    {
         return Err(Error::InvalidParameter(
-            "filterbank requires frequencies and positive sample rate".into(),
+            "filterbank requires finite positive frequencies below Nyquist".into(),
         ));
     }
     let b = broadcast(b, frs.len(), "b")?;
     let c = broadcast(c, frs.len(), "c")?;
+    if b.iter().chain(&c).any(|value| !value.is_finite()) {
+        return Err(Error::InvalidParameter(
+            "filter coefficients must be finite".into(),
+        ));
+    }
     let (_, erbw) = utils::freq2erb(frs);
     let mut ap = Array3::zeros((frs.len(), 3, 4));
     let mut bz = Array3::zeros((frs.len(), 3, 4));
@@ -329,13 +350,27 @@ pub fn asym_cmp_frsp_v2(
     n_frq_rsl: usize,
     num_filt: usize,
 ) -> Result<AsymCmpResponse> {
-    if n_frq_rsl < 64 || !(1..=4).contains(&num_filt) {
+    if !fs.is_finite()
+        || fs <= 0.0
+        || frs.is_empty()
+        || frs
+            .iter()
+            .any(|frequency| !frequency.is_finite() || *frequency <= 0.0 || *frequency >= fs / 2.0)
+        || n_frq_rsl < 64
+        || !(1..=4).contains(&num_filt)
+    {
         return Err(Error::InvalidParameter(
-            "asymmetric response requires >=64 bins and 1..=4 sections".into(),
+            "asymmetric response requires frequencies below Nyquist, >=64 bins, and 1..=4 sections"
+                .into(),
         ));
     }
     let b = broadcast(b, frs.len(), "b")?;
     let c = broadcast(c, frs.len(), "c")?;
+    if b.iter().chain(&c).any(|value| !value.is_finite()) {
+        return Err(Error::InvalidParameter(
+            "asymmetric response coefficients must be finite".into(),
+        ));
+    }
     let (_, erbw) = utils::freq2erb(frs);
     let freq = Array1::from_iter((0..n_frq_rsl).map(|i| i as f64 / n_frq_rsl as f64 * fs / 2.0));
     let mut acf = Array2::ones((frs.len(), n_frq_rsl));
@@ -534,6 +569,18 @@ pub fn gcfb_v211(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
     let signal_coefficients = if param.ctrl == ControlMode::Static {
         let centers = Array1::from_iter((0..channels).map(|ch| static_frat[ch] * response.fp1[ch]));
         response.fr2 = Array2::from_shape_vec((channels, 1), centers.to_vec()).unwrap();
+        for ch in 0..channels {
+            response.fp2[ch] = fr1_to_fp2(
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                response.b2_val[ch],
+                response.c2_val[ch],
+                static_frat[ch],
+                response.fr1[ch],
+            )?
+            .0;
+        }
         make_asym_cmp_filters_v2(
             param.fs,
             centers.as_slice().unwrap(),
@@ -791,6 +838,22 @@ mod tests {
         let output = gcfb_v211(&[1.0, 0.0, 0.0, 0.0, 0.0], param).unwrap();
         assert_eq!(output.cgc_out.dim(), (4, 5));
         assert!(output.cgc_out.iter().all(|v| v.is_finite()));
+        assert_eq!(output.gc_resp.fr2.dim(), (4, 1));
+        assert!(output.gc_resp.fp2.iter().all(|value| *value > 0.0));
+        for ch in 0..4 {
+            let expected = fr1_to_fp2(
+                output.gc_param.n,
+                output.gc_resp.b1_val[ch],
+                output.gc_resp.c1_val[ch],
+                output.gc_resp.b2_val[ch],
+                output.gc_resp.c2_val[ch],
+                output.gc_resp.fr2[[ch, 0]] / output.gc_resp.fp1[ch],
+                output.gc_resp.fr1[ch],
+            )
+            .unwrap()
+            .0;
+            assert_relative_eq!(output.gc_resp.fp2[ch], expected, epsilon = 1e-9);
+        }
     }
 
     #[test]
@@ -808,5 +871,28 @@ mod tests {
         assert_eq!(output.cgc_out.dim(), (4, 32));
         assert!(output.cgc_out.iter().all(|v| v.is_finite()));
         assert_eq!(output.gc_resp.fr2.dim(), (4, 32));
+    }
+
+    #[test]
+    fn acf_state_rejects_a_coefficient_bank_with_different_dimensions() {
+        let one_channel = make_asym_cmp_filters_v2(8000.0, &[500.0], &[2.17], &[2.2]).unwrap();
+        let two_channels =
+            make_asym_cmp_filters_v2(8000.0, &[500.0, 1000.0], &[2.17], &[2.2]).unwrap();
+        let mut status = AcfStatus::new(&one_channel);
+
+        assert!(status.process(&two_channels, &[1.0, 2.0], false).is_err());
+        assert_eq!(status.count, 0);
+    }
+
+    #[test]
+    fn v211_rejects_a_channel_range_at_or_above_nyquist() {
+        let param = GcParam {
+            fs: 1000.0,
+            num_ch: 2,
+            f_range: [400.0, 600.0],
+            out_mid_crct: "No".into(),
+            ..GcParam::default()
+        };
+        assert!(gcfb_v211(&[1.0, 0.0], param).is_err());
     }
 }

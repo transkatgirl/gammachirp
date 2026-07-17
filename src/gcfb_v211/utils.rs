@@ -26,7 +26,7 @@ pub fn nextpow2(n: usize) -> u32 {
     }
 }
 
-/// Read an uncompressed 16-bit PCM WAV file, normalized to `[-1, 1)`.
+/// Read a mono, uncompressed 16-bit PCM WAV file, normalized to `[-1, 1)`.
 pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
     let mut file = File::open(path)?;
     let mut header = [0_u8; 12];
@@ -36,6 +36,7 @@ pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
     }
     let mut sample_rate = None;
     let mut format = None;
+    let mut channels = None;
     let mut bits = None;
     let mut data = Vec::new();
     loop {
@@ -52,6 +53,7 @@ pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
                     return Err(Error::Wav("short fmt chunk".into()));
                 }
                 format = Some(u16::from_le_bytes(chunk[0..2].try_into().unwrap()));
+                channels = Some(u16::from_le_bytes(chunk[2..4].try_into().unwrap()));
                 sample_rate = Some(u32::from_le_bytes(chunk[4..8].try_into().unwrap()));
                 bits = Some(u16::from_le_bytes(chunk[14..16].try_into().unwrap()));
             }
@@ -67,9 +69,9 @@ pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
             file.seek(SeekFrom::Current(1))?;
         }
     }
-    if format != Some(1) || bits != Some(16) || data.is_empty() {
+    if format != Some(1) || channels != Some(1) || bits != Some(16) || data.is_empty() {
         return Err(Error::Wav(
-            "only non-empty 16-bit PCM WAV files are supported".into(),
+            "only non-empty mono 16-bit PCM WAV files are supported".into(),
         ));
     }
     let samples = data
@@ -114,7 +116,11 @@ pub fn equal_freq_scale(
     num_ch: usize,
     range_freq: [f64; 2],
 ) -> Result<(Array1<f64>, Array1<f64>)> {
-    if num_ch < 2 || range_freq[0] <= 0.0 || range_freq[1] <= range_freq[0] {
+    if num_ch < 2
+        || range_freq.iter().any(|value| !value.is_finite())
+        || range_freq[0] <= 0.0
+        || range_freq[1] <= range_freq[0]
+    {
         return Err(Error::InvalidParameter(
             "frequency scale requires at least two channels and a positive increasing range".into(),
         ));
@@ -423,6 +429,7 @@ pub fn out_mid_crct_filt(kind: &str, sr: f64, filter_type: u8) -> Result<Array1<
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use std::fs;
 
     #[test]
     fn auditory_scale_reference_values() {
@@ -447,5 +454,35 @@ mod tests {
         assert_eq!(centers.as_slice().unwrap(), &[-2, 0, 2]);
         assert_eq!(frames.column(0).to_vec(), vec![0.0, 0.0, 1.0, 2.0]);
         assert_eq!(frames.column(2).to_vec(), vec![3.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn audioread_rejects_stereo_pcm_instead_of_flattening_channels() {
+        let samples = [1000_i16, -1000, 2000, -2000];
+        let data_len = (samples.len() * size_of::<i16>()) as u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&4_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("gammachirpy-stereo-{}.wav", std::process::id()));
+        fs::write(&path, wav).unwrap();
+        let result = audioread(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(result, Err(Error::Wav(message)) if message.contains("mono")));
     }
 }

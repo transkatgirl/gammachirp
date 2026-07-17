@@ -117,7 +117,7 @@ def equal_freq_scale(name_scale, num_ch, range_freq):
 
     elif name_scale == 'ERB':
         range_wf, _ = freq2erb(range_freq)
-        diff_wf = np.diff(range_wf) / (num_ch-1)
+        diff_wf = np.diff(range_wf).item() / (num_ch-1)
         wf_val = np.arange(range_wf[0], range_wf[1]+eps*1000, diff_wf)
         frs, _ = erb2freq(wf_val)
 

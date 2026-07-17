@@ -383,13 +383,14 @@ def gcfb_v23_frame_base(pgc_smpl, scgc_smpl, gc_param, gc_resp):
         """
         level estimation path
         """
-        lvl_lin1_frame_mtrx, _ = set_frame4time_sequence(pgc_smpl[int(gc_param.lvl_est.n_ch_lvl_est[n_ch]-1), :], 
-                                                         gc_param.dyn_hpaf.len_frame, 
+        n_ch_lvl_est = int(np.asarray(gc_param.lvl_est.n_ch_lvl_est[n_ch]).item() - 1)
+        lvl_lin1_frame_mtrx, _ = set_frame4time_sequence(pgc_smpl[n_ch_lvl_est, :],
+                                                         gc_param.dyn_hpaf.len_frame,
                                                          gc_param.dyn_hpaf.len_shift)
         lvl_lin1_frame = np.sqrt(np.dot(gc_param.dyn_hpaf.val_win, lvl_lin1_frame_mtrx ** 2))
 
-        lvl_lin2_frame_mtrx, _ = set_frame4time_sequence(scgc_smpl[int(gc_param.lvl_est.n_ch_lvl_est[n_ch]-1), :], 
-                                                         gc_param.dyn_hpaf.len_frame, 
+        lvl_lin2_frame_mtrx, _ = set_frame4time_sequence(scgc_smpl[n_ch_lvl_est, :],
+                                                         gc_param.dyn_hpaf.len_frame,
                                                          gc_param.dyn_hpaf.len_shift)
         lvl_lin2_frame = np.sqrt(np.dot(gc_param.dyn_hpaf.val_win, lvl_lin2_frame_mtrx ** 2))
 
@@ -1550,6 +1551,10 @@ def gcfb_v23_asym_func_in_out(gc_param, gc_resp, fr1query, compression_health, p
     af_out_db = 20*np.log10(af_out_lin/af_out_lin_norm)
     io_func_db = af_out_db + pin_db
 
+    if np.ndim(pin_db) == 0:
+        af_out_db = np.asarray(af_out_db).item()
+        io_func_db = np.asarray(io_func_db).item()
+
     return af_out_db, io_func_db, gc_param
 
 
@@ -1604,6 +1609,9 @@ def gcfb_v23_asym_func_in_out_inv_io_func(gc_param, gc_resp, fr1query, compressi
     _, io_func_db_list, _ = gcfb_v23_asym_func_in_out(gc_param, gc_resp, fr1query, compression_health, pin_db_list)
     func_interp1d = interp1d(io_func_db_list, pin_db_list, kind='linear', fill_value='extrapolate')
     pin_db = func_interp1d(io_func_db)
+
+    if np.ndim(io_func_db) == 0:
+        pin_db = np.asarray(pin_db).item()
 
     return pin_db
 

@@ -183,10 +183,16 @@ pub struct GcfbOutput {
 }
 
 pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
-    if param.fs <= 0.
+    if !param.fs.is_finite()
+        || param.fs <= 0.
         || param.num_ch < 2
+        || param.f_range.iter().any(|value| !value.is_finite())
         || param.f_range[1] * 3. > param.fs
         || param.num_update_asym_cmp == 0
+        || !param.dyn_hpaf.t_frame.is_finite()
+        || param.dyn_hpaf.t_frame <= 0.0
+        || !param.dyn_hpaf.t_shift.is_finite()
+        || param.dyn_hpaf.t_shift <= 0.0
     {
         return Err(Error::InvalidParameter(
             "invalid v2.34 sample rate, channel grid, or update period".into(),
@@ -202,16 +208,29 @@ pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
     param.dyn_hpaf.t_frame = param.dyn_hpaf.len_frame as f64 / param.fs;
     param.dyn_hpaf.t_shift = param.dyn_hpaf.len_shift as f64 / param.fs;
     param.dyn_hpaf.fs = 1. / param.dyn_hpaf.t_shift;
-    if param.dyn_hpaf.str_prc.contains("frame") {
-        let win = if param
-            .dyn_hpaf
-            .name_win
-            .to_ascii_lowercase()
-            .contains("hann")
-        {
+    let processing = param.dyn_hpaf.str_prc.to_ascii_lowercase();
+    let frame_processing = processing.contains("frame");
+    let sample_processing = processing.contains("sample");
+    if frame_processing == sample_processing {
+        return Err(Error::InvalidParameter(
+            "dynamic processing mode must select exactly one of frame-base or sample-base".into(),
+        ));
+    }
+    param.dyn_hpaf.str_prc = if frame_processing {
+        "frame-base".into()
+    } else {
+        "sample-base".into()
+    };
+    if frame_processing {
+        let window_name = param.dyn_hpaf.name_win.to_ascii_lowercase();
+        let win = if window_name.contains("hann") {
             dsp::hanning(param.dyn_hpaf.len_frame)
-        } else {
+        } else if window_name.contains("hamm") {
             dsp::hamming(param.dyn_hpaf.len_frame)
+        } else {
+            return Err(Error::InvalidParameter(
+                "frame window must be hanning or hamming".into(),
+            ));
         };
         let sum: f64 = win.iter().sum();
         param.dyn_hpaf.val_win = Array1::from_iter(win.into_iter().map(|v| v / sum));
@@ -664,10 +683,27 @@ pub fn gcfb_v234(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
     let fixed_c2: Array1<f64>;
     if param.ctrl == ControlMode::Static {
         let level = param.level_db_scgcfb;
-        fixed_centers = Array1::from_iter((0..channels).map(|ch| {
-            (response.frat0_pc[ch] + response.frat1_val[ch] * (level - response.pc_hpaf[ch]))
-                * response.fp1[ch]
+        let ratios = Array1::from_iter((0..channels).map(|ch| {
+            response.frat0_pc[ch] + response.frat1_val[ch] * (level - response.pc_hpaf[ch])
         }));
+        fixed_centers = &ratios * &response.fp1;
+        response.fr2 = Array2::zeros((channels, 1));
+        response.fr2.column_mut(0).assign(&fixed_centers);
+        response.frat_val = Array2::zeros((channels, 1));
+        response.frat_val.column_mut(0).assign(&ratios);
+        response.lvl_db = Array2::from_elem((channels, 1), level);
+        for ch in 0..channels {
+            response.fp2[ch] = fr1_to_fp2(
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                response.b2_val[ch],
+                response.c2_val[ch],
+                ratios[ch],
+                response.fr1[ch],
+            )?
+            .0;
+        }
         fixed_c2 = response.c2_val.clone();
     } else {
         fixed_centers = response.fp1.mapv(|v| param.lvl_est.frat * v);
@@ -713,7 +749,14 @@ pub fn gcfb_v234(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
         ControlMode::Dynamic if param.dyn_hpaf.str_prc.contains("frame") => {
             gcfb_v23_frame_base(&pgc, &scgc, &param, &mut response)?
         }
-        ControlMode::Dynamic => gcfb_v23_sample_base(&pgc, &scgc, &param, &mut response)?,
+        ControlMode::Dynamic if param.dyn_hpaf.str_prc.contains("sample") => {
+            gcfb_v23_sample_base(&pgc, &scgc, &param, &mut response)?
+        }
+        ControlMode::Dynamic => {
+            return Err(Error::InvalidParameter(
+                "dynamic processing mode must be frame-base or sample-base".into(),
+            ));
+        }
         ControlMode::Level => scgc.clone(),
     };
     match param.gain_ref {
@@ -825,6 +868,19 @@ pub fn gcfb_v23_env_mod_loss(
         ));
     }
     em.fs = param.dyn_hpaf.fs;
+    if !em.fs.is_finite()
+        || em.fs <= 0.0
+        || em.reduce_db.iter().any(|value| !value.is_finite())
+        || em
+            .f_cutoff
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0 || *value >= em.fs / 2.0)
+        || frames.nrows() != param.fr1.len()
+    {
+        return Err(Error::InvalidParameter(
+            "envelope modulation parameters must be finite, cutoffs must be below Nyquist, and frame channels must match the filterbank".into(),
+        ));
+    }
     let (aud, _) = utils::freq2erb(param.hloss.f_audgram_list.as_slice().unwrap());
     let (fb, _) = utils::freq2erb(param.fr1.as_slice().unwrap());
     em.fb_fr1 = param.fr1.clone();
@@ -840,6 +896,15 @@ pub fn gcfb_v23_env_mod_loss(
         fb.as_slice().unwrap(),
         true,
     )?;
+    if em
+        .fb_f_cutoff
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0 || *value >= em.fs / 2.0)
+    {
+        return Err(Error::InvalidParameter(
+            "interpolated envelope cutoffs must be finite and below Nyquist".into(),
+        ));
+    }
     let mut out = Array2::zeros(frames.dim());
     for ch in 0..frames.nrows() {
         let env = frames.row(ch);
@@ -856,9 +921,14 @@ pub fn gcfb_v23_env_mod_loss(
 }
 
 pub fn gcfb_v23_env_mod_fb(env: &[f64], em: &EmParam) -> Result<Array2<f64>> {
-    if em.fs <= 0. {
+    if !em.fs.is_finite()
+        || em.fs <= 0.
+        || em.fc_mod_list.iter().any(|frequency| {
+            !frequency.is_finite() || *frequency <= 0.0 || *frequency >= em.fs / 2.0
+        })
+    {
         return Err(Error::InvalidParameter(
-            "modulation filterbank sample rate must be positive".into(),
+            "modulation filterbank frequencies must be finite, positive, and below Nyquist".into(),
         ));
     }
     let mut out = Array2::zeros((em.fc_mod_list.len(), env.len()));
@@ -978,5 +1048,64 @@ mod tests {
         let out = gcfb_v234(&signal, p).unwrap();
         assert_eq!(out.dcgc_out.dim(), (4, 24));
         assert!(out.dcgc_out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn static_processing_populates_response_metadata() {
+        let p = GcParam {
+            fs: 8000.0,
+            out_mid_crct: "No".into(),
+            num_ch: 4,
+            f_range: [200.0, 1500.0],
+            ctrl: ControlMode::Static,
+            ..GcParam::default()
+        };
+        let out = gcfb_v234(&[1.0, 0.0, 0.0, 0.0], p).unwrap();
+
+        assert_eq!(out.gc_resp.fr2.dim(), (4, 1));
+        assert_eq!(out.gc_resp.frat_val.dim(), (4, 1));
+        assert_eq!(out.gc_resp.lvl_db.dim(), (4, 1));
+        assert!(out.gc_resp.fp2.iter().all(|value| *value > 0.0));
+        for ch in 0..4 {
+            assert_relative_eq!(
+                out.gc_resp.fr2[[ch, 0]],
+                out.gc_resp.frat_val[[ch, 0]] * out.gc_resp.fp1[ch],
+                epsilon = 1e-10
+            );
+            assert_relative_eq!(out.gc_resp.lvl_db[[ch, 0]], 50.0);
+        }
+    }
+
+    #[test]
+    fn invalid_dynamic_processing_and_window_names_are_rejected() {
+        let invalid_processing = GcParam {
+            dyn_hpaf: DynHpaf {
+                str_prc: "fram-base".into(),
+                ..DynHpaf::default()
+            },
+            ..GcParam::default()
+        };
+        assert!(set_param(invalid_processing).is_err());
+
+        let invalid_window = GcParam {
+            dyn_hpaf: DynHpaf {
+                name_win: "blackman".into(),
+                ..DynHpaf::default()
+            },
+            ..GcParam::default()
+        };
+        assert!(set_param(invalid_window).is_err());
+    }
+
+    #[test]
+    fn modulation_filterbank_rejects_degenerate_or_aliased_frequencies() {
+        for frequency in [0.0, 1000.0, 1500.0, f64::NAN] {
+            let em = EmParam {
+                fs: 2000.0,
+                fc_mod_list: Array1::from(vec![frequency]),
+                ..EmParam::default()
+            };
+            assert!(gcfb_v23_env_mod_fb(&[1.0, 0.0, 0.0], &em).is_err());
+        }
     }
 }
