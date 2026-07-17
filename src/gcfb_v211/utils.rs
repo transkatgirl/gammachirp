@@ -69,9 +69,15 @@ pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
             file.seek(SeekFrom::Current(1))?;
         }
     }
-    if format != Some(1) || channels != Some(1) || bits != Some(16) || data.is_empty() {
+    if format != Some(1)
+        || channels != Some(1)
+        || bits != Some(16)
+        || data.is_empty()
+        || !data.len().is_multiple_of(2)
+        || sample_rate == Some(0)
+    {
         return Err(Error::Wav(
-            "only non-empty mono 16-bit PCM WAV files are supported".into(),
+            "only valid non-empty mono 16-bit PCM WAV files are supported".into(),
         ));
     }
     let samples = data
@@ -484,5 +490,33 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         assert!(matches!(result, Err(Error::Wav(message)) if message.contains("mono")));
+    }
+
+    #[test]
+    fn audioread_rejects_an_incomplete_16_bit_sample() {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&38_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&1_u32.to_le_bytes());
+        wav.extend_from_slice(&[0_u8, 0_u8]);
+
+        let path = std::env::temp_dir().join(format!(
+            "gammachirpy-incomplete-sample-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&path, wav).unwrap();
+        let result = audioread(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(result, Err(Error::Wav(_))));
     }
 }

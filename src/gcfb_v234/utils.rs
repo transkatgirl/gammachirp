@@ -26,8 +26,8 @@ impl Default for ParamTransFunc {
             fs: 48_000.0,
             n_frq_rsl: 2048,
             freq_calib: 1000.0,
-            type_field2eardrum: String::new(),
-            type_midear2cochlea: String::new(),
+            type_field2eardrum: "FreeField".into(),
+            type_midear2cochlea: "MiddleEar".into(),
             type_field2cochlea_db: String::new(),
             name_filter: String::new(),
         }
@@ -181,23 +181,38 @@ pub fn trans_func_field2eardrum_set(
 }
 
 pub fn trans_func_field2cochlea(param: &ParamTransFunc) -> Result<OutTransFunc> {
-    if param.fs <= 0.0 || param.n_frq_rsl < 2 {
+    if !param.fs.is_finite()
+        || param.fs <= 0.0
+        || param.n_frq_rsl < 2
+        || !param.freq_calib.is_finite()
+    {
         return Err(Error::InvalidParameter(
-            "transfer function requires positive fs and at least two bins".into(),
+            "transfer function requires finite calibration and sample frequencies and at least two bins"
+                .into(),
         ));
     }
     let freq = Array1::from_iter(
         (0..param.n_frq_rsl).map(|i| i as f64 / param.n_frq_rsl as f64 * param.fs / 2.0),
     );
-    let field_type = if param.type_field2eardrum.contains("Diffuse") {
-        "DiffuseField"
-    } else if param.type_field2eardrum.contains("ITU") {
-        "ITU"
-    } else if param.type_field2eardrum.contains("NoField") {
-        "NoField"
-    } else {
-        "FreeField"
+    let field_type = match param.type_field2eardrum.as_str() {
+        "FreeField" | "FreeField2EarDrum_Moore16" => "FreeField",
+        "DiffuseField" | "DiffuseField2EarDrum_Moore16" => "DiffuseField",
+        "ITU" | "ITUField2EarDrum" => "ITU",
+        "NoField" | "NoField2EarDrum" => "NoField",
+        _ => {
+            return Err(Error::InvalidParameter(
+                "unknown field-to-eardrum transfer function".into(),
+            ));
+        }
     };
+    if !matches!(
+        param.type_midear2cochlea.as_str(),
+        "MiddleEar" | "MiddleEar_Moore16"
+    ) {
+        return Err(Error::InvalidParameter(
+            "middle-ear transfer function must be MiddleEar or MiddleEar_Moore16".into(),
+        ));
+    }
     let mut field_db = if field_type == "NoField" {
         Array1::zeros(freq.len())
     } else {
@@ -426,5 +441,20 @@ mod tests {
         let (x, db) = eqlz2meddis_hc_level(&[0.5, -0.5], None, Some(90.)).unwrap();
         assert_relative_eq!(x[0], 500., epsilon = 1e-12);
         assert_relative_eq!(db[1], 60.);
+    }
+
+    #[test]
+    fn transfer_function_rejects_unknown_selectors() {
+        let unknown_field = ParamTransFunc {
+            type_field2eardrum: "FreeFiled".into(),
+            ..ParamTransFunc::default()
+        };
+        assert!(trans_func_field2cochlea(&unknown_field).is_err());
+
+        let unknown_middle_ear = ParamTransFunc {
+            type_midear2cochlea: "DifferentMiddleEar".into(),
+            ..ParamTransFunc::default()
+        };
+        assert!(trans_func_field2cochlea(&unknown_middle_ear).is_err());
     }
 }

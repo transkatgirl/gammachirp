@@ -302,59 +302,52 @@ fn hearing_pattern(
     kind: &str,
     manual: Option<&Array1<f64>>,
 ) -> Result<(&'static str, Array1<f64>)> {
-    let pair = if kind.contains("NH") {
-        ("NH_NormalHearing", vec![0.; 7])
-    } else if kind.contains("HL0") {
-        (
+    let key = kind.split('_').next().unwrap_or(kind).to_ascii_uppercase();
+    let pair = match key.as_str() {
+        "NH" => ("NH_NormalHearing", vec![0.; 7]),
+        "HL0" => (
             "HLval_ManualSet",
             manual
                 .ok_or_else(|| {
                     Error::InvalidParameter("HL0 requires hloss_hearing_level_db".into())
                 })?
                 .to_vec(),
-        )
-    } else if kind.contains("HL1") {
-        ("HL1_Example", vec![10., 4., 10., 13., 48., 58., 79.])
-    } else if kind.contains("HL2") {
-        (
+        ),
+        "HL1" => ("HL1_Example", vec![10., 4., 10., 13., 48., 58., 79.]),
+        "HL2" => (
             "HL2_Tsuiki2002_80yr",
             vec![23.5, 24.3, 26.8, 27.9, 32.9, 48.3, 68.5],
-        )
-    } else if kind.contains("HL3") {
-        (
+        ),
+        "HL3" => (
             "HL3_ISO7029_70yr_male",
             vec![8., 8., 9., 10., 19., 43., 59.],
-        )
-    } else if kind.contains("HL4") {
-        (
+        ),
+        "HL4" => (
             "HL4_ISO7029_70yr_female",
             vec![8., 8., 9., 10., 16., 24., 41.],
-        )
-    } else if kind.contains("HL5") {
-        ("HL5_ISO7029_60yr_male", vec![5., 5., 6., 7., 12., 28., 39.])
-    } else if kind.contains("HL6") {
-        (
+        ),
+        "HL5" => ("HL5_ISO7029_60yr_male", vec![5., 5., 6., 7., 12., 28., 39.]),
+        "HL6" => (
             "HL6_ISO7029_60yr_female",
             vec![5., 5., 6., 7., 11., 16., 26.],
-        )
-    } else if kind.contains("HL7") {
-        (
+        ),
+        "HL7" => (
             "HL7_Example_Otosclerosis",
             vec![50., 55., 50., 50., 40., 25., 20.],
-        )
-    } else if kind.contains("HL8") {
-        (
+        ),
+        "HL8" => (
             "HL8_Example_NoiseInduced",
             vec![15., 10., 15., 10., 10., 40., 20.],
-        )
-    } else {
-        return Err(Error::InvalidParameter(
-            "hearing-loss type must be NH or HL0..HL8".into(),
-        ));
+        ),
+        _ => {
+            return Err(Error::InvalidParameter(
+                "hearing-loss type must be NH or HL0..HL8".into(),
+            ));
+        }
     };
-    if pair.1.len() != 7 || pair.1.iter().any(|v| *v < 0.) {
+    if pair.1.len() != 7 || pair.1.iter().any(|v| !v.is_finite() || *v < 0.) {
         return Err(Error::InvalidParameter(
-            "audiogram must contain seven non-negative values".into(),
+            "audiogram must contain seven finite non-negative values".into(),
         ));
     }
     Ok((pair.0, Array1::from(pair.1)))
@@ -368,11 +361,7 @@ pub fn gcfb_v23_hearing_loss(mut param: GcParam, response: &GcResp) -> Result<Gc
         hearing_level_db: hearing,
         ..HLoss::default()
     };
-    let default_health = if param.hloss_type.contains("NH") {
-        1.
-    } else {
-        0.5
-    };
+    let default_health = if name == "NH_NormalHearing" { 1. } else { 0.5 };
     loss.compression_health =
         Array1::from_elem(7, param.hloss_compression_health.unwrap_or(default_health));
     loss.compression_health_initval = loss.compression_health.clone();
@@ -504,7 +493,39 @@ pub fn gcfb_v23_frame_base(
     param: &GcParam,
     response: &mut GcResp,
 ) -> Result<Array2<f64>> {
-    let (channels, _) = pgc.dim();
+    let (channels, samples) = pgc.dim();
+    let channel_vectors_match = [
+        param.fr1.len(),
+        param.hloss.fb_compression_health.len(),
+        param.lvl_est.n_ch_lvl_est.len(),
+        response.b1_val.len(),
+        response.c1_val.len(),
+        response.fp1.len(),
+        response.b2_val.len(),
+        response.c2_val.len(),
+        response.frat0_pc.len(),
+        response.frat1_val.len(),
+        response.pc_hpaf.len(),
+    ]
+    .into_iter()
+    .all(|len| len == channels);
+    if channels == 0
+        || samples == 0
+        || scgc.dim() != pgc.dim()
+        || param.num_ch != channels
+        || !channel_vectors_match
+        || param.dyn_hpaf.val_win.len() != param.dyn_hpaf.len_frame
+        || param
+            .lvl_est
+            .n_ch_lvl_est
+            .iter()
+            .any(|&source| source >= channels)
+    {
+        return Err(Error::InvalidParameter(
+            "frame processing requires non-empty, equally shaped channel matrices and matching prepared parameters"
+                .into(),
+        ));
+    }
     let decay = param
         .lvl_est
         .exp_decay_val
@@ -812,18 +833,30 @@ pub fn gcfb_v23_synth_snd(gc_smpl: &Array2<f64>, param: &GcParam) -> Result<Arra
     let mean = gc_smpl.mean_axis(Axis(0)).ok_or_else(|| {
         Error::InvalidParameter("cannot synthesize empty filterbank output".into())
     })?;
+    if mean.is_empty() {
+        return Err(Error::InvalidParameter(
+            "cannot synthesize empty filterbank output".into(),
+        ));
+    }
     if param.out_mid_crct.eq_ignore_ascii_case("no") {
         Ok(mean.mapv(|v| -15. * v))
     } else {
         let (fir, _) = utils::mk_filter_field2cochlea(&param.out_mid_crct, param.fs, false)?;
-        let filtered = dsp::lfilter(fir.as_slice().unwrap(), &[1.], mean.as_slice().unwrap())?;
-        let delay = (0.00632 * param.fs).trunc() as usize;
-        let mut out = vec![0.; filtered.len()];
-        if delay < filtered.len() {
-            for i in 0..filtered.len() - delay {
-                out[i] = -15. * filtered[i + delay];
-            }
-        }
+        // The legacy ELC inverse is linear phase. Pad before shifting so the
+        // compensated output includes the FIR tail even for short signals.
+        // The other correction filters are minimum phase and need no fixed
+        // ELC delay compensation.
+        let delay = if param.out_mid_crct.eq_ignore_ascii_case("ELC") {
+            fir.len().saturating_sub(1) / 2
+        } else {
+            0
+        };
+        let mut padded = mean.to_vec();
+        padded.resize(padded.len() + delay, 0.);
+        let filtered = dsp::lfilter(fir.as_slice().unwrap(), &[1.], &padded)?;
+        let out: Vec<f64> = (0..mean.len())
+            .map(|i| -15. * filtered[i + delay])
+            .collect();
         Ok(Array1::from(out))
     }
 }
@@ -1106,6 +1139,63 @@ mod tests {
                 ..EmParam::default()
             };
             assert!(gcfb_v23_env_mod_fb(&[1.0, 0.0, 0.0], &em).is_err());
+        }
+    }
+
+    #[test]
+    fn hearing_pattern_rejects_ambiguous_names_and_non_finite_levels() {
+        assert!(hearing_pattern("HL10", None).is_err());
+        assert!(hearing_pattern("NHL3", None).is_err());
+        assert!(hearing_pattern("HL3_ISO7029_70yr_male", None).is_ok());
+
+        let manual = Array1::from(vec![0., 0., 0., f64::NAN, 0., 0., 0.]);
+        assert!(hearing_pattern("HL0", Some(&manual)).is_err());
+    }
+
+    #[test]
+    fn frame_processing_rejects_empty_or_mismatched_matrices() {
+        let p = GcParam {
+            fs: 8_000.,
+            out_mid_crct: "No".into(),
+            num_ch: 4,
+            f_range: [200., 2_000.],
+            ..GcParam::default()
+        };
+        let (param, mut response) = set_param(p).unwrap();
+
+        assert!(
+            gcfb_v23_frame_base(
+                &Array2::zeros((0, 0)),
+                &Array2::zeros((0, 0)),
+                &param,
+                &mut response,
+            )
+            .is_err()
+        );
+        assert!(
+            gcfb_v23_frame_base(
+                &Array2::zeros((4, 8)),
+                &Array2::zeros((3, 8)),
+                &param,
+                &mut response,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn corrected_synthesis_preserves_short_signals() {
+        let input = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        for correction in ["ELC", "EarDrum"] {
+            let param = GcParam {
+                fs: 8_000.,
+                out_mid_crct: correction.into(),
+                ..GcParam::default()
+            };
+            let output = gcfb_v23_synth_snd(&input, &param).unwrap();
+            assert_eq!(output.len(), input.ncols());
+            assert!(output.iter().all(|value| value.is_finite()));
+            assert!(output.iter().any(|value| value.abs() > 1e-12));
         }
     }
 }
