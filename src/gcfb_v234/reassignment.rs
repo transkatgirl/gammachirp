@@ -1,0 +1,1162 @@
+//! Time-frequency reassignment for GCFB v2.34.
+//!
+//! Reassignment is analysis-only: it does not modify the ordinary real GCFB
+//! output and does not provide a synthesis representation.  On a shared,
+//! zero-padded DFT domain, the original input and both auxiliary inputs pass
+//! through the configured outer/middle-ear correction FIR.  Each real
+//! passive-gammachirp (pGC) impulse is then projected exactly onto the
+//! nonnegative-frequency bins, and the resulting complex pGC is followed by
+//! the same HP-AF operator as the real filterbank.  Its imaginary branch is
+//! therefore offline and acausal even though the real GCFB remains causal and
+//! unchanged.
+//!
+//! For the conditioned linear operator `T`, the reported coordinates are
+//! `Re(T(t*x) / T(x))` and `Im(T(D*x) / T(x)) / (2*pi)`, where `x` is the
+//! original public input, `T` includes the correction FIR, and `D` is the
+//! skew-adjoint derivative on that same finite DFT domain.  This is the
+//! auxiliary-atom construction of
+//! [Holighaus et al.](https://ltfat.org/notes/ltfatnote041.pdf) written as
+//! operator applications.  Exactness refers to this implemented finite
+//! discrete operator, up to floating-point error.
+
+use std::f64::consts::PI;
+
+use ndarray::{Array1, Array2};
+use num_complex::Complex64;
+
+use super::gcfb_v234::{
+    AcfCoef, ControlMode, GcParam, GcfbOutput, cmprs_gc_frsp, gcfb_v234, make_asym_cmp_filters_v2,
+};
+use super::utils;
+use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
+use crate::{Error, Result, dsp};
+
+/// Options for dcGC reassignment.
+#[derive(Clone, Debug)]
+pub struct ReassignmentConfig {
+    /// Per-channel relative analytic-power floor. A coefficient is rejected
+    /// when its power is below this fraction of the channel maximum.
+    pub coefficient_floor: f64,
+}
+
+impl Default for ReassignmentConfig {
+    fn default() -> Self {
+        Self {
+            coefficient_floor: 1e-8,
+        }
+    }
+}
+
+/// Mathematical status of a reassignment result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReassignmentMode {
+    /// A fixed complex cGC (static or level-control output).
+    Fixed,
+    /// Exact fixed-filter coordinates with positive frame-dependent energy
+    /// gains applied only during transport.
+    Frame,
+    /// Exact reassignment of the correction-plus-HP-AF operator conditioned on
+    /// the recorded coefficient history. This does not differentiate through
+    /// the nonlinear coefficient estimator that produced that history.
+    SampleConditional,
+}
+
+/// Separate, analysis-only result produced from an existing GCFB output.
+#[derive(Clone, Debug)]
+pub struct ReassignmentResult {
+    /// Reassigned analytic-representation energy on `[ERB channel, time bin]`.
+    /// The source measure is `|C|^2 / 2`, not pointwise or framewise
+    /// `dcgc_out^2`.
+    pub energy_map: Array2<f64>,
+    /// Reassigned time, in seconds, for every complex source coefficient.
+    pub t_hat: Array2<f64>,
+    /// Reassigned frequency, in Hz, for every complex source coefficient.
+    pub f_hat: Array2<f64>,
+    /// Coefficients that passed the relative analytic-power floor.
+    pub validity_mask: Array2<bool>,
+    /// Centers of the target time bins, in seconds.
+    pub time_axis: Array1<f64>,
+    /// Centers of the target auditory-frequency bins, in Hz.
+    pub frequency_axis_hz: Array1<f64>,
+    /// Centers of the target auditory-frequency bins, in ERB rate.
+    pub frequency_axis_erb: Array1<f64>,
+    /// Analytic-representation energy before floor and map-boundary rejection.
+    pub source_energy: f64,
+    /// Analytic-representation energy rejected by the relative floor.
+    pub floor_discarded_energy: f64,
+    /// Retained-coefficient energy whose coordinates lie outside the map.
+    pub boundary_discarded_energy: f64,
+    /// Sum of floor- and boundary-discarded analytic energy.
+    pub discarded_energy: f64,
+    /// Type and guarantee of the reassignment calculation.
+    pub mode: ReassignmentMode,
+    /// Length of the zero-padded finite DFT domain used by the correction FIR,
+    /// analytic projection, and derivative.
+    pub analysis_fft_len: usize,
+}
+
+impl ReassignmentResult {
+    /// Analytic-representation energy successfully deposited into the map.
+    pub fn retained_energy(&self) -> f64 {
+        self.energy_map.sum()
+    }
+}
+
+struct CoefficientAnalysis {
+    power: Array2<f64>,
+    t_hat: Array2<f64>,
+    f_hat: Array2<f64>,
+    validity_mask: Array2<bool>,
+    mode: ReassignmentMode,
+    analysis_fft_len: usize,
+}
+
+struct OperatorOutputs {
+    coefficient: Array2<Complex64>,
+    time_weighted: Array2<Complex64>,
+    derivative: Array2<Complex64>,
+    mode: ReassignmentMode,
+    analysis_fft_len: usize,
+}
+
+struct PreparedInputSpectra {
+    values: [Vec<Complex64>; 3],
+}
+
+struct AnalyticPgc {
+    #[cfg(test)]
+    impulse: Vec<Complex64>,
+    spectrum: Vec<Complex64>,
+}
+
+/// Run GCFB v2.34 and its reassignment analysis together. The ordinary GCFB
+/// output is identical to calling [`gcfb_v234`] alone.
+pub fn gcfb_v234_with_reassignment(
+    snd_in: &[f64],
+    gc_param: GcParam,
+) -> Result<(GcfbOutput, ReassignmentResult)> {
+    let output = gcfb_v234(snd_in, gc_param)?;
+    let reassignment = reassign_gcfb_v234(snd_in, &output)?;
+    Ok((output, reassignment))
+}
+
+/// Reassign an existing GCFB v2.34 analysis with the default construction.
+/// `snd_in` must be the same input used to produce `output`.
+pub fn reassign_gcfb_v234(snd_in: &[f64], output: &GcfbOutput) -> Result<ReassignmentResult> {
+    reassign_gcfb_v234_with_config(snd_in, output, &ReassignmentConfig::default())
+}
+
+/// Reassign an existing GCFB v2.34 analysis with explicit options.
+pub fn reassign_gcfb_v234_with_config(
+    snd_in: &[f64],
+    output: &GcfbOutput,
+    config: &ReassignmentConfig,
+) -> Result<ReassignmentResult> {
+    validate_analysis_input(snd_in, output, config)?;
+    let operator = conditioned_operator_outputs(snd_in, output)?;
+    let analysis = analyze_coefficients(operator, config.coefficient_floor)?;
+    let frame_mode = output.gc_param.ctrl == ControlMode::Dynamic
+        && output.gc_param.dyn_hpaf.str_prc.contains("frame");
+    let (time_axis, mut accounting) = if frame_mode {
+        transport_frame_energy(output, &analysis)?
+    } else {
+        transport_sample_energy(output, &analysis)?
+    };
+    let frequency_axis_hz = output.gc_param.fr1.clone();
+    let (frequency_axis_erb, _) = utils::freq2erb(frequency_axis_hz.as_slice().unwrap());
+    accounting.discarded = accounting.floor + accounting.boundary;
+
+    Ok(ReassignmentResult {
+        energy_map: accounting.map,
+        t_hat: analysis.t_hat,
+        f_hat: analysis.f_hat,
+        validity_mask: analysis.validity_mask,
+        time_axis,
+        frequency_axis_hz,
+        frequency_axis_erb,
+        source_energy: accounting.source,
+        floor_discarded_energy: accounting.floor,
+        boundary_discarded_energy: accounting.boundary,
+        discarded_energy: accounting.discarded,
+        mode: analysis.mode,
+        analysis_fft_len: analysis.analysis_fft_len,
+    })
+}
+
+fn validate_analysis_input(
+    snd: &[f64],
+    output: &GcfbOutput,
+    config: &ReassignmentConfig,
+) -> Result<()> {
+    let channels = output.gc_param.num_ch;
+    if snd.is_empty()
+        || channels == 0
+        || output.gc_param.fr1.len() != channels
+        || output.scgc_smpl.nrows() != channels
+        || output.gc_resp.gain_factor.len() != channels
+        || !config.coefficient_floor.is_finite()
+        || config.coefficient_floor <= 0.0
+        || config.coefficient_floor >= 1.0
+    {
+        return Err(Error::InvalidParameter(
+            "reassignment requires a matching non-empty GCFB output and a coefficient floor in (0, 1)"
+                .into(),
+        ));
+    }
+    if output.scgc_smpl.ncols() != snd.len() {
+        return Err(Error::InvalidParameter(
+            "input length does not match the supplied GCFB output".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn correction_fir(param: &GcParam) -> Result<Vec<f64>> {
+    if param.out_mid_crct.eq_ignore_ascii_case("no") {
+        Ok(vec![1.0])
+    } else {
+        let (fir, _) = utils::mk_filter_field2cochlea(&param.out_mid_crct, param.fs, true)?;
+        Ok(fir.to_vec())
+    }
+}
+
+fn conditioned_operator_outputs(snd_in: &[f64], output: &GcfbOutput) -> Result<OperatorOutputs> {
+    let pgcs: Vec<Vec<f64>> = (0..output.gc_param.num_ch)
+        .map(|ch| real_pgc(&output.gc_param, output, ch))
+        .collect::<Result<_>>()?;
+    let correction = correction_fir(&output.gc_param)?;
+    let maximum_pgc_len = pgcs.iter().map(Vec::len).max().unwrap_or(0);
+    let analysis_fft_len = analysis_fft_len(snd_in.len(), correction.len(), maximum_pgc_len)?;
+    let mut inputs = prepare_input_spectra(snd_in, output.gc_param.fs, analysis_fft_len);
+    apply_correction_fir(&mut inputs, &correction);
+    let sample_mode = output.gc_param.ctrl == ControlMode::Dynamic
+        && output.gc_param.dyn_hpaf.str_prc.contains("sample");
+    if sample_mode {
+        sample_operator_outputs(snd_in.len(), output, &pgcs, &inputs, analysis_fft_len)
+    } else {
+        fixed_operator_outputs(snd_in.len(), output, &pgcs, &inputs, analysis_fft_len)
+    }
+}
+
+fn analysis_fft_len(
+    signal_len: usize,
+    correction_len: usize,
+    maximum_pgc_len: usize,
+) -> Result<usize> {
+    let convolution_len = signal_len
+        .checked_add(correction_len)
+        .and_then(|value| value.checked_add(maximum_pgc_len))
+        .and_then(|value| value.checked_sub(2))
+        .ok_or_else(|| Error::Unsupported("reassignment DFT length overflow".into()))?;
+    convolution_len
+        .checked_mul(2)
+        .and_then(usize::checked_next_power_of_two)
+        .ok_or_else(|| Error::Unsupported("reassignment DFT length overflow".into()))
+}
+
+fn real_pgc(param: &GcParam, output: &GcfbOutput, ch: usize) -> Result<Vec<f64>> {
+    let impulse = gammachirp::gammachirp(
+        &[output.gc_resp.fr1[ch]],
+        param.fs,
+        param.n,
+        output.gc_resp.b1_val[ch],
+        output.gc_resp.c1_val[ch],
+        0.0,
+        Carrier::Cosine,
+        Normalization::Peak,
+    )?;
+    Ok(impulse
+        .gc
+        .row(0)
+        .iter()
+        .take(impulse.len_gc[0])
+        .copied()
+        .collect())
+}
+
+fn analytic_pgc(real: &[f64], fft_len: usize) -> AnalyticPgc {
+    let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (destination, &source) in spectrum.iter_mut().zip(real) {
+        destination.re = source;
+    }
+    dsp::fft(&mut spectrum, false);
+    for value in &mut spectrum[1..fft_len / 2] {
+        *value *= 2.0;
+    }
+    for value in &mut spectrum[fft_len / 2 + 1..] {
+        *value = Complex64::new(0.0, 0.0);
+    }
+    #[cfg(test)]
+    let impulse = {
+        let mut impulse = spectrum.clone();
+        dsp::fft(&mut impulse, true);
+        impulse
+    };
+    AnalyticPgc {
+        #[cfg(test)]
+        impulse,
+        spectrum,
+    }
+}
+
+fn prepare_input_spectra(signal: &[f64], sample_rate: f64, fft_len: usize) -> PreparedInputSpectra {
+    let mut input = vec![Complex64::new(0.0, 0.0); fft_len];
+    let mut time_weighted = input.clone();
+    for (sample, &value) in signal.iter().enumerate() {
+        input[sample].re = value;
+        time_weighted[sample].re = sample as f64 / sample_rate * value;
+    }
+    dsp::fft(&mut input, false);
+    dsp::fft(&mut time_weighted, false);
+    let mut derivative = input.clone();
+    for (bin, value) in derivative.iter_mut().enumerate() {
+        if bin == 0 || bin == fft_len / 2 {
+            *value = Complex64::new(0.0, 0.0);
+            continue;
+        }
+        let frequency_hz = if bin < fft_len / 2 {
+            bin as f64 * sample_rate / fft_len as f64
+        } else {
+            (bin as f64 - fft_len as f64) * sample_rate / fft_len as f64
+        };
+        *value *= Complex64::new(0.0, 2.0 * PI * frequency_hz);
+    }
+    PreparedInputSpectra {
+        values: [input, time_weighted, derivative],
+    }
+}
+
+fn apply_correction_fir(inputs: &mut PreparedInputSpectra, correction: &[f64]) {
+    if correction.len() == 1 && correction[0] == 1.0 {
+        return;
+    }
+    let fft_len = inputs.values[0].len();
+    let mut correction_spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (destination, &coefficient) in correction_spectrum.iter_mut().zip(correction) {
+        destination.re = coefficient;
+    }
+    dsp::fft(&mut correction_spectrum, false);
+    for values in &mut inputs.values {
+        for (value, correction) in values.iter_mut().zip(&correction_spectrum) {
+            *value *= correction;
+        }
+    }
+}
+
+fn apply_analytic_pgc(pgc: &AnalyticPgc, inputs: &PreparedInputSpectra) -> [Vec<Complex64>; 3] {
+    std::array::from_fn(|pass| {
+        let mut output: Vec<Complex64> = pgc
+            .spectrum
+            .iter()
+            .zip(&inputs.values[pass])
+            .map(|(filter, input)| filter * input)
+            .collect();
+        dsp::fft(&mut output, true);
+        output
+    })
+}
+
+fn fixed_operator_outputs(
+    samples: usize,
+    output: &GcfbOutput,
+    pgcs: &[Vec<f64>],
+    inputs: &PreparedInputSpectra,
+    analysis_fft_len: usize,
+) -> Result<OperatorOutputs> {
+    let param = &output.gc_param;
+    let response = &output.gc_resp;
+    let channels = param.num_ch;
+    let (centers, b2, c2) = if param.ctrl == ControlMode::Static {
+        (
+            response.fr2.column(0).to_owned(),
+            response.b2_val.clone(),
+            response.c2_val.clone(),
+        )
+    } else {
+        (
+            response.fp1.mapv(|value| param.lvl_est.frat * value),
+            Array1::from_elem(channels, param.lvl_est.b2),
+            &param.hloss.fb_compression_health * param.lvl_est.c2,
+        )
+    };
+    let coefficients = make_asym_cmp_filters_v2(
+        param.fs,
+        centers.as_slice().unwrap(),
+        b2.as_slice().unwrap(),
+        c2.as_slice().unwrap(),
+    )?;
+    let mut result = empty_operator_outputs(
+        channels,
+        samples,
+        if param.ctrl == ControlMode::Dynamic && param.dyn_hpaf.str_prc.contains("frame") {
+            ReassignmentMode::Frame
+        } else {
+            ReassignmentMode::Fixed
+        },
+        analysis_fft_len,
+    );
+    for (ch, real_pgc) in pgcs.iter().enumerate() {
+        let pgc = analytic_pgc(real_pgc, analysis_fft_len);
+        let pgc_outputs = apply_analytic_pgc(&pgc, inputs);
+        let filtered: [Vec<Complex64>; 3] = std::array::from_fn(|pass| {
+            filter_fixed_cascade(&pgc_outputs[pass][..samples], &coefficients, ch)
+        });
+        assign_operator_row(&mut result, ch, &filtered);
+        for sample in 0..samples {
+            verify_real_branch(
+                result.coefficient[[ch, sample]].re,
+                output.scgc_smpl[[ch, sample]],
+            )?;
+        }
+    }
+    Ok(result)
+}
+
+fn sample_operator_outputs(
+    samples: usize,
+    output: &GcfbOutput,
+    pgcs: &[Vec<f64>],
+    inputs: &PreparedInputSpectra,
+    analysis_fft_len: usize,
+) -> Result<OperatorOutputs> {
+    let param = &output.gc_param;
+    let response = &output.gc_resp;
+    let channels = param.num_ch;
+    if response.fr2.dim() != (channels, samples) {
+        return Err(Error::InvalidParameter(
+            "sample reassignment requires the realized HP-AF center-frequency history".into(),
+        ));
+    }
+    let mut result = empty_operator_outputs(
+        channels,
+        samples,
+        ReassignmentMode::SampleConditional,
+        analysis_fft_len,
+    );
+    for (ch, real_pgc) in pgcs.iter().enumerate() {
+        let pgc = analytic_pgc(real_pgc, analysis_fft_len);
+        let pgc_outputs = apply_analytic_pgc(&pgc, inputs);
+        let mut states: [ComplexCascadeState; 3] = std::array::from_fn(|_| Default::default());
+        let mut coefficients = make_asym_cmp_filters_v2(
+            param.fs,
+            &[response.fr2[[ch, 0]]],
+            &[response.b2_val[ch]],
+            &[response.c2_val[ch]],
+        )?;
+        let pass_inputs = pgc_outputs[0]
+            .iter()
+            .zip(&pgc_outputs[1])
+            .zip(&pgc_outputs[2]);
+        for (sample, ((&coefficient_input, &time_input), &derivative_input)) in
+            pass_inputs.take(samples).enumerate()
+        {
+            if sample % param.num_update_asym_cmp == 0 {
+                coefficients = make_asym_cmp_filters_v2(
+                    param.fs,
+                    &[response.fr2[[ch, sample]]],
+                    &[response.b2_val[ch]],
+                    &[response.c2_val[ch]],
+                )?;
+            }
+            let inputs = [coefficient_input, time_input, derivative_input];
+            let values: [Complex64; 3] =
+                std::array::from_fn(|pass| states[pass].process(inputs[pass], &coefficients, 0));
+            result.coefficient[[ch, sample]] = values[0];
+            result.time_weighted[[ch, sample]] = values[1];
+            result.derivative[[ch, sample]] = values[2];
+            let gain = response.gain_factor[ch];
+            if !gain.is_finite() || gain == 0.0 {
+                return Err(Error::Numerical(
+                    "sample reassignment encountered a non-finite or zero output gain".into(),
+                ));
+            }
+            verify_real_branch(
+                result.coefficient[[ch, sample]].re,
+                output.dcgc_out[[ch, sample]] / gain,
+            )?;
+        }
+    }
+    Ok(result)
+}
+
+fn empty_operator_outputs(
+    channels: usize,
+    samples: usize,
+    mode: ReassignmentMode,
+    analysis_fft_len: usize,
+) -> OperatorOutputs {
+    let zeros = || Array2::from_elem((channels, samples), Complex64::new(0.0, 0.0));
+    OperatorOutputs {
+        coefficient: zeros(),
+        time_weighted: zeros(),
+        derivative: zeros(),
+        mode,
+        analysis_fft_len,
+    }
+}
+
+fn assign_operator_row(result: &mut OperatorOutputs, ch: usize, values: &[Vec<Complex64>; 3]) {
+    result
+        .coefficient
+        .row_mut(ch)
+        .assign(&Array1::from(values[0].clone()));
+    result
+        .time_weighted
+        .row_mut(ch)
+        .assign(&Array1::from(values[1].clone()));
+    result
+        .derivative
+        .row_mut(ch)
+        .assign(&Array1::from(values[2].clone()));
+}
+
+#[derive(Clone, Copy, Default)]
+struct BiquadState {
+    input_previous: Complex64,
+    input_before_previous: Complex64,
+    output_previous: Complex64,
+    output_before_previous: Complex64,
+}
+
+#[derive(Default)]
+struct ComplexCascadeState {
+    sections: [BiquadState; 4],
+}
+
+impl ComplexCascadeState {
+    fn process(&mut self, input: Complex64, coefficients: &AcfCoef, ch: usize) -> Complex64 {
+        let mut current = input;
+        for (section, state) in self.sections.iter_mut().enumerate() {
+            let output = (coefficients.bz[[ch, 0, section]] * current
+                + coefficients.bz[[ch, 1, section]] * state.input_previous
+                + coefficients.bz[[ch, 2, section]] * state.input_before_previous
+                - coefficients.ap[[ch, 1, section]] * state.output_previous
+                - coefficients.ap[[ch, 2, section]] * state.output_before_previous)
+                / coefficients.ap[[ch, 0, section]];
+            state.input_before_previous = state.input_previous;
+            state.input_previous = current;
+            state.output_before_previous = state.output_previous;
+            state.output_previous = output;
+            current = output;
+        }
+        current
+    }
+}
+
+fn filter_fixed_cascade(input: &[Complex64], coefficients: &AcfCoef, ch: usize) -> Vec<Complex64> {
+    let mut state = ComplexCascadeState::default();
+    input
+        .iter()
+        .map(|&value| state.process(value, coefficients, ch))
+        .collect()
+}
+
+fn verify_real_branch(actual: f64, expected: f64) -> Result<()> {
+    let tolerance = 2e-8 * actual.abs().max(expected.abs()).max(1.0);
+    if !actual.is_finite() || !expected.is_finite() || (actual - expected).abs() > tolerance {
+        return Err(Error::InvalidParameter(format!(
+            "input does not match the supplied GCFB output or its real cGC branch ({actual} versus {expected}, difference {})",
+            (actual - expected).abs()
+        )));
+    }
+    Ok(())
+}
+
+fn analyze_coefficients(
+    operator: OperatorOutputs,
+    relative_floor: f64,
+) -> Result<CoefficientAnalysis> {
+    let dimensions = operator.coefficient.dim();
+    let mut power = Array2::zeros(dimensions);
+    let mut t_hat = Array2::from_elem(dimensions, f64::NAN);
+    let mut f_hat = Array2::from_elem(dimensions, f64::NAN);
+    for ch in 0..dimensions.0 {
+        for sample in 0..dimensions.1 {
+            let coefficient = operator.coefficient[[ch, sample]];
+            let norm = coefficient.norm_sqr();
+            power[[ch, sample]] = norm / 2.0;
+            if norm > 0.0 && norm.is_finite() {
+                t_hat[[ch, sample]] = (operator.time_weighted[[ch, sample]] / coefficient).re;
+                f_hat[[ch, sample]] =
+                    (operator.derivative[[ch, sample]] / coefficient).im / (2.0 * PI);
+            }
+        }
+    }
+    let validity_mask = apply_floor(&power, &t_hat, &f_hat, relative_floor)?;
+    Ok(CoefficientAnalysis {
+        power,
+        t_hat,
+        f_hat,
+        validity_mask,
+        mode: operator.mode,
+        analysis_fft_len: operator.analysis_fft_len,
+    })
+}
+
+fn apply_floor(
+    power: &Array2<f64>,
+    t_hat: &Array2<f64>,
+    f_hat: &Array2<f64>,
+    relative_floor: f64,
+) -> Result<Array2<bool>> {
+    let mut mask = Array2::from_elem(power.dim(), false);
+    for ch in 0..power.nrows() {
+        if power.row(ch).iter().any(|value| !value.is_finite()) {
+            return Err(Error::Numerical(format!(
+                "non-finite analytic power in reassignment channel {ch}"
+            )));
+        }
+        let maximum = power.row(ch).iter().copied().fold(0.0, f64::max);
+        if maximum <= 0.0 {
+            continue;
+        }
+        let threshold = relative_floor * maximum;
+        for sample in 0..power.ncols() {
+            if power[[ch, sample]] >= threshold {
+                if !t_hat[[ch, sample]].is_finite() || !f_hat[[ch, sample]].is_finite() {
+                    return Err(Error::Numerical(format!(
+                        "non-finite reassignment coordinate above the coefficient floor at channel {ch}, sample {sample}"
+                    )));
+                }
+                mask[[ch, sample]] = true;
+            }
+        }
+    }
+    Ok(mask)
+}
+
+#[derive(Default)]
+struct EnergyAccounting {
+    map: Array2<f64>,
+    source: f64,
+    floor: f64,
+    boundary: f64,
+    discarded: f64,
+}
+
+fn transport_frame_energy(
+    output: &GcfbOutput,
+    analysis: &CoefficientAnalysis,
+) -> Result<(Array1<f64>, EnergyAccounting)> {
+    let param = &output.gc_param;
+    let response = &output.gc_resp;
+    let frames = response.asym_func_gain.ncols();
+    if frames == 0
+        || response.asym_func_gain.nrows() != param.num_ch
+        || param.dyn_hpaf.val_win.len() != param.dyn_hpaf.len_frame
+    {
+        return Err(Error::InvalidParameter(
+            "frame reassignment requires populated frame gains and window metadata".into(),
+        ));
+    }
+    let time_axis = Array1::from_iter(
+        (0..frames).map(|frame| frame as f64 * param.dyn_hpaf.len_shift as f64 / param.fs),
+    );
+    let (frequency_axis, _) = utils::freq2erb(param.fr1.as_slice().unwrap());
+    let static_response = cmprs_gc_frsp(
+        param.fr1.as_slice().unwrap(),
+        param.fs,
+        param.n,
+        response.b1_val.as_slice().unwrap(),
+        response.c1_val.as_slice().unwrap(),
+        &[param.lvl_est.frat],
+        &[param.lvl_est.b2],
+        (&param.hloss.fb_compression_health * param.lvl_est.c2)
+            .as_slice()
+            .unwrap(),
+        2048,
+    )?;
+    let mut accounting = EnergyAccounting {
+        map: Array2::zeros((param.num_ch, frames)),
+        ..EnergyAccounting::default()
+    };
+    let half = param.dyn_hpaf.len_frame / 2;
+    for ch in 0..param.num_ch {
+        for frame in 0..frames {
+            let gain = response.gain_factor[ch]
+                * static_response.norm_fct_fp2[ch]
+                * response.asym_func_gain[[ch, frame]];
+            for offset in 0..param.dyn_hpaf.len_frame {
+                let source = frame as isize * param.dyn_hpaf.len_shift as isize + offset as isize
+                    - half as isize;
+                if source < 0 || source as usize >= analysis.power.ncols() {
+                    continue;
+                }
+                let sample = source as usize;
+                let energy =
+                    param.dyn_hpaf.val_win[offset] * gain.powi(2) * analysis.power[[ch, sample]];
+                deposit_energy(
+                    &mut accounting,
+                    energy,
+                    analysis.validity_mask[[ch, sample]],
+                    analysis.t_hat[[ch, sample]],
+                    analysis.f_hat[[ch, sample]],
+                    time_axis.as_slice().unwrap(),
+                    frequency_axis.as_slice().unwrap(),
+                )?;
+            }
+        }
+    }
+    Ok((time_axis, accounting))
+}
+
+fn transport_sample_energy(
+    output: &GcfbOutput,
+    analysis: &CoefficientAnalysis,
+) -> Result<(Array1<f64>, EnergyAccounting)> {
+    let param = &output.gc_param;
+    let samples = analysis.power.ncols();
+    let time_axis = Array1::from_iter((0..samples).map(|sample| sample as f64 / param.fs));
+    let (frequency_axis, _) = utils::freq2erb(param.fr1.as_slice().unwrap());
+    let mut accounting = EnergyAccounting {
+        map: Array2::zeros((param.num_ch, samples)),
+        ..EnergyAccounting::default()
+    };
+    for ch in 0..param.num_ch {
+        let gain = output.gc_resp.gain_factor[ch];
+        for sample in 0..samples {
+            let energy = gain.powi(2) * analysis.power[[ch, sample]];
+            deposit_energy(
+                &mut accounting,
+                energy,
+                analysis.validity_mask[[ch, sample]],
+                analysis.t_hat[[ch, sample]],
+                analysis.f_hat[[ch, sample]],
+                time_axis.as_slice().unwrap(),
+                frequency_axis.as_slice().unwrap(),
+            )?;
+        }
+    }
+    Ok((time_axis, accounting))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deposit_energy(
+    accounting: &mut EnergyAccounting,
+    energy: f64,
+    valid: bool,
+    time: f64,
+    frequency_hz: f64,
+    time_axis: &[f64],
+    frequency_axis_erb: &[f64],
+) -> Result<()> {
+    if !energy.is_finite() || energy < 0.0 {
+        return Err(Error::Numerical(
+            "non-finite or negative analytic energy during reassignment transport".into(),
+        ));
+    }
+    if energy == 0.0 {
+        return Ok(());
+    }
+    accounting.source += energy;
+    if !valid {
+        accounting.floor += energy;
+        return Ok(());
+    }
+    if frequency_hz <= 0.0 {
+        accounting.boundary += energy;
+        return Ok(());
+    }
+    let (erb, _) = utils::freq2erb(&[frequency_hz]);
+    let Some(time_weights) = linear_weights(time_axis, time) else {
+        accounting.boundary += energy;
+        return Ok(());
+    };
+    let Some(frequency_weights) = linear_weights(frequency_axis_erb, erb[0]) else {
+        accounting.boundary += energy;
+        return Ok(());
+    };
+    for &(time_bin, time_weight) in &time_weights {
+        for &(frequency_bin, frequency_weight) in &frequency_weights {
+            accounting.map[[frequency_bin, time_bin]] += energy * time_weight * frequency_weight;
+        }
+    }
+    Ok(())
+}
+
+fn linear_weights(axis: &[f64], value: f64) -> Option<Vec<(usize, f64)>> {
+    if axis.is_empty() || !value.is_finite() || value < axis[0] || value > axis[axis.len() - 1] {
+        return None;
+    }
+    if axis.len() == 1 {
+        return ((value - axis[0]).abs() <= f64::EPSILON * axis[0].abs().max(1.0))
+            .then(|| vec![(0, 1.0)]);
+    }
+    match axis.binary_search_by(|candidate| candidate.total_cmp(&value)) {
+        Ok(index) => Some(vec![(index, 1.0)]),
+        Err(upper) if upper > 0 && upper < axis.len() => {
+            let lower = upper - 1;
+            let upper_weight = (value - axis[lower]) / (axis[upper] - axis[lower]);
+            Some(vec![(lower, 1.0 - upper_weight), (upper, upper_weight)])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use approx::assert_relative_eq;
+
+    use super::*;
+    use crate::gcfb_v234::{DynHpaf, GainReference, GcParam};
+
+    fn compact_frame_parameters() -> GcParam {
+        GcParam {
+            fs: 8000.0,
+            num_ch: 8,
+            f_range: [200.0, 1800.0],
+            out_mid_crct: "No".into(),
+            ctrl: ControlMode::Dynamic,
+            dyn_hpaf: DynHpaf {
+                t_frame: 0.008,
+                t_shift: 0.004,
+                ..DynHpaf::default()
+            },
+            ..GcParam::default()
+        }
+    }
+
+    fn static_parameters() -> GcParam {
+        GcParam {
+            ctrl: ControlMode::Static,
+            ..compact_frame_parameters()
+        }
+    }
+
+    #[test]
+    fn analytic_projection_is_one_sided_and_preserves_the_real_pgc() {
+        let signal = vec![0.0; 128];
+        let output = gcfb_v234(&signal, static_parameters()).unwrap();
+        for ch in 0..output.gc_param.num_ch {
+            let real = real_pgc(&output.gc_param, &output, ch).unwrap();
+            let fft_len = analysis_fft_len(signal.len(), 1, real.len()).unwrap();
+            let analytic = analytic_pgc(&real, fft_len);
+            for (sample, value) in analytic.impulse.iter().enumerate() {
+                let expected = real.get(sample).copied().unwrap_or(0.0);
+                assert_relative_eq!(value.re, expected, epsilon = 5e-13);
+            }
+            let mut recovered_spectrum = analytic.impulse.clone();
+            dsp::fft(&mut recovered_spectrum, false);
+            let total: f64 = recovered_spectrum
+                .iter()
+                .map(|value| value.norm_sqr())
+                .sum();
+            let negative: f64 = recovered_spectrum[fft_len / 2 + 1..]
+                .iter()
+                .map(|value| value.norm_sqr())
+                .sum();
+            let roundoff_bound = total.max(1.0)
+                * (64.0 * f64::EPSILON * fft_len.ilog2() as f64).powi(2)
+                * fft_len as f64;
+            assert!(
+                negative <= roundoff_bound,
+                "negative-bin energy {negative} exceeded {roundoff_bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_and_frame_real_branches_match_scgc_before_gain() {
+        let signal: Vec<f64> = (0..320)
+            .map(|sample| (2.0 * PI * 700.0 * sample as f64 / 8000.0).sin())
+            .collect();
+        for parameters in [static_parameters(), compact_frame_parameters()] {
+            for correction in ["No", "ELC", "EarDrum"] {
+                let mut corrected = parameters.clone();
+                corrected.out_mid_crct = correction.into();
+                let output = gcfb_v234(&signal, corrected).unwrap();
+                let operator = conditioned_operator_outputs(&signal, &output).unwrap();
+                for (actual, expected) in operator.coefficient.iter().zip(output.scgc_smpl.iter()) {
+                    assert_relative_eq!(actual.re, expected, epsilon = 2e-11, max_relative = 2e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sample_real_branch_matches_conditioned_dcgc_before_gain() {
+        let mut parameters = compact_frame_parameters();
+        parameters.num_ch = 3;
+        parameters.f_range = [300.0, 1400.0];
+        parameters.dyn_hpaf.str_prc = "sample-base".into();
+        parameters.num_update_asym_cmp = 3;
+        let signal: Vec<f64> = (0..48)
+            .map(|sample| 0.1 * (2.0 * PI * 600.0 * sample as f64 / 8000.0).sin())
+            .collect();
+        for correction in ["No", "ELC", "EarDrum"] {
+            let mut corrected = parameters.clone();
+            corrected.out_mid_crct = correction.into();
+            let output = gcfb_v234(&signal, corrected).unwrap();
+            let operator = conditioned_operator_outputs(&signal, &output).unwrap();
+            for ch in 0..output.gc_param.num_ch {
+                for sample in 0..signal.len() {
+                    assert_relative_eq!(
+                        operator.coefficient[[ch, sample]].re,
+                        output.dcgc_out[[ch, sample]] / output.gc_resp.gain_factor[ch],
+                        epsilon = 2e-11,
+                        max_relative = 2e-10
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corrected_frame_impulse_reassigns_to_the_exact_original_input_time() {
+        let mut signal = vec![0.0; 512];
+        let impulse_sample = 192;
+        signal[impulse_sample] = 1.0;
+        let expected = impulse_sample as f64 / 8000.0;
+        for correction in ["No", "ELC", "EarDrum"] {
+            let mut parameters = compact_frame_parameters();
+            parameters.out_mid_crct = correction.into();
+            let (_, reassigned) = gcfb_v234_with_reassignment(&signal, parameters).unwrap();
+            for ch in 0..reassigned.t_hat.nrows() {
+                for sample in 0..reassigned.t_hat.ncols() {
+                    if reassigned.validity_mask[[ch, sample]] {
+                        assert_relative_eq!(
+                            reassigned.t_hat[[ch, sample]],
+                            expected,
+                            epsilon = 2e-10
+                        );
+                    }
+                }
+            }
+            assert_eq!(reassigned.mode, ReassignmentMode::Frame);
+            assert!(reassigned.analysis_fft_len.is_power_of_two());
+        }
+    }
+
+    #[test]
+    fn tone_coordinates_are_stable_at_low_middle_and_high_frequencies() {
+        let base_parameters = GcParam {
+            num_ch: 12,
+            f_range: [180.0, 2200.0],
+            ..static_parameters()
+        };
+        for correction in ["No", "ELC"] {
+            let mut parameters = base_parameters.clone();
+            parameters.out_mid_crct = correction.into();
+            for frequency in [275.0, 713.0, 1675.0] {
+                let signal: Vec<f64> = (0..2048)
+                    .map(|sample| (2.0 * PI * frequency * sample as f64 / 8000.0).cos())
+                    .collect();
+                let (_, reassigned) =
+                    gcfb_v234_with_reassignment(&signal, parameters.clone()).unwrap();
+                let ch = reassigned
+                    .frequency_axis_hz
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (*a - frequency).abs().total_cmp(&(*b - frequency).abs())
+                    })
+                    .unwrap()
+                    .0;
+                let estimates: Vec<f64> = (768..1536)
+                    .filter(|&sample| reassigned.validity_mask[[ch, sample]])
+                    .map(|sample| reassigned.f_hat[[ch, sample]])
+                    .collect();
+                assert!(estimates.len() > 500);
+                let mean = estimates.iter().sum::<f64>() / estimates.len() as f64;
+                let maximum = estimates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let minimum = estimates.iter().copied().fold(f64::INFINITY, f64::min);
+                assert!(
+                    (mean - frequency).abs() < 1.0,
+                    "{frequency} Hz tone with {correction} correction estimated at {mean} Hz"
+                );
+                assert!(
+                    maximum - minimum < 3.0,
+                    "{frequency} Hz tone with {correction} correction oscillated over {} Hz",
+                    maximum - minimum
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn analysis_dft_covers_the_correction_and_pgc_cascade() {
+        let signal = vec![0.0; 128];
+        for correction_name in ["No", "ELC", "EarDrum"] {
+            let mut parameters = static_parameters();
+            parameters.out_mid_crct = correction_name.into();
+            let output = gcfb_v234(&signal, parameters).unwrap();
+            let operator = conditioned_operator_outputs(&signal, &output).unwrap();
+            let correction = correction_fir(&output.gc_param).unwrap();
+            let maximum_pgc_len = (0..output.gc_param.num_ch)
+                .map(|ch| real_pgc(&output.gc_param, &output, ch).unwrap().len())
+                .max()
+                .unwrap();
+            let convolution_len = signal.len() + correction.len() + maximum_pgc_len - 2;
+            assert_eq!(
+                operator.analysis_fft_len,
+                analysis_fft_len(signal.len(), correction.len(), maximum_pgc_len).unwrap()
+            );
+            assert!(operator.analysis_fft_len >= 2 * convolution_len);
+            assert!(operator.analysis_fft_len.is_power_of_two());
+        }
+    }
+
+    #[test]
+    fn frame_coordinates_are_invariant_to_input_scaling() {
+        let low: Vec<f64> = (0..320)
+            .map(|sample| 0.05 * (2.0 * PI * 700.0 * sample as f64 / 8000.0).sin())
+            .collect();
+        let high: Vec<f64> = low.iter().map(|sample| sample * 10.0).collect();
+        let (_, low_result) =
+            gcfb_v234_with_reassignment(&low, compact_frame_parameters()).unwrap();
+        let (_, high_result) =
+            gcfb_v234_with_reassignment(&high, compact_frame_parameters()).unwrap();
+        assert_eq!(low_result.validity_mask, high_result.validity_mask);
+        for ((a, b), valid) in low_result
+            .t_hat
+            .iter()
+            .zip(high_result.t_hat.iter())
+            .zip(low_result.validity_mask.iter())
+        {
+            if *valid {
+                assert_relative_eq!(a, b, epsilon = 2e-12);
+            }
+        }
+        for ((a, b), valid) in low_result
+            .f_hat
+            .iter()
+            .zip(high_result.f_hat.iter())
+            .zip(low_result.validity_mask.iter())
+        {
+            if *valid {
+                assert_relative_eq!(a, b, epsilon = 2e-8);
+            }
+        }
+        assert!(high_result.source_energy > low_result.source_energy);
+    }
+
+    #[test]
+    fn conditioned_sample_passes_match_an_explicit_kernel() {
+        let mut parameters = compact_frame_parameters();
+        parameters.num_ch = 2;
+        parameters.f_range = [500.0, 1200.0];
+        parameters.dyn_hpaf.str_prc = "sample-base".into();
+        parameters.num_update_asym_cmp = 2;
+        let signal: Vec<f64> = (0..10)
+            .map(|sample| 0.1 * (2.0 * PI * 650.0 * sample as f64 / 8000.0).sin())
+            .collect();
+        let output = gcfb_v234(&signal, parameters).unwrap();
+        let operator = conditioned_operator_outputs(&signal, &output).unwrap();
+        let ch = 0;
+        let pgc_real = real_pgc(&output.gc_param, &output, ch).unwrap();
+        let pgc = analytic_pgc(&pgc_real, operator.analysis_fft_len);
+        let inputs = prepare_input_spectra(&signal, output.gc_param.fs, operator.analysis_fft_len);
+        let mut padded_inputs = inputs.values.clone();
+        for values in &mut padded_inputs {
+            dsp::fft(values, true);
+        }
+        let target_sample = signal.len() - 1;
+        let mut kernel = vec![Complex64::new(0.0, 0.0); operator.analysis_fft_len];
+        for (input_sample, kernel_value) in kernel.iter_mut().enumerate() {
+            let mut state = ComplexCascadeState::default();
+            let mut coefficients = make_asym_cmp_filters_v2(
+                output.gc_param.fs,
+                &[output.gc_resp.fr2[[ch, 0]]],
+                &[output.gc_resp.b2_val[ch]],
+                &[output.gc_resp.c2_val[ch]],
+            )
+            .unwrap();
+            let mut value = Complex64::new(0.0, 0.0);
+            for sample in 0..=target_sample {
+                if sample % output.gc_param.num_update_asym_cmp == 0 {
+                    coefficients = make_asym_cmp_filters_v2(
+                        output.gc_param.fs,
+                        &[output.gc_resp.fr2[[ch, sample]]],
+                        &[output.gc_resp.b2_val[ch]],
+                        &[output.gc_resp.c2_val[ch]],
+                    )
+                    .unwrap();
+                }
+                let lag =
+                    (operator.analysis_fft_len + sample - input_sample) % operator.analysis_fft_len;
+                value = state.process(pgc.impulse[lag], &coefficients, 0);
+            }
+            *kernel_value = value;
+        }
+        let explicit: [Complex64; 3] = std::array::from_fn(|pass| {
+            kernel
+                .iter()
+                .zip(&padded_inputs[pass])
+                .map(|(kernel, input)| kernel * input)
+                .sum()
+        });
+        assert_relative_eq!(
+            explicit[0].re,
+            operator.coefficient[[ch, target_sample]].re,
+            epsilon = 2e-10
+        );
+        assert_relative_eq!(
+            explicit[0].im,
+            operator.coefficient[[ch, target_sample]].im,
+            epsilon = 2e-10
+        );
+        assert_relative_eq!(
+            explicit[1].re,
+            operator.time_weighted[[ch, target_sample]].re,
+            epsilon = 2e-10
+        );
+        assert_relative_eq!(
+            explicit[1].im,
+            operator.time_weighted[[ch, target_sample]].im,
+            epsilon = 2e-10
+        );
+        assert_relative_eq!(
+            explicit[2].re,
+            operator.derivative[[ch, target_sample]].re,
+            epsilon = 2e-8
+        );
+        assert_relative_eq!(
+            explicit[2].im,
+            operator.derivative[[ch, target_sample]].im,
+            epsilon = 2e-8
+        );
+    }
+
+    #[test]
+    fn analytic_energy_is_fully_accounted_for() {
+        let signal: Vec<f64> = (0..320)
+            .map(|sample| (2.0 * PI * 700.0 * sample as f64 / 8000.0).sin())
+            .collect();
+        for parameters in [static_parameters(), compact_frame_parameters()] {
+            let (_, reassigned) = gcfb_v234_with_reassignment(&signal, parameters).unwrap();
+            assert_relative_eq!(
+                reassigned.retained_energy()
+                    + reassigned.floor_discarded_energy
+                    + reassigned.boundary_discarded_energy,
+                reassigned.source_energy,
+                epsilon = reassigned.source_energy.max(1.0) * 2e-12
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_reassignment_floor_is_rejected() {
+        let signal = vec![0.0, 1.0, 0.0, 0.0];
+        let parameters = GcParam {
+            num_ch: 2,
+            f_range: [300.0, 1200.0],
+            ..static_parameters()
+        };
+        let output = gcfb_v234(&signal, parameters).unwrap();
+        let config = ReassignmentConfig {
+            coefficient_floor: 0.0,
+        };
+        assert!(reassign_gcfb_v234_with_config(&signal, &output, &config).is_err());
+    }
+
+    #[test]
+    fn gain_reference_variants_are_supported() {
+        let signal = vec![1.0; 64];
+        let parameters = GcParam {
+            gain_ref: GainReference::Db(50.0),
+            ..compact_frame_parameters()
+        };
+        let (_, result) = gcfb_v234_with_reassignment(&signal, parameters).unwrap();
+        assert!(result.source_energy.is_finite());
+    }
+}

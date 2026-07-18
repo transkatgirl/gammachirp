@@ -31,6 +31,50 @@ assert_eq!(output.dcgc_out.nrows(), 32);
 # Ok::<(), gammachirpy::Error>(())
 ```
 
+### Reassigned dcGC analysis
+
+GCFB v2.34 also exposes an analysis-only, energy-conserving reassignment map.
+On a shared finite DFT domain, it passes the original input and its exact time-
+and DFT-derivative-weighted forms through the configured outer/middle-ear
+correction FIR. It then projects each zero-padded real pGC onto the
+nonnegative bins, applies the same HP-AF operator to all three inputs, and
+computes coordinates without phase unwrapping. It bilinearly transports
+analytic-representation power (`|C|^2 / 2`) onto the frame-time/ERB grid. This
+is not pointwise or framewise `dcgc_out^2`, and the ordinary `GcfbOutput` is not
+changed.
+
+```rust
+use gammachirpy::gcfb_v234::{GcParam, gcfb_v234_with_reassignment};
+
+let input = [1.0, 0.0, 0.0, 0.0];
+let (filterbank, reassigned) =
+    gcfb_v234_with_reassignment(&input, GcParam {
+        num_ch: 32,
+        out_mid_crct: "No".into(),
+        ..GcParam::default()
+    })?;
+
+assert_eq!(filterbank.dcgc_out.nrows(), 32);
+assert_eq!(reassigned.energy_map.nrows(), 32);
+assert!((reassigned.retained_energy() + reassigned.discarded_energy
+    - reassigned.source_energy).abs() < 1e-10);
+# Ok::<(), gammachirpy::Error>(())
+```
+
+The imaginary analysis branch is offline and acausal; the ordinary real GCFB
+branch remains causal and unchanged. In frame mode, dynamic compression is a
+positive real gain, so it affects transported energy but not coordinates. In
+sample mode, all three operator applications replay the recorded HP-AF
+coefficient history. Its exactness is conditional on that history: the
+analysis does not differentiate through the nonlinear level estimator that
+created the coefficients. In all modes, exactness refers to the implemented
+zero-padded finite discrete operator up to floating-point error. The selected
+DFT length is exposed as `ReassignmentResult::analysis_fft_len`.
+
+Energy rejected by the relative coefficient floor and by target-map boundaries
+is reported separately. Reassignment sharpens resolved ridges but cannot split
+closely spaced components that already occupy the same gammachirp passband.
+
 Build and test with:
 
 ```bash
