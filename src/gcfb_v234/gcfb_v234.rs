@@ -182,7 +182,14 @@ pub struct GcfbOutput {
     pub gc_resp: GcResp,
 }
 
-pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
+pub fn set_param(param: GcParam) -> Result<(GcParam, GcResp)> {
+    set_param_with_preserved_hearing_loss(param, None)
+}
+
+fn set_param_with_preserved_hearing_loss(
+    mut param: GcParam,
+    preserved_hearing_loss: Option<&HLoss>,
+) -> Result<(GcParam, GcResp)> {
     if !param.fs.is_finite()
         || param.fs <= 0.
         || param.num_ch < 2
@@ -282,7 +289,11 @@ pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
         gain_factor: Array1::ones(param.num_ch),
         cgc_ref: None,
     };
-    param = gcfb_v23_hearing_loss(param, &response)?;
+    if let Some(hearing_loss) = preserved_hearing_loss {
+        param.hloss = hearing_loss.clone();
+    } else {
+        param = gcfb_v23_hearing_loss(param, &response)?;
+    }
     let shift = (param.lvl_est.lct_erb / erb_space).round() as isize;
     param.lvl_est.exp_decay_val =
         (-1. / (param.lvl_est.decay_hl * param.fs / 1000.) * 2_f64.ln()).exp();
@@ -716,12 +727,29 @@ pub fn gcfb_v23_sample_base(
 }
 
 pub fn gcfb_v234(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
+    gcfb_v234_internal(snd_in, gc_param, None)
+}
+
+pub(crate) fn gcfb_v234_with_preserved_hearing_loss(
+    snd_in: &[f64],
+    gc_param: GcParam,
+    hearing_loss: &HLoss,
+) -> Result<GcfbOutput> {
+    gcfb_v234_internal(snd_in, gc_param, Some(hearing_loss))
+}
+
+fn gcfb_v234_internal(
+    snd_in: &[f64],
+    gc_param: GcParam,
+    preserved_hearing_loss: Option<&HLoss>,
+) -> Result<GcfbOutput> {
     if snd_in.is_empty() {
         return Err(Error::InvalidParameter(
             "input sound cannot be empty".into(),
         ));
     }
-    let (param, mut response) = set_param(gc_param)?;
+    let (param, mut response) =
+        set_param_with_preserved_hearing_loss(gc_param, preserved_hearing_loss)?;
     let snd = if param.out_mid_crct.eq_ignore_ascii_case("no") {
         snd_in.to_vec()
     } else {

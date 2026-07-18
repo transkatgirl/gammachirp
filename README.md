@@ -75,11 +75,66 @@ Energy rejected by the relative coefficient floor and by target-map boundaries
 is reported separately. Reassignment sharpens resolved ridges but cannot split
 closely spaced components that already occupy the same gammachirp passband.
 
+Phase-aware reassignment is available through
+`gcfb_v234_with_phase_reassignment` and
+`phase_reassign_gcfb_v234_with_config`. It follows the complex phase transport
+proposed by [Gardner and Magnasco (2006)](https://pmc.ncbi.nlm.nih.gov/articles/PMC1431718/).
+For a source coefficient in channel `k`, it scales the analytic coefficient
+so its squared magnitude is the transported energy, then applies
+
+\[
+\exp\!\left(i\pi(f_{r1,k}+\hat f)(\hat t-t)\right)
+\]
+
+before bilinear deposition. `PhaseReassignmentResult::complex_map` retains
+absolute phase for analysis, while `phase_coherence_map` is the magnitude of
+the complex sum divided by the sum of contribution magnitudes. Empty bins have
+zero coherence. The matched `unreassigned_energy_map` contains only the same
+floor- and boundary-accepted contributions on the reassigned map's grid. Its
+time coordinate is the source sample for sample-based analyses and the
+originating frame for frame-based analyses.
+
+`SparsityMetrics` reports Shannon entropy in nats, its exponential as the
+effective number of bins, and the effective-bin fraction. A
+`SparsityComparison` rejects maps whose retained energy differs, preventing
+coefficient floors or boundary losses from making reassignment appear
+artificially sparse. Deterministic white-noise tests in this crate show reduced
+effective support for the matched GCFB maps; that is an empirical observation
+of this implementation, not the paper's Gaussian-STFT white-noise theorem.
+
+`gcfb_v234_with_bandwidth_consensus` runs phase-aware analysis at several
+complete-filter bandwidths. Its default scales are `0.75`, `1.0`, and `1.5`.
+Each scale multiplies both coefficients of `b1`, every coefficient of `b2`, and
+`lvl_est.b2`; chirp, compression, level-control, hearing-loss, and frequency-
+grid parameters remain fixed. Each reassigned energy map is normalized by its
+own maximum. The agreement map counts the fraction above the relative support
+floor, and salience is the required-agreement order statistic (the default
+requires every scale). The returned ordinary `GcfbOutput` and the analysis at
+the unique `1.0` baseline share the exact unscaled run.
+
+These extensions are model-specific analogues of the paper's Gaussian-STFT
+experiments. Its STFT-zero topology, unlimited localization precision, and
+reconstruction behavior do not automatically hold for the nonlinear GCFB.
+The complex output preserves phase for analysis and coherence measurement, but
+it is not an invertible GCFB representation and has no synthesis guarantee.
+All complex and consensus paths use the offline/acausal imaginary branch. In
+sample mode they replay the realized coefficient history, so their meaning is
+conditional on that history and does not include differentiation through the
+nonlinear estimator.
+
+Run the deterministic tones, clicks, chirp, and seeded-noise example (it only
+prints measurements and writes no files) with:
+
+```bash
+cargo run --example v234_phase_consensus
+```
+
 Build and test with:
 
 ```bash
-cargo test
-cargo doc --no-deps --open
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test --doc
 ```
 
 ### Rust/Python parity properties

@@ -18,6 +18,24 @@
 //! [Holighaus et al.](https://ltfat.org/notes/ltfatnote041.pdf) written as
 //! operator applications.  Exactness refers to this implemented finite
 //! discrete operator, up to floating-point error.
+//!
+//! The opt-in complex map applies the phase transport proposed by
+//! [Gardner and Magnasco (2006)](https://pmc.ncbi.nlm.nih.gov/articles/PMC1431718/):
+//! each analytic coefficient is rotated by the phase accumulated between its
+//! source and reassigned coordinates.  This preserves useful absolute-phase
+//! information for analysis and makes phase coherence measurable, but it is
+//! **not** an invertible GCFB representation and no reconstruction API is
+//! provided.  The paper's zero topology, white-noise sparsity theorem,
+//! unlimited localization claims, and reconstruction observations concern a
+//! Gaussian STFT and do not transfer unchanged to this nonlinear gammachirp
+//! filterbank.
+//!
+//! Bandwidth consensus is likewise a model-specific analogue: a scale changes
+//! all passive and asymmetric bandwidth coefficients (`b1`, `b2`, and
+//! `lvl_est.b2`) while leaving chirp, compression, level-control,
+//! hearing-loss, and frequency-grid parameters unchanged.  Every complex
+//! analysis remains offline/acausal.  Sample-mode coordinates and phase are
+//! conditional on the recorded nonlinear coefficient history.
 
 use std::f64::consts::PI;
 
@@ -25,7 +43,8 @@ use ndarray::{Array1, Array2};
 use num_complex::Complex64;
 
 use super::gcfb_v234::{
-    AcfCoef, ControlMode, GcParam, GcfbOutput, cmprs_gc_frsp, gcfb_v234, make_asym_cmp_filters_v2,
+    AcfCoef, ControlMode, GcParam, GcfbOutput, cmprs_gc_frsp, gcfb_v234,
+    gcfb_v234_with_preserved_hearing_loss, make_asym_cmp_filters_v2,
 };
 use super::utils;
 use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
@@ -102,7 +121,177 @@ impl ReassignmentResult {
     }
 }
 
+/// Phase-preserving, analysis-only reassignment output.
+///
+/// `complex_map` contains the bilinearly transported, phase-corrected analytic
+/// coefficients.  Its squared magnitude is not generally equal to
+/// `reassignment.energy_map`, because multiple contributions may interfere.
+#[derive(Clone, Debug)]
+pub struct PhaseReassignmentResult {
+    /// Coordinates, energy map, masks, axes, and energy accounting.
+    pub reassignment: ReassignmentResult,
+    /// Phase-corrected complex contributions on the reassigned grid.
+    pub complex_map: Array2<Complex64>,
+    /// Magnitude of the complex sum divided by the sum of contribution
+    /// magnitudes. Empty bins are zero; all values are in `[0, 1]`.
+    pub phase_coherence_map: Array2<f64>,
+    /// Successfully transported energy accumulated on the reassigned map's
+    /// channel/time grid before reassignment. Sample-based analyses use each
+    /// coefficient's source sample; frame-based analyses use the originating
+    /// frame. Its total matches the reassigned map, so floor and boundary
+    /// rejection affect both sides of a sparsity comparison identically.
+    pub unreassigned_energy_map: Array2<f64>,
+}
+
+impl PhaseReassignmentResult {
+    /// A descriptive alias for [`Self::complex_map`].
+    pub fn phase_corrected_map(&self) -> &Array2<Complex64> {
+        &self.complex_map
+    }
+
+    /// Compare the effective support of the matched retained-energy maps.
+    pub fn sparsity_comparison(&self) -> Result<SparsityComparison> {
+        SparsityComparison::from_maps(&self.reassignment.energy_map, &self.unreassigned_energy_map)
+    }
+}
+
+/// Entropy-based support statistics for a nonnegative energy map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SparsityMetrics {
+    /// Shannon entropy `-sum(p_i * ln(p_i))`, in nats.
+    pub shannon_entropy: f64,
+    /// Perplexity `exp(shannon_entropy)`, interpreted as effective bins.
+    pub effective_bins: f64,
+    /// Effective bins divided by the total number of bins.
+    pub effective_bin_fraction: f64,
+}
+
+impl SparsityMetrics {
+    /// Compute metrics from a finite, nonnegative energy map.
+    ///
+    /// An all-zero or empty map has zero entropy, zero effective bins, and a
+    /// zero effective-bin fraction.
+    pub fn from_energy_map(energy_map: &Array2<f64>) -> Result<Self> {
+        if energy_map
+            .iter()
+            .any(|energy| !energy.is_finite() || *energy < 0.0)
+        {
+            return Err(Error::InvalidParameter(
+                "sparsity metrics require a finite, nonnegative energy map".into(),
+            ));
+        }
+        let total = energy_map.sum();
+        if energy_map.is_empty() || total == 0.0 {
+            return Ok(Self {
+                shannon_entropy: 0.0,
+                effective_bins: 0.0,
+                effective_bin_fraction: 0.0,
+            });
+        }
+        if !total.is_finite() {
+            return Err(Error::Numerical(
+                "non-finite total energy while computing sparsity metrics".into(),
+            ));
+        }
+        let shannon_entropy = energy_map
+            .iter()
+            .filter(|&&energy| energy > 0.0)
+            .map(|&energy| {
+                let probability = energy / total;
+                -probability * probability.ln()
+            })
+            .sum::<f64>()
+            .max(0.0);
+        let effective_bins = shannon_entropy.exp();
+        Ok(Self {
+            shannon_entropy,
+            effective_bins,
+            effective_bin_fraction: effective_bins / energy_map.len() as f64,
+        })
+    }
+}
+
+/// Matched-energy sparsity statistics before and after reassignment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SparsityComparison {
+    /// Metrics for the reassigned energy map.
+    pub reassigned: SparsityMetrics,
+    /// Metrics for the same retained contributions at their source bins.
+    pub unreassigned: SparsityMetrics,
+}
+
+impl SparsityComparison {
+    /// Compare maps only when they contain the same retained energy.
+    pub fn from_maps(
+        reassigned_energy_map: &Array2<f64>,
+        unreassigned_energy_map: &Array2<f64>,
+    ) -> Result<Self> {
+        if reassigned_energy_map.dim() != unreassigned_energy_map.dim() {
+            return Err(Error::InvalidParameter(
+                "sparsity comparison requires maps on the same grid".into(),
+            ));
+        }
+        let reassigned = SparsityMetrics::from_energy_map(reassigned_energy_map)?;
+        let unreassigned = SparsityMetrics::from_energy_map(unreassigned_energy_map)?;
+        let reassigned_energy = reassigned_energy_map.sum();
+        let unreassigned_energy = unreassigned_energy_map.sum();
+        let tolerance = reassigned_energy.abs().max(unreassigned_energy.abs()) * 1e-10;
+        if (reassigned_energy - unreassigned_energy).abs() > tolerance {
+            return Err(Error::InvalidParameter(
+                "sparsity comparison requires maps with identical retained energy".into(),
+            ));
+        }
+        Ok(Self {
+            reassigned,
+            unreassigned,
+        })
+    }
+}
+
+/// Options for model-specific bandwidth consensus.
+#[derive(Clone, Debug)]
+pub struct BandwidthConsensusConfig {
+    /// Multipliers applied to `b1`, `b2`, and `lvl_est.b2`.
+    pub scales: Vec<f64>,
+    /// A normalized scale map supports a bin only when it exceeds this value.
+    pub relative_support_floor: f64,
+    /// Minimum fraction of scales required by the consensus mask and salience
+    /// order statistic.
+    pub required_agreement: f64,
+    /// Reassignment options shared by every bandwidth scale.
+    pub reassignment_config: ReassignmentConfig,
+}
+
+impl Default for BandwidthConsensusConfig {
+    fn default() -> Self {
+        Self {
+            scales: vec![0.75, 1.0, 1.5],
+            relative_support_floor: 1e-6,
+            required_agreement: 1.0,
+            reassignment_config: ReassignmentConfig::default(),
+        }
+    }
+}
+
+/// Multi-bandwidth phase analyses and their scale-stability maps.
+#[derive(Clone, Debug)]
+pub struct BandwidthConsensusResult {
+    /// Validated bandwidth scales in analysis order.
+    pub scales: Vec<f64>,
+    /// Phase-aware reassignment result for every scale.
+    pub analyses: Vec<PhaseReassignmentResult>,
+    /// Index of the unique unscaled (`1.0`) analysis.
+    pub baseline_index: usize,
+    /// Fraction of normalized scale maps above the support floor per bin.
+    pub agreement_map: Array2<f64>,
+    /// Bins meeting `required_agreement`.
+    pub consensus_mask: Array2<bool>,
+    /// Required-agreement order statistic of the normalized scale maps.
+    pub salience_map: Array2<f64>,
+}
+
 struct CoefficientAnalysis {
+    coefficient: Array2<Complex64>,
     power: Array2<f64>,
     t_hat: Array2<f64>,
     f_hat: Array2<f64>,
@@ -152,35 +341,262 @@ pub fn reassign_gcfb_v234_with_config(
     output: &GcfbOutput,
     config: &ReassignmentConfig,
 ) -> Result<ReassignmentResult> {
+    Ok(reassignment_products(snd_in, output, config, false)?.0)
+}
+
+/// Run GCFB v2.34 and its opt-in phase-aware reassignment together.
+///
+/// The ordinary output is identical to [`gcfb_v234`]. The complex result is
+/// analysis-only and carries no reconstruction guarantee.
+pub fn gcfb_v234_with_phase_reassignment(
+    snd_in: &[f64],
+    gc_param: GcParam,
+) -> Result<(GcfbOutput, PhaseReassignmentResult)> {
+    let output = gcfb_v234(snd_in, gc_param)?;
+    let reassignment = phase_reassign_gcfb_v234(snd_in, &output)?;
+    Ok((output, reassignment))
+}
+
+/// Phase-reassign an existing GCFB output with default options.
+/// `snd_in` must be the input used to produce `output`.
+pub fn phase_reassign_gcfb_v234(
+    snd_in: &[f64],
+    output: &GcfbOutput,
+) -> Result<PhaseReassignmentResult> {
+    phase_reassign_gcfb_v234_with_config(snd_in, output, &ReassignmentConfig::default())
+}
+
+/// Phase-reassign an existing GCFB output with explicit options.
+pub fn phase_reassign_gcfb_v234_with_config(
+    snd_in: &[f64],
+    output: &GcfbOutput,
+    config: &ReassignmentConfig,
+) -> Result<PhaseReassignmentResult> {
+    let (reassignment, phase) = reassignment_products(snd_in, output, config, true)?;
+    let phase = phase.expect("phase transport was requested");
+    let phase_coherence_map = phase.coherence_map();
+    Ok(PhaseReassignmentResult {
+        reassignment,
+        complex_map: phase.complex_map,
+        phase_coherence_map,
+        unreassigned_energy_map: phase.unreassigned_energy_map,
+    })
+}
+
+/// Run a phase analysis at every configured bandwidth and form a consensus.
+///
+/// Exactly one scale must be `1.0`; its phase analysis is computed from the
+/// returned, unscaled [`GcfbOutput`]. Other scales uniformly multiply `b1`,
+/// `b2`, and `lvl_est.b2` before running independent GCFB analyses.
+pub fn gcfb_v234_with_bandwidth_consensus(
+    snd_in: &[f64],
+    gc_param: GcParam,
+    config: &BandwidthConsensusConfig,
+) -> Result<(GcfbOutput, BandwidthConsensusResult)> {
+    let baseline_index = validate_consensus_config(config)?;
+    let output = gcfb_v234(snd_in, gc_param.clone())?;
+    let mut analyses = Vec::with_capacity(config.scales.len());
+    for (index, &scale) in config.scales.iter().enumerate() {
+        let analysis = if index == baseline_index {
+            phase_reassign_gcfb_v234_with_config(snd_in, &output, &config.reassignment_config)?
+        } else {
+            let scaled_output = gcfb_v234_with_preserved_hearing_loss(
+                snd_in,
+                scale_bandwidths(gc_param.clone(), scale),
+                &output.gc_param.hloss,
+            )?;
+            phase_reassign_gcfb_v234_with_config(
+                snd_in,
+                &scaled_output,
+                &config.reassignment_config,
+            )?
+        };
+        analyses.push(analysis);
+    }
+    let (agreement_map, consensus_mask, salience_map) = consensus_maps(
+        &analyses,
+        config.relative_support_floor,
+        config.required_agreement,
+    )?;
+    Ok((
+        output,
+        BandwidthConsensusResult {
+            scales: config.scales.clone(),
+            analyses,
+            baseline_index,
+            agreement_map,
+            consensus_mask,
+            salience_map,
+        },
+    ))
+}
+
+fn reassignment_products(
+    snd_in: &[f64],
+    output: &GcfbOutput,
+    config: &ReassignmentConfig,
+    include_phase: bool,
+) -> Result<(ReassignmentResult, Option<PhaseAccounting>)> {
     validate_analysis_input(snd_in, output, config)?;
     let operator = conditioned_operator_outputs(snd_in, output)?;
     let analysis = analyze_coefficients(operator, config.coefficient_floor)?;
     let frame_mode = output.gc_param.ctrl == ControlMode::Dynamic
         && output.gc_param.dyn_hpaf.str_prc.contains("frame");
-    let (time_axis, mut accounting) = if frame_mode {
-        transport_frame_energy(output, &analysis)?
+    let (time_axis, mut transported) = if frame_mode {
+        transport_frame_energy(output, &analysis, include_phase)?
     } else {
-        transport_sample_energy(output, &analysis)?
+        transport_sample_energy(output, &analysis, include_phase)?
     };
     let frequency_axis_hz = output.gc_param.fr1.clone();
     let (frequency_axis_erb, _) = utils::freq2erb(frequency_axis_hz.as_slice().unwrap());
-    accounting.discarded = accounting.floor + accounting.boundary;
+    transported.energy.discarded = transported.energy.floor + transported.energy.boundary;
 
-    Ok(ReassignmentResult {
-        energy_map: accounting.map,
+    let reassignment = ReassignmentResult {
+        energy_map: transported.energy.map,
         t_hat: analysis.t_hat,
         f_hat: analysis.f_hat,
         validity_mask: analysis.validity_mask,
         time_axis,
         frequency_axis_hz,
         frequency_axis_erb,
-        source_energy: accounting.source,
-        floor_discarded_energy: accounting.floor,
-        boundary_discarded_energy: accounting.boundary,
-        discarded_energy: accounting.discarded,
+        source_energy: transported.energy.source,
+        floor_discarded_energy: transported.energy.floor,
+        boundary_discarded_energy: transported.energy.boundary,
+        discarded_energy: transported.energy.discarded,
         mode: analysis.mode,
         analysis_fft_len: analysis.analysis_fft_len,
-    })
+    };
+    Ok((reassignment, transported.phase))
+}
+
+fn validate_consensus_config(config: &BandwidthConsensusConfig) -> Result<usize> {
+    if config.scales.len() < 2
+        || !config.relative_support_floor.is_finite()
+        || config.relative_support_floor <= 0.0
+        || config.relative_support_floor >= 1.0
+        || !config.required_agreement.is_finite()
+        || config.required_agreement <= 0.0
+        || config.required_agreement > 1.0
+    {
+        return Err(Error::InvalidParameter(
+            "bandwidth consensus requires at least two scales, a support floor in (0, 1), and required agreement in (0, 1]"
+                .into(),
+        ));
+    }
+    if config
+        .scales
+        .iter()
+        .any(|scale| !scale.is_finite() || *scale <= 0.0)
+    {
+        return Err(Error::InvalidParameter(
+            "bandwidth consensus scales must be positive and finite".into(),
+        ));
+    }
+    for (index, scale) in config.scales.iter().enumerate() {
+        if config.scales[..index].contains(scale) {
+            return Err(Error::InvalidParameter(
+                "bandwidth consensus scales must be unique".into(),
+            ));
+        }
+    }
+    let baselines: Vec<usize> = config
+        .scales
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &scale)| (scale == 1.0).then_some(index))
+        .collect();
+    if baselines.len() != 1 {
+        return Err(Error::InvalidParameter(
+            "bandwidth consensus requires exactly one 1.0 baseline scale".into(),
+        ));
+    }
+    validate_reassignment_config(&config.reassignment_config)?;
+    Ok(baselines[0])
+}
+
+fn validate_reassignment_config(config: &ReassignmentConfig) -> Result<()> {
+    if !config.coefficient_floor.is_finite()
+        || config.coefficient_floor <= 0.0
+        || config.coefficient_floor >= 1.0
+    {
+        return Err(Error::InvalidParameter(
+            "reassignment coefficient floor must be in (0, 1)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn scale_bandwidths(mut parameters: GcParam, scale: f64) -> GcParam {
+    for coefficient in &mut parameters.b1 {
+        *coefficient *= scale;
+    }
+    for row in &mut parameters.b2 {
+        for coefficient in row {
+            *coefficient *= scale;
+        }
+    }
+    parameters.lvl_est.b2 *= scale;
+    parameters
+}
+
+fn consensus_maps(
+    analyses: &[PhaseReassignmentResult],
+    relative_support_floor: f64,
+    required_agreement: f64,
+) -> Result<(Array2<f64>, Array2<bool>, Array2<f64>)> {
+    let dimensions = analyses
+        .first()
+        .ok_or_else(|| Error::InvalidParameter("bandwidth consensus has no analyses".into()))?
+        .reassignment
+        .energy_map
+        .dim();
+    if analyses
+        .iter()
+        .any(|analysis| analysis.reassignment.energy_map.dim() != dimensions)
+    {
+        return Err(Error::InvalidParameter(
+            "bandwidth consensus scale maps do not share a target grid".into(),
+        ));
+    }
+    let maxima: Vec<f64> = analyses
+        .iter()
+        .map(|analysis| {
+            analysis
+                .reassignment
+                .energy_map
+                .iter()
+                .copied()
+                .fold(0.0, f64::max)
+        })
+        .collect();
+    let required_count = (required_agreement * analyses.len() as f64).ceil() as usize;
+    let mut agreement_map = Array2::zeros(dimensions);
+    let mut consensus_mask = Array2::from_elem(dimensions, false);
+    let mut salience_map = Array2::zeros(dimensions);
+    for ch in 0..dimensions.0 {
+        for time in 0..dimensions.1 {
+            let mut normalized: Vec<f64> = analyses
+                .iter()
+                .zip(&maxima)
+                .map(|(analysis, &maximum)| {
+                    if maximum > 0.0 {
+                        analysis.reassignment.energy_map[[ch, time]] / maximum
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let support_count = normalized
+                .iter()
+                .filter(|&&value| value > relative_support_floor)
+                .count();
+            agreement_map[[ch, time]] = support_count as f64 / analyses.len() as f64;
+            consensus_mask[[ch, time]] = support_count >= required_count;
+            normalized.sort_by(|left, right| right.total_cmp(left));
+            salience_map[[ch, time]] = normalized[required_count - 1];
+        }
+    }
+    Ok((agreement_map, consensus_mask, salience_map))
 }
 
 fn validate_analysis_input(
@@ -188,15 +604,13 @@ fn validate_analysis_input(
     output: &GcfbOutput,
     config: &ReassignmentConfig,
 ) -> Result<()> {
+    validate_reassignment_config(config)?;
     let channels = output.gc_param.num_ch;
     if snd.is_empty()
         || channels == 0
         || output.gc_param.fr1.len() != channels
         || output.scgc_smpl.nrows() != channels
         || output.gc_resp.gain_factor.len() != channels
-        || !config.coefficient_floor.is_finite()
-        || config.coefficient_floor <= 0.0
-        || config.coefficient_floor >= 1.0
     {
         return Err(Error::InvalidParameter(
             "reassignment requires a matching non-empty GCFB output and a coefficient floor in (0, 1)"
@@ -584,6 +998,7 @@ fn analyze_coefficients(
     }
     let validity_mask = apply_floor(&power, &t_hat, &f_hat, relative_floor)?;
     Ok(CoefficientAnalysis {
+        coefficient: operator.coefficient,
         power,
         t_hat,
         f_hat,
@@ -634,10 +1049,51 @@ struct EnergyAccounting {
     discarded: f64,
 }
 
+struct PhaseAccounting {
+    complex_map: Array2<Complex64>,
+    contribution_magnitude_map: Array2<f64>,
+    unreassigned_energy_map: Array2<f64>,
+}
+
+impl PhaseAccounting {
+    fn coherence_map(&self) -> Array2<f64> {
+        Array2::from_shape_fn(self.complex_map.dim(), |index| {
+            let magnitude_sum = self.contribution_magnitude_map[index];
+            if magnitude_sum > 0.0 {
+                (self.complex_map[index].norm() / magnitude_sum).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+    }
+}
+
+struct TransportAccounting {
+    energy: EnergyAccounting,
+    phase: Option<PhaseAccounting>,
+}
+
+impl TransportAccounting {
+    fn new(target_dimensions: (usize, usize), include_phase: bool) -> Self {
+        Self {
+            energy: EnergyAccounting {
+                map: Array2::zeros(target_dimensions),
+                ..EnergyAccounting::default()
+            },
+            phase: include_phase.then(|| PhaseAccounting {
+                complex_map: Array2::from_elem(target_dimensions, Complex64::new(0.0, 0.0)),
+                contribution_magnitude_map: Array2::zeros(target_dimensions),
+                unreassigned_energy_map: Array2::zeros(target_dimensions),
+            }),
+        }
+    }
+}
+
 fn transport_frame_energy(
     output: &GcfbOutput,
     analysis: &CoefficientAnalysis,
-) -> Result<(Array1<f64>, EnergyAccounting)> {
+    include_phase: bool,
+) -> Result<(Array1<f64>, TransportAccounting)> {
     let param = &output.gc_param;
     let response = &output.gc_resp;
     let frames = response.asym_func_gain.ncols();
@@ -666,10 +1122,7 @@ fn transport_frame_energy(
             .unwrap(),
         2048,
     )?;
-    let mut accounting = EnergyAccounting {
-        map: Array2::zeros((param.num_ch, frames)),
-        ..EnergyAccounting::default()
-    };
+    let mut accounting = TransportAccounting::new((param.num_ch, frames), include_phase);
     let half = param.dyn_hpaf.len_frame / 2;
     for ch in 0..param.num_ch {
         for frame in 0..frames {
@@ -691,6 +1144,11 @@ fn transport_frame_energy(
                     analysis.validity_mask[[ch, sample]],
                     analysis.t_hat[[ch, sample]],
                     analysis.f_hat[[ch, sample]],
+                    ch,
+                    frame,
+                    sample as f64 / param.fs,
+                    param.fr1[ch],
+                    analysis.coefficient[[ch, sample]],
                     time_axis.as_slice().unwrap(),
                     frequency_axis.as_slice().unwrap(),
                 )?;
@@ -703,15 +1161,13 @@ fn transport_frame_energy(
 fn transport_sample_energy(
     output: &GcfbOutput,
     analysis: &CoefficientAnalysis,
-) -> Result<(Array1<f64>, EnergyAccounting)> {
+    include_phase: bool,
+) -> Result<(Array1<f64>, TransportAccounting)> {
     let param = &output.gc_param;
     let samples = analysis.power.ncols();
     let time_axis = Array1::from_iter((0..samples).map(|sample| sample as f64 / param.fs));
     let (frequency_axis, _) = utils::freq2erb(param.fr1.as_slice().unwrap());
-    let mut accounting = EnergyAccounting {
-        map: Array2::zeros((param.num_ch, samples)),
-        ..EnergyAccounting::default()
-    };
+    let mut accounting = TransportAccounting::new((param.num_ch, samples), include_phase);
     for ch in 0..param.num_ch {
         let gain = output.gc_resp.gain_factor[ch];
         for sample in 0..samples {
@@ -722,6 +1178,11 @@ fn transport_sample_energy(
                 analysis.validity_mask[[ch, sample]],
                 analysis.t_hat[[ch, sample]],
                 analysis.f_hat[[ch, sample]],
+                ch,
+                sample,
+                sample as f64 / param.fs,
+                param.fr1[ch],
+                analysis.coefficient[[ch, sample]],
                 time_axis.as_slice().unwrap(),
                 frequency_axis.as_slice().unwrap(),
             )?;
@@ -732,11 +1193,16 @@ fn transport_sample_energy(
 
 #[allow(clippy::too_many_arguments)]
 fn deposit_energy(
-    accounting: &mut EnergyAccounting,
+    accounting: &mut TransportAccounting,
     energy: f64,
     valid: bool,
     time: f64,
     frequency_hz: f64,
+    source_channel: usize,
+    source_time_bin: usize,
+    source_time: f64,
+    source_center_hz: f64,
+    source_coefficient: Complex64,
     time_axis: &[f64],
     frequency_axis_erb: &[f64],
 ) -> Result<()> {
@@ -748,28 +1214,52 @@ fn deposit_energy(
     if energy == 0.0 {
         return Ok(());
     }
-    accounting.source += energy;
+    accounting.energy.source += energy;
     if !valid {
-        accounting.floor += energy;
+        accounting.energy.floor += energy;
         return Ok(());
     }
     if frequency_hz <= 0.0 {
-        accounting.boundary += energy;
+        accounting.energy.boundary += energy;
         return Ok(());
     }
     let (erb, _) = utils::freq2erb(&[frequency_hz]);
     let Some(time_weights) = linear_weights(time_axis, time) else {
-        accounting.boundary += energy;
+        accounting.energy.boundary += energy;
         return Ok(());
     };
     let Some(frequency_weights) = linear_weights(frequency_axis_erb, erb[0]) else {
-        accounting.boundary += energy;
+        accounting.energy.boundary += energy;
         return Ok(());
+    };
+    let phase_contribution = if accounting.phase.is_some() {
+        let coefficient_power = source_coefficient.norm_sqr();
+        if !coefficient_power.is_finite() || coefficient_power <= 0.0 {
+            return Err(Error::Numerical(
+                "retained phase contribution has zero or non-finite analytic magnitude".into(),
+            ));
+        }
+        let scaled_coefficient = source_coefficient * (energy / coefficient_power).sqrt();
+        let phase = PI * (source_center_hz + frequency_hz) * (time - source_time);
+        Some(scaled_coefficient * Complex64::new(phase.cos(), phase.sin()))
+    } else {
+        None
     };
     for &(time_bin, time_weight) in &time_weights {
         for &(frequency_bin, frequency_weight) in &frequency_weights {
-            accounting.map[[frequency_bin, time_bin]] += energy * time_weight * frequency_weight;
+            let weight = time_weight * frequency_weight;
+            accounting.energy.map[[frequency_bin, time_bin]] += energy * weight;
+            if let (Some(phase), Some(contribution)) =
+                (accounting.phase.as_mut(), phase_contribution)
+            {
+                phase.complex_map[[frequency_bin, time_bin]] += contribution * weight;
+                phase.contribution_magnitude_map[[frequency_bin, time_bin]] +=
+                    contribution.norm() * weight;
+            }
         }
+    }
+    if let Some(phase) = accounting.phase.as_mut() {
+        phase.unreassigned_energy_map[[source_channel, source_time_bin]] += energy;
     }
     Ok(())
 }
@@ -796,6 +1286,7 @@ fn linear_weights(axis: &[f64], value: f64) -> Option<Vec<(usize, f64)>> {
 #[cfg(test)]
 mod tests {
     use approx::assert_relative_eq;
+    use ndarray::array;
 
     use super::*;
     use crate::gcfb_v234::{DynHpaf, GainReference, GcParam};
@@ -821,6 +1312,16 @@ mod tests {
             ctrl: ControlMode::Static,
             ..compact_frame_parameters()
         }
+    }
+
+    fn deterministic_noise(samples: usize) -> Vec<f64> {
+        let mut state = 0x9e37_79b9_u32;
+        (0..samples)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (f64::from(state) / f64::from(u32::MAX)) * 2.0 - 1.0
+            })
+            .collect()
     }
 
     #[test]
@@ -1158,5 +1659,367 @@ mod tests {
         };
         let (_, result) = gcfb_v234_with_reassignment(&signal, parameters).unwrap();
         assert!(result.source_energy.is_finite());
+    }
+
+    #[test]
+    fn phase_deposition_matches_the_average_frequency_rotation_and_linear_weights() {
+        let time_axis = [0.0, 0.0025];
+        let (frequency_axis_erb, _) = utils::freq2erb(&[100.0, 300.0, 500.0]);
+        let mut accounting = TransportAccounting::new((3, 2), true);
+
+        // The destination lies halfway between the two time bins. In radians,
+        // the expected transport is
+        //   pi * (100 Hz + 300 Hz) * (0.00125 s - 0 s) = pi / 2.
+        // Scaling (3 + 4i) to energy 9 gives 1.8 + 2.4i, and a +pi/2
+        // rotation therefore gives -2.4 + 1.8i before interpolation.
+        deposit_energy(
+            &mut accounting,
+            9.0,
+            true,
+            0.00125,
+            300.0,
+            0,
+            0,
+            0.0,
+            100.0,
+            Complex64::new(3.0, 4.0),
+            &time_axis,
+            frequency_axis_erb.as_slice().unwrap(),
+        )
+        .unwrap();
+
+        assert_relative_eq!(accounting.energy.source, 9.0, epsilon = 1e-14);
+        assert_relative_eq!(accounting.energy.map[[1, 0]], 4.5, epsilon = 1e-14);
+        assert_relative_eq!(accounting.energy.map[[1, 1]], 4.5, epsilon = 1e-14);
+        assert_relative_eq!(accounting.energy.map.sum(), 9.0, epsilon = 1e-14);
+
+        let phase = accounting.phase.unwrap();
+        for time_bin in 0..2 {
+            assert_relative_eq!(phase.complex_map[[1, time_bin]].re, -1.2, epsilon = 2e-15);
+            assert_relative_eq!(phase.complex_map[[1, time_bin]].im, 0.9, epsilon = 2e-15);
+            assert_relative_eq!(
+                phase.contribution_magnitude_map[[1, time_bin]],
+                1.5,
+                epsilon = 2e-15
+            );
+        }
+        assert_relative_eq!(phase.unreassigned_energy_map[[0, 0]], 9.0, epsilon = 1e-14);
+        assert_relative_eq!(phase.coherence_map()[[1, 0]], 1.0, epsilon = 2e-15);
+        assert_relative_eq!(phase.coherence_map()[[1, 1]], 1.0, epsilon = 2e-15);
+    }
+
+    #[test]
+    fn phase_transport_preserves_energy_results_and_matches_retained_source_energy() {
+        let signal: Vec<f64> = (0..640)
+            .map(|sample| (2.0 * PI * 713.0 * sample as f64 / 8000.0).cos())
+            .collect();
+        for parameters in [static_parameters(), compact_frame_parameters()] {
+            let output = gcfb_v234(&signal, parameters).unwrap();
+            let energy = reassign_gcfb_v234(&signal, &output).unwrap();
+            let phase = phase_reassign_gcfb_v234(&signal, &output).unwrap();
+            assert_eq!(energy.energy_map, phase.reassignment.energy_map);
+            assert_eq!(energy.t_hat, phase.reassignment.t_hat);
+            assert_eq!(energy.f_hat, phase.reassignment.f_hat);
+            assert_eq!(energy.validity_mask, phase.reassignment.validity_mask);
+            assert_eq!(
+                phase.unreassigned_energy_map.dim(),
+                phase.reassignment.energy_map.dim()
+            );
+            assert_relative_eq!(
+                phase.unreassigned_energy_map.sum(),
+                phase.reassignment.retained_energy(),
+                epsilon = phase.reassignment.retained_energy().max(1.0) * 2e-12
+            );
+            phase.sparsity_comparison().unwrap();
+            assert!(
+                phase
+                    .phase_coherence_map
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            );
+        }
+    }
+
+    #[test]
+    fn static_phase_map_scales_linearly_and_energy_quadratically() {
+        let signal: Vec<f64> = (0..768)
+            .map(|sample| 0.1 * (2.0 * PI * 700.0 * sample as f64 / 8000.0).cos())
+            .collect();
+        let scaled: Vec<f64> = signal.iter().map(|value| 3.0 * value).collect();
+        let parameters = GcParam {
+            num_ch: 2,
+            f_range: [650.0, 750.0],
+            ..static_parameters()
+        };
+        let (_, low) = gcfb_v234_with_phase_reassignment(&signal, parameters.clone()).unwrap();
+        let (_, high) = gcfb_v234_with_phase_reassignment(&scaled, parameters).unwrap();
+        assert_eq!(
+            low.reassignment.validity_mask,
+            high.reassignment.validity_mask
+        );
+        for (low, high) in low.complex_map.iter().zip(&high.complex_map) {
+            assert_relative_eq!(high.re, 3.0 * low.re, epsilon = 2e-9, max_relative = 2e-9);
+            assert_relative_eq!(high.im, 3.0 * low.im, epsilon = 2e-9, max_relative = 2e-9);
+        }
+        for (low, high) in low
+            .reassignment
+            .energy_map
+            .iter()
+            .zip(&high.reassignment.energy_map)
+        {
+            assert_relative_eq!(*high, 9.0 * *low, epsilon = 2e-8, max_relative = 2e-9);
+        }
+        let dominant = (0..low.reassignment.energy_map.nrows())
+            .flat_map(|ch| (256..512).map(move |time| (ch, time)))
+            .max_by(|&left, &right| {
+                low.reassignment.energy_map[left].total_cmp(&low.reassignment.energy_map[right])
+            })
+            .unwrap();
+        let dominant_energy = low.reassignment.energy_map[dominant];
+        let dominant_support: Vec<(usize, usize)> = (0..low.reassignment.energy_map.nrows())
+            .flat_map(|ch| (256..512).map(move |time| (ch, time)))
+            .filter(|&index| low.reassignment.energy_map[index] > 0.1 * dominant_energy)
+            .collect();
+        let support_energy: f64 = dominant_support
+            .iter()
+            .map(|&index| low.reassignment.energy_map[index])
+            .sum();
+        let energy_weighted_coherence: f64 = dominant_support
+            .iter()
+            .map(|&index| low.reassignment.energy_map[index] * low.phase_coherence_map[index])
+            .sum::<f64>()
+            / support_energy;
+        assert!(
+            dominant_support.len() > 100 && energy_weighted_coherence > 0.8,
+            "tone dominant support had {} bins and energy-weighted coherence {energy_weighted_coherence}; dominant-bin coherence was {} at {dominant:?}",
+            dominant_support.len(),
+            low.phase_coherence_map[dominant]
+        );
+    }
+
+    #[test]
+    fn linear_chirp_coordinates_follow_frequency_at_reassigned_time() {
+        let samples = 2048;
+        let duration = samples as f64 / 8000.0;
+        let start_hz = 690.0;
+        let chirp_rate = 20.0 / duration;
+        let signal: Vec<f64> = (0..samples)
+            .map(|sample| {
+                let time = sample as f64 / 8000.0;
+                (2.0 * PI * (start_hz * time + 0.5 * chirp_rate * time.powi(2))).cos()
+            })
+            .collect();
+        let (_, phase) = gcfb_v234_with_phase_reassignment(
+            &signal,
+            GcParam {
+                num_ch: 2,
+                f_range: [680.0, 720.0],
+                ..static_parameters()
+            },
+        )
+        .unwrap();
+        let mut errors = Vec::new();
+        for ch in 0..phase.reassignment.t_hat.nrows() {
+            let channel_maximum = phase
+                .reassignment
+                .energy_map
+                .row(ch)
+                .iter()
+                .copied()
+                .fold(0.0, f64::max);
+            for sample in 0..samples {
+                let time = phase.reassignment.t_hat[[ch, sample]];
+                if phase.reassignment.validity_mask[[ch, sample]]
+                    && (0.04..duration - 0.04).contains(&time)
+                    && phase.reassignment.f_hat[[ch, sample]] > 0.0
+                    && channel_maximum > 0.0
+                {
+                    errors.push(
+                        (phase.reassignment.f_hat[[ch, sample]] - (start_hz + chirp_rate * time))
+                            .abs(),
+                    );
+                }
+            }
+        }
+        errors.sort_by(f64::total_cmp);
+        assert!(errors.len() > 1000);
+        assert!(errors[errors.len() / 2] < 2.0);
+        let dominant = (0..phase.reassignment.energy_map.nrows())
+            .flat_map(|ch| (400..samples - 400).map(move |time| (ch, time)))
+            .max_by(|&left, &right| {
+                phase.reassignment.energy_map[left].total_cmp(&phase.reassignment.energy_map[right])
+            })
+            .unwrap();
+        let dominant_energy = phase.reassignment.energy_map[dominant];
+        let dominant_support: Vec<(usize, usize)> = (0..phase.reassignment.energy_map.nrows())
+            .flat_map(|ch| (400..samples - 400).map(move |time| (ch, time)))
+            .filter(|&index| phase.reassignment.energy_map[index] > 0.1 * dominant_energy)
+            .collect();
+        let support_energy: f64 = dominant_support
+            .iter()
+            .map(|&index| phase.reassignment.energy_map[index])
+            .sum();
+        let energy_weighted_coherence: f64 = dominant_support
+            .iter()
+            .map(|&index| phase.reassignment.energy_map[index] * phase.phase_coherence_map[index])
+            .sum::<f64>()
+            / support_energy;
+        assert!(
+            dominant_support.len() > 500 && energy_weighted_coherence > 0.9,
+            "chirp dominant support had {} bins and energy-weighted coherence {energy_weighted_coherence}; dominant-bin coherence was {} at {dominant:?}",
+            dominant_support.len(),
+            phase.phase_coherence_map[dominant]
+        );
+    }
+
+    #[test]
+    fn sparsity_metrics_match_single_bin_and_uniform_maps() {
+        let single = SparsityMetrics::from_energy_map(&array![[4.0, 0.0], [0.0, 0.0]]).unwrap();
+        assert_relative_eq!(single.shannon_entropy, 0.0, epsilon = 1e-15);
+        assert_relative_eq!(single.effective_bins, 1.0, epsilon = 1e-15);
+        assert_relative_eq!(single.effective_bin_fraction, 0.25, epsilon = 1e-15);
+
+        let uniform = SparsityMetrics::from_energy_map(&array![[1.0, 1.0], [1.0, 1.0]]).unwrap();
+        assert_relative_eq!(uniform.shannon_entropy, 4.0_f64.ln(), epsilon = 1e-15);
+        assert_relative_eq!(uniform.effective_bins, 4.0, epsilon = 1e-14);
+        assert_relative_eq!(uniform.effective_bin_fraction, 1.0, epsilon = 1e-14);
+        assert!(SparsityComparison::from_maps(&array![[1.0, 0.0]], &array![[2.0, 0.0]],).is_err());
+    }
+
+    #[test]
+    fn sparsity_comparison_rejects_different_grids_and_quiet_energy_mismatches() {
+        assert!(SparsityComparison::from_maps(&array![[1.0]], &array![[1.0, 0.0]]).is_err());
+        assert!(SparsityComparison::from_maps(&array![[0.0]], &array![[5e-11]]).is_err());
+        assert!(SparsityComparison::from_maps(&array![[5e-11]], &array![[5e-11]]).is_ok());
+    }
+
+    #[test]
+    fn deterministic_noise_has_smaller_empirical_reassigned_support() {
+        let signal = deterministic_noise(1024);
+        let (_, phase) = gcfb_v234_with_phase_reassignment(
+            &signal,
+            GcParam {
+                num_ch: 12,
+                f_range: [180.0, 2200.0],
+                ..static_parameters()
+            },
+        )
+        .unwrap();
+        let comparison = phase.sparsity_comparison().unwrap();
+        assert!(
+            comparison.reassigned.effective_bin_fraction
+                < comparison.unreassigned.effective_bin_fraction,
+            "reassigned fraction {} did not beat source fraction {}",
+            comparison.reassigned.effective_bin_fraction,
+            comparison.unreassigned.effective_bin_fraction
+        );
+    }
+
+    #[test]
+    fn consensus_validates_configuration_and_reuses_the_baseline_grid() {
+        for scales in [
+            vec![1.0],
+            vec![0.75, 1.0, 1.0],
+            vec![0.75, 1.5],
+            vec![0.75, 1.0, f64::NAN],
+        ] {
+            let config = BandwidthConsensusConfig {
+                scales,
+                ..BandwidthConsensusConfig::default()
+            };
+            assert!(validate_consensus_config(&config).is_err());
+        }
+        for (support, agreement) in [(0.0, 1.0), (1.0, 1.0), (1e-6, 0.0), (1e-6, 1.1)] {
+            let config = BandwidthConsensusConfig {
+                relative_support_floor: support,
+                required_agreement: agreement,
+                ..BandwidthConsensusConfig::default()
+            };
+            assert!(validate_consensus_config(&config).is_err());
+        }
+
+        let sample_rate = 48_000.0;
+        let samples = 2048;
+        let tone_hz = 1000.0;
+        let click_sample = 768;
+        let mut signal: Vec<f64> = (0..samples)
+            .map(|sample| 0.2 * (2.0 * PI * tone_hz * sample as f64 / sample_rate).cos())
+            .collect();
+        signal[click_sample] += 1.0;
+        let parameters = GcParam {
+            fs: sample_rate,
+            num_ch: 8,
+            f_range: [200.0, 6000.0],
+            ..static_parameters()
+        };
+        let config = BandwidthConsensusConfig::default();
+        let ordinary_output = gcfb_v234(&signal, parameters.clone()).unwrap();
+        let (baseline_output, consensus) =
+            gcfb_v234_with_bandwidth_consensus(&signal, parameters, &config).unwrap();
+        assert_eq!(baseline_output.dcgc_out, ordinary_output.dcgc_out);
+        assert_eq!(baseline_output.scgc_smpl, ordinary_output.scgc_smpl);
+        assert_eq!(consensus.baseline_index, 1);
+        assert_eq!(consensus.analyses.len(), 3);
+        assert_eq!(
+            consensus.analyses[consensus.baseline_index]
+                .reassignment
+                .frequency_axis_hz,
+            baseline_output.gc_param.fr1
+        );
+        let direct_baseline = phase_reassign_gcfb_v234_with_config(
+            &signal,
+            &baseline_output,
+            &config.reassignment_config,
+        )
+        .unwrap();
+        assert_eq!(
+            consensus.analyses[consensus.baseline_index]
+                .reassignment
+                .energy_map,
+            direct_baseline.reassignment.energy_map
+        );
+        assert_eq!(
+            consensus.analyses[consensus.baseline_index].complex_map,
+            direct_baseline.complex_map
+        );
+        assert!(
+            consensus
+                .agreement_map
+                .iter()
+                .all(|agreement| (0.0..=1.0).contains(agreement))
+        );
+        let tone_channel = baseline_output
+            .gc_param
+            .fr1
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                (*left - tone_hz).abs().total_cmp(&(*right - tone_hz).abs())
+            })
+            .unwrap()
+            .0;
+        let tone_agreement = consensus
+            .agreement_map
+            .row(tone_channel)
+            .iter()
+            .skip(samples / 3)
+            .take(samples / 3)
+            .copied()
+            .fold(0.0, f64::max);
+        let click_agreement = consensus
+            .agreement_map
+            .column(click_sample)
+            .iter()
+            .copied()
+            .fold(0.0, f64::max);
+        assert_relative_eq!(tone_agreement, 1.0, epsilon = f64::EPSILON);
+        assert_relative_eq!(click_agreement, 1.0, epsilon = f64::EPSILON);
+        let consensus_bins = consensus
+            .consensus_mask
+            .iter()
+            .filter(|&&value| value)
+            .count();
+        assert!(consensus_bins > 0);
+        assert!(consensus_bins < consensus.consensus_mask.len());
     }
 }
