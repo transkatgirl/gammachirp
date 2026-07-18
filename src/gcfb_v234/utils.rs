@@ -326,6 +326,7 @@ pub fn mk_filter_field2cochlea(
     let transfer = trans_func_field2cochlea(&param)?;
     let bins = transfer.freq.len();
     let fft_len = bins * 2;
+    let count = crate::gcfb_v211::utils::correction_filter_coefficient_count(fs, fft_len)?;
     let mut spectrum = vec![num_complex::Complex64::new(0., 0.); fft_len];
     let mags: Vec<f64> = transfer
         .field2cochlea_db
@@ -344,7 +345,6 @@ pub fn mk_filter_field2cochlea(
         }
     }
     crate::dsp::fft(&mut spectrum, true);
-    let count = ((200. / 16000. * fs / 2.).trunc() as usize * 2 + 1).min(fft_len - 1);
     let center = count / 2;
     let win = crate::dsp::hanning(count);
     let linear: Vec<f64> = (0..count)
@@ -456,5 +456,11 @@ mod tests {
             ..ParamTransFunc::default()
         };
         assert!(trans_func_field2cochlea(&unknown_middle_ear).is_err());
+    }
+
+    #[test]
+    fn field_to_cochlea_filter_rejects_rates_that_would_produce_no_taps() {
+        assert!(mk_filter_field2cochlea("EarDrum", 128.0, true).is_err());
+        assert!(mk_filter_field2cochlea("ELC", 128.0, true).is_err());
     }
 }

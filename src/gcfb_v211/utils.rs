@@ -383,6 +383,23 @@ pub fn out_mid_crct(
     Ok((power, Array1::from(freq), Array1::from(db)))
 }
 
+/// Calculate a safe odd tap count that leaves at least one minimum-phase tap.
+pub(crate) fn correction_filter_coefficient_count(sr: f64, fft_len: usize) -> Result<usize> {
+    if !sr.is_finite() || sr <= 0.0 {
+        return Err(Error::InvalidParameter(
+            "correction-filter sample rate must be finite and positive".into(),
+        ));
+    }
+    let half_count = (200.0 / 16000.0 * sr / 2.0).trunc() as usize;
+    let max_half_count = fft_len.saturating_sub(2) / 2;
+    if half_count == 0 || max_half_count == 0 {
+        return Err(Error::InvalidParameter(
+            "sample rate is too low to construct a non-empty correction filter".into(),
+        ));
+    }
+    Ok(half_count.min(max_half_count) * 2 + 1)
+}
+
 /// Construct the legacy outer/middle-ear correction FIR.
 ///
 /// `filter_type` follows the Python switch: 0 is forward linear phase, 1 is
@@ -390,12 +407,14 @@ pub fn out_mid_crct(
 /// frequency-sampling FIR design; its magnitude follows the same correction
 /// table while avoiding a dependency on SciPy's Parks–McClellan implementation.
 pub fn out_mid_crct_filt(kind: &str, sr: f64, filter_type: u8) -> Result<Array1<f64>> {
-    if !matches!(filter_type, 0..=2) || sr <= 0.0 {
+    if !matches!(filter_type, 0..=2) {
         return Err(Error::InvalidParameter(
-            "filter type must be 0, 1, or 2 and sample rate must be positive".into(),
+            "filter type must be 0, 1, or 2".into(),
         ));
     }
     let bins = 2048;
+    let fft_len = bins * 2;
+    let coefficient_count = correction_filter_coefficient_count(sr, fft_len)?;
     let (power, _, _) = out_mid_crct(kind, bins, sr)?;
     let mut magnitude: Vec<f64> = power.iter().map(|v| v.sqrt()).collect();
     if filter_type == 1 {
@@ -403,7 +422,6 @@ pub fn out_mid_crct_filt(kind: &str, sr: f64, filter_type: u8) -> Result<Array1<
             *value = 1.0 / value.max(0.1);
         }
     }
-    let fft_len = bins * 2;
     let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
     spectrum[0].re = magnitude[0];
     for i in 1..bins {
@@ -412,8 +430,6 @@ pub fn out_mid_crct_filt(kind: &str, sr: f64, filter_type: u8) -> Result<Array1<
     }
     spectrum[bins].re = *magnitude.last().unwrap();
     dsp::fft(&mut spectrum, true);
-    let coefficient_count =
-        ((200.0 / 16000.0 * sr / 2.0).trunc() as usize * 2 + 1).min(fft_len - 1);
     let center = coefficient_count / 2;
     let window = dsp::hanning(coefficient_count);
     let mut linear = vec![0.0; coefficient_count];
@@ -452,6 +468,13 @@ mod tests {
         for (a, b) in got.iter().zip([1.0, 4.0, 11.0, 22.0]) {
             assert_relative_eq!(*a, b, epsilon = 1e-12);
         }
+    }
+
+    #[test]
+    fn correction_filter_rejects_rates_that_would_produce_no_minimum_phase_taps() {
+        assert!(out_mid_crct_filt("ELC", 128.0, 2).is_err());
+        assert!(out_mid_crct_filt("ELC", f64::NAN, 2).is_err());
+        assert!(!out_mid_crct_filt("ELC", 160.0, 2).unwrap().is_empty());
     }
 
     #[test]

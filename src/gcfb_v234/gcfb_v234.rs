@@ -628,6 +628,38 @@ pub fn gcfb_v23_sample_base(
     response: &mut GcResp,
 ) -> Result<Array2<f64>> {
     let (channels, samples) = pgc.dim();
+    let channel_vectors_match = [
+        param.fr1.len(),
+        param.hloss.fb_compression_health.len(),
+        param.lvl_est.n_ch_lvl_est.len(),
+        response.b1_val.len(),
+        response.c1_val.len(),
+        response.fp1.len(),
+        response.b2_val.len(),
+        response.c2_val.len(),
+        response.frat0_pc.len(),
+        response.frat1_val.len(),
+        response.pc_hpaf.len(),
+    ]
+    .into_iter()
+    .all(|len| len == channels);
+    if channels == 0
+        || samples == 0
+        || scgc.dim() != pgc.dim()
+        || param.num_ch != channels
+        || param.num_update_asym_cmp == 0
+        || !channel_vectors_match
+        || param
+            .lvl_est
+            .n_ch_lvl_est
+            .iter()
+            .any(|&source| source >= channels)
+    {
+        return Err(Error::InvalidParameter(
+            "sample processing requires non-empty, equally shaped channel matrices and matching prepared parameters"
+                .into(),
+        ));
+    }
     let mut out = Array2::zeros((channels, samples));
     response.fr2 = Array2::zeros((channels, samples));
     response.frat_val = Array2::zeros((channels, samples));
@@ -1153,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_processing_rejects_empty_or_mismatched_matrices() {
+    fn dynamic_processing_rejects_empty_or_mismatched_matrices() {
         let p = GcParam {
             fs: 8_000.,
             out_mid_crct: "No".into(),
@@ -1174,6 +1206,15 @@ mod tests {
         );
         assert!(
             gcfb_v23_frame_base(
+                &Array2::zeros((4, 8)),
+                &Array2::zeros((3, 8)),
+                &param,
+                &mut response,
+            )
+            .is_err()
+        );
+        assert!(
+            gcfb_v23_sample_base(
                 &Array2::zeros((4, 8)),
                 &Array2::zeros((3, 8)),
                 &param,

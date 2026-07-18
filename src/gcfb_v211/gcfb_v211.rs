@@ -307,9 +307,12 @@ pub fn make_asym_cmp_filters_v2(fs: f64, frs: &[f64], b: &[f64], c: &[f64]) -> R
     }
     let b = broadcast(b, frs.len(), "b")?;
     let c = broadcast(c, frs.len(), "c")?;
-    if b.iter().chain(&c).any(|value| !value.is_finite()) {
+    if b.iter().any(|value| !value.is_finite() || *value <= 0.0)
+        || c.iter().any(|value| !value.is_finite())
+    {
         return Err(Error::InvalidParameter(
-            "filter coefficients must be finite".into(),
+            "asymmetric-filter bandwidths must be finite and positive; chirp coefficients must be finite"
+                .into(),
         ));
     }
     let (_, erbw) = utils::freq2erb(frs);
@@ -327,11 +330,21 @@ pub fn make_asym_cmp_filters_v2(fs: f64, frs: &[f64], b: &[f64], c: &[f64]) -> R
             let psi = 2.0 * PI * (frs[ch] - delta).max(0.0) / fs;
             let a = [1.0, -2.0 * r * phi.cos(), r * r];
             let mut z = [1.0, -2.0 * r * psi.cos(), r * r];
+            if !r.is_finite() || r >= 1.0 || a.iter().chain(&z).any(|value| !value.is_finite()) {
+                return Err(Error::InvalidParameter(
+                    "asymmetric-filter parameters must produce finite, stable sections".into(),
+                ));
+            }
             let v = Complex64::from_polar(1.0, 2.0 * PI * frs[ch] / fs);
             let powers = [Complex64::new(1.0, 0.0), v, v * v];
             let numerator = (0..3).map(|i| powers[i] * a[i]).sum::<Complex64>();
             let denominator = (0..3).map(|i| powers[i] * z[i]).sum::<Complex64>();
             let normalization = (numerator / denominator).norm();
+            if !normalization.is_finite() {
+                return Err(Error::InvalidParameter(
+                    "asymmetric-filter normalization must be finite".into(),
+                ));
+            }
             for i in 0..3 {
                 ap[[ch, i, section]] = a[i];
                 z[i] *= normalization;
@@ -366,9 +379,12 @@ pub fn asym_cmp_frsp_v2(
     }
     let b = broadcast(b, frs.len(), "b")?;
     let c = broadcast(c, frs.len(), "c")?;
-    if b.iter().chain(&c).any(|value| !value.is_finite()) {
+    if b.iter().any(|value| !value.is_finite() || *value <= 0.0)
+        || c.iter().any(|value| !value.is_finite())
+    {
         return Err(Error::InvalidParameter(
-            "asymmetric response coefficients must be finite".into(),
+            "asymmetric-response bandwidths must be finite and positive; chirp coefficients must be finite"
+                .into(),
         ));
     }
     let (_, erbw) = utils::freq2erb(frs);
@@ -386,6 +402,11 @@ pub fn asym_cmp_frsp_v2(
             let psi = 2.0 * PI * (frs[ch] - delta).max(0.0) / fs;
             let a = [1.0, -2.0 * r * phi.cos(), r * r];
             let z = [1.0, -2.0 * r * psi.cos(), r * r];
+            if !r.is_finite() || r >= 1.0 || a.iter().chain(&z).any(|value| !value.is_finite()) {
+                return Err(Error::InvalidParameter(
+                    "asymmetric-response parameters must describe finite, stable sections".into(),
+                ));
+            }
             let magnitude = |f: f64| {
                 let cs1 = (2.0 * PI * f / fs).cos();
                 let cs2 = (4.0 * PI * f / fs).cos();
@@ -399,15 +420,32 @@ pub fn asym_cmp_frsp_v2(
                 (mag2(z) / mag2(a)).sqrt()
             };
             let norm = magnitude(frs[ch]);
+            if !norm.is_finite() || norm <= 0.0 {
+                return Err(Error::InvalidParameter(
+                    "asymmetric-response normalization must be finite and positive".into(),
+                ));
+            }
             for bin in 0..n_frq_rsl {
-                acf[[ch, bin]] *= magnitude(freq[bin]) / norm;
+                let value = magnitude(freq[bin]) / norm;
+                if !value.is_finite() {
+                    return Err(Error::InvalidParameter(
+                        "asymmetric response must remain finite".into(),
+                    ));
+                }
+                acf[[ch, bin]] *= value;
             }
         }
     }
     let mut asym = Array2::zeros((frs.len(), n_frq_rsl));
     for ch in 0..frs.len() {
         for bin in 0..n_frq_rsl {
-            asym[[ch, bin]] = (c[ch] * (freq[bin] - frs[ch]).atan2(b[ch] * erbw[ch])).exp();
+            let value = (c[ch] * (freq[bin] - frs[ch]).atan2(b[ch] * erbw[ch])).exp();
+            if !value.is_finite() {
+                return Err(Error::InvalidParameter(
+                    "asymmetric function must remain finite".into(),
+                ));
+            }
+            asym[[ch, bin]] = value;
         }
     }
     Ok(AsymCmpResponse {
@@ -882,6 +920,24 @@ mod tests {
 
         assert!(status.process(&two_channels, &[1.0, 2.0], false).is_err());
         assert_eq!(status.count, 0);
+    }
+
+    #[test]
+    fn asymmetric_filters_reject_non_positive_or_unstable_bandwidths() {
+        for bandwidth in [0.0, -1.0, 20.0] {
+            assert!(make_asym_cmp_filters_v2(8_000.0, &[500.0], &[bandwidth], &[2.2]).is_err());
+            assert!(asym_cmp_frsp_v2(&[500.0], 8_000.0, &[bandwidth], &[2.2], 256, 4,).is_err());
+        }
+
+        let param = GcParam {
+            fs: 8_000.0,
+            num_ch: 4,
+            f_range: [200.0, 2_000.0],
+            out_mid_crct: "No".into(),
+            b2: [[0.0, 0.0], [0.0, 0.0]],
+            ..GcParam::default()
+        };
+        assert!(gcfb_v211(&[1.0, 0.0, 0.0], param).is_err());
     }
 
     #[test]
