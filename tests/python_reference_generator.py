@@ -352,6 +352,34 @@ def v234_references():
     modulation_input = np.array([1.0, 0.5, -0.25, 0.75, -1.0, 0.0, 0.2, -0.1, 0.3, 0.0])
     result["modulation_filterbank"] = encoded(gcfb.gcfb_v23_env_mod_fb(modulation_input, modulation_param))
 
+    envelope_frames = np.empty((4, 16))
+    for channel in range(4):
+        for frame in range(16):
+            baseline = 1.25 + 0.35 * channel
+            modulation = (0.15 + 0.04 * channel) * np.sin(
+                2 * np.pi * (channel + 1) * frame / 16
+            )
+            envelope_frames[channel, frame] = (
+                baseline + modulation + (0.2 if frame == channel + 4 else 0.0)
+            )
+    envelope_param, _ = gcfb.set_param(make_v234_param("dynamic"))
+    # The reference set_param keeps channel frequencies as a column vector;
+    # flatten it for the scalar-per-channel envelope routine.
+    envelope_param.fr1 = np.asarray(envelope_param.fr1).reshape(-1)
+    envelope_modulation_param = Param()
+    envelope_modulation_param.reduce_db = np.array([0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0])
+    envelope_modulation_param.f_cutoff = np.array([32.0, 48.0, 64.0, 96.0, 128.0, 160.0, 192.0])
+    envelope_output, envelope_modulation_param = gcfb.gcfb_v23_env_mod_loss(
+        envelope_frames, envelope_param, envelope_modulation_param
+    )
+    result["envelope_modulation_loss"] = {
+        "output": encoded(envelope_output),
+        "fs": float(envelope_modulation_param.fs),
+        "fb_fr1": encoded(envelope_modulation_param.fb_fr1),
+        "fb_reduce_db": encoded(envelope_modulation_param.fb_reduce_db),
+        "fb_f_cutoff": encoded(envelope_modulation_param.fb_f_cutoff),
+    }
+
     input_signal = np.array([1.0, -0.25, 0.5, 0.0, -0.1, 0.2] + [0.0] * 26)
     result["filterbank"] = {}
     # The source's static path refers to gc_param.frat0_pc/frat1_val even

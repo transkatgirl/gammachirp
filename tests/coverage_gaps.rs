@@ -60,30 +60,104 @@ fn smooth_spectrum_covers_both_windows_and_reports_frame_times() {
 #[test]
 fn envelope_modulation_loss_and_analysis_cover_success_and_validation() {
     let param = prepared_v234();
-    let frames = Array2::from_shape_fn((4, 16), |(channel, _)| channel as f64 + 1.0);
+    let frames = Array2::from_shape_fn((4, 16), |(channel, frame)| {
+        let baseline = 1.25 + 0.35 * channel as f64;
+        let modulation = (0.15 + 0.04 * channel as f64)
+            * (2.0 * std::f64::consts::PI * (channel + 1) as f64 * frame as f64 / 16.0).sin();
+        baseline + modulation + if frame == channel + 4 { 0.2 } else { 0.0 }
+    });
+    let reductions = Array1::from(vec![0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0]);
+    let cutoffs = Array1::from(vec![32.0, 48.0, 64.0, 96.0, 128.0, 160.0, 192.0]);
+    let requested = EmParam {
+        reduce_db: reductions.clone(),
+        f_cutoff: cutoffs.clone(),
+        ..EmParam::default()
+    };
+    let zero_reduction = EmParam {
+        reduce_db: Array1::zeros(7),
+        f_cutoff: cutoffs.clone(),
+        ..EmParam::default()
+    };
 
-    let (reduced, em) = fb234::gcfb_v23_env_mod_loss(&frames, &param, EmParam::default()).unwrap();
+    let (reduced, em) = fb234::gcfb_v23_env_mod_loss(&frames, &param, requested).unwrap();
+    let (unattenuated, _) = fb234::gcfb_v23_env_mod_loss(&frames, &param, zero_reduction).unwrap();
     assert_eq!(reduced.dim(), frames.dim());
     assert_eq!(em.fs, param.dyn_hpaf.fs);
     assert_eq!(em.fb_fr1, param.fr1);
     assert_eq!(em.fb_reduce_db.len(), param.num_ch);
     assert_eq!(em.fb_f_cutoff.len(), param.num_ch);
+
+    let (audiogram_erb, _) = utils234::freq2erb(param.hloss.f_audgram_list.as_slice().unwrap());
+    let (filterbank_erb, _) = utils234::freq2erb(param.fr1.as_slice().unwrap());
+    let expected_reductions = utils234::interp1(
+        audiogram_erb.as_slice().unwrap(),
+        reductions.as_slice().unwrap(),
+        filterbank_erb.as_slice().unwrap(),
+        true,
+    )
+    .unwrap();
+    let expected_cutoffs = utils234::interp1(
+        audiogram_erb.as_slice().unwrap(),
+        cutoffs.as_slice().unwrap(),
+        filterbank_erb.as_slice().unwrap(),
+        true,
+    )
+    .unwrap();
+    for channel in 0..param.num_ch {
+        assert_relative_eq!(
+            em.fb_reduce_db[channel],
+            expected_reductions[channel],
+            epsilon = 1e-12
+        );
+        assert_relative_eq!(
+            em.fb_f_cutoff[channel],
+            expected_cutoffs[channel],
+            epsilon = 1e-12
+        );
+    }
+
     for channel in 0..frames.nrows() {
+        let dc = (frames
+            .row(channel)
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            / frames.ncols() as f64)
+            .sqrt();
+        let gain = 10_f64.powf(-em.fb_reduce_db[channel] / 20.0);
         for frame in 0..frames.ncols() - 1 {
             assert_relative_eq!(
                 reduced[[channel, frame]],
-                frames[[channel, frame]],
+                dc + gain * (unattenuated[[channel, frame]] - dc),
                 epsilon = 1e-12
+            );
+            assert!(
+                (reduced[[channel, frame]] - dc).abs()
+                    <= (unattenuated[[channel, frame]] - dc).abs() + 1e-12
             );
         }
         assert_eq!(reduced[[channel, frames.ncols() - 1]], 0.0);
+        assert_eq!(unattenuated[[channel, frames.ncols() - 1]], 0.0);
     }
 
-    let (analysis, analyzed) =
-        fb234::gcfb_v23_ana_env_mod(&reduced, &param, EmParam::default()).unwrap();
+    let (analysis, analyzed) = fb234::gcfb_v23_ana_env_mod(&reduced, &param, em.clone()).unwrap();
     assert_eq!(analysis.dim(), (4, 9, 16));
     assert_eq!(analyzed.fs, param.dyn_hpaf.fs);
     assert!(analysis.iter().all(|value| value.is_finite()));
+    for channel in 0..frames.nrows() {
+        let direct =
+            fb234::gcfb_v23_env_mod_fb(reduced.row(channel).as_slice().unwrap(), &analyzed)
+                .unwrap();
+        for modulation_channel in 0..direct.nrows() {
+            for frame in 0..direct.ncols() {
+                assert_relative_eq!(
+                    analysis[[channel, modulation_channel, frame]],
+                    direct[[modulation_channel, frame]],
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
 
     let mut sample_param = param.clone();
     sample_param.dyn_hpaf.str_prc = "sample-base".into();
@@ -171,6 +245,7 @@ fn public_signal_utilities_cover_empty_inputs_aliases_and_rejections() {
     assert!(utils211::rceps(&[]).is_err());
 
     for scale in [
+        FrequencyScale::Erb,
         FrequencyScale::Linear,
         FrequencyScale::Mel,
         FrequencyScale::Log,
@@ -179,8 +254,8 @@ fn public_signal_utilities_cover_empty_inputs_aliases_and_rejections() {
             utils211::equal_freq_scale(scale, 4, [100.0, 1_600.0]).unwrap();
         assert_eq!(frequencies.len(), 4);
         assert_eq!(positions.len(), 4);
-        assert_relative_eq!(frequencies[0], 100.0, epsilon = 1e-10);
-        assert_relative_eq!(frequencies[3], 1_600.0, epsilon = 1e-9);
+        assert_eq!(frequencies[0], 100.0);
+        assert_eq!(frequencies[3], 1_600.0);
     }
     assert!(utils211::equal_freq_scale(FrequencyScale::Linear, 1, [100.0, 200.0]).is_err());
 

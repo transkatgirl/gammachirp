@@ -95,6 +95,8 @@ pub enum GainReference {
 pub struct GcParam {
     pub fs: f64,
     pub num_ch: usize,
+    /// Requested channel-frequency interval `[low, high]`, satisfying
+    /// `0 < low < high < fs / 2`.
     pub f_range: [f64; 2],
     pub out_mid_crct: String,
     pub n: f64,
@@ -182,6 +184,34 @@ pub struct GcfbOutput {
     pub gc_resp: GcResp,
 }
 
+fn validate_prepared_frequencies(fs: f64, frequencies: &[f64], name: &str) -> Result<()> {
+    if frequencies
+        .iter()
+        .any(|frequency| !frequency.is_finite() || *frequency <= 0.0 || *frequency >= fs / 2.0)
+    {
+        return Err(Error::InvalidParameter(format!(
+            "{name} must be finite, positive, and below Nyquist"
+        )));
+    }
+    Ok(())
+}
+
+fn initial_asymmetric_ratio_and_centers(
+    param: &GcParam,
+    response: &GcResp,
+) -> (Array1<f64>, Array1<f64>) {
+    let ratios = if param.ctrl == ControlMode::Static {
+        let level = param.level_db_scgcfb;
+        Array1::from_iter((0..param.num_ch).map(|ch| {
+            response.frat0_pc[ch] + response.frat1_val[ch] * (level - response.pc_hpaf[ch])
+        }))
+    } else {
+        Array1::from_elem(param.num_ch, param.lvl_est.frat)
+    };
+    let centers = &ratios * &response.fp1;
+    (ratios, centers)
+}
+
 pub fn set_param(param: GcParam) -> Result<(GcParam, GcResp)> {
     set_param_with_preserved_hearing_loss(param, None)
 }
@@ -194,7 +224,9 @@ fn set_param_with_preserved_hearing_loss(
         || param.fs <= 0.
         || param.num_ch < 2
         || param.f_range.iter().any(|value| !value.is_finite())
-        || param.f_range[1] * 3. > param.fs
+        || param.f_range[0] <= 0.0
+        || param.f_range[1] <= param.f_range[0]
+        || param.f_range[1] >= param.fs / 2.0
         || param.num_update_asym_cmp == 0
         || !param.dyn_hpaf.t_frame.is_finite()
         || param.dyn_hpaf.t_frame <= 0.0
@@ -202,7 +234,8 @@ fn set_param_with_preserved_hearing_loss(
         || param.dyn_hpaf.t_shift <= 0.0
     {
         return Err(Error::InvalidParameter(
-            "invalid v2.34 sample rate, channel grid, or update period".into(),
+            "v2.34 requires a finite positive sample rate, at least two channels, a frequency range satisfying 0 < low < high < fs / 2, and positive frame and update periods"
+                .into(),
         ));
     }
     param.dyn_hpaf.len_frame = (param.dyn_hpaf.t_frame * param.fs).trunc() as usize;
@@ -244,6 +277,11 @@ fn set_param_with_preserved_hearing_loss(
     }
     let (fr1, erb_grid) =
         utils::equal_freq_scale(FrequencyScale::Erb, param.num_ch, param.f_range)?;
+    validate_prepared_frequencies(
+        param.fs,
+        fr1.as_slice().unwrap(),
+        "channel grid frequencies",
+    )?;
     param.fr1 = fr1.clone();
     let erb_space = erb_grid
         .windows(2)
@@ -259,6 +297,7 @@ fn set_param_with_preserved_hearing_loss(
     let (_, width) = utils::freq2erb(fr1.as_slice().unwrap());
     let fp1 =
         Array1::from_iter((0..param.num_ch).map(|i| fr1[i] + c1[i] * width[i] * b1[i] / param.n));
+    validate_prepared_frequencies(param.fs, fp1.as_slice().unwrap(), "derived filter centers")?;
     let b2 = ef.mapv(|v| param.b2[0][0] + param.b2[0][1] * v);
     let c2 = ef.mapv(|v| param.c2[0][0] + param.c2[0][1] * v);
     let frat0 = ef.mapv(|v| param.frat[0][0] + param.frat[0][1] * v);
@@ -289,6 +328,12 @@ fn set_param_with_preserved_hearing_loss(
         gain_factor: Array1::ones(param.num_ch),
         cgc_ref: None,
     };
+    let (_, initial_centers) = initial_asymmetric_ratio_and_centers(&param, &response);
+    validate_prepared_frequencies(
+        param.fs,
+        initial_centers.as_slice().unwrap(),
+        "initial asymmetric filter centers",
+    )?;
     if let Some(hearing_loss) = preserved_hearing_loss {
         param.hloss = hearing_loss.clone();
     } else {
@@ -675,7 +720,7 @@ pub fn gcfb_v23_sample_base(
     response.fr2 = Array2::zeros((channels, samples));
     response.frat_val = Array2::zeros((channels, samples));
     response.lvl_db = Array2::zeros((channels, samples));
-    let centers = response.fp1.mapv(|v| param.lvl_est.frat * v);
+    let (_, centers) = initial_asymmetric_ratio_and_centers(param, response);
     let mut coef = make_asym_cmp_filters_v2(
         param.fs,
         centers.as_slice().unwrap(),
@@ -760,18 +805,14 @@ fn gcfb_v234_internal(
     let samples = snd.len();
     let mut pgc = Array2::zeros((channels, samples));
     let mut scgc = Array2::zeros((channels, samples));
-    let fixed_centers: Array1<f64>;
+    let (initial_ratios, fixed_centers) = initial_asymmetric_ratio_and_centers(&param, &response);
     let fixed_c2: Array1<f64>;
     if param.ctrl == ControlMode::Static {
         let level = param.level_db_scgcfb;
-        let ratios = Array1::from_iter((0..channels).map(|ch| {
-            response.frat0_pc[ch] + response.frat1_val[ch] * (level - response.pc_hpaf[ch])
-        }));
-        fixed_centers = &ratios * &response.fp1;
         response.fr2 = Array2::zeros((channels, 1));
         response.fr2.column_mut(0).assign(&fixed_centers);
         response.frat_val = Array2::zeros((channels, 1));
-        response.frat_val.column_mut(0).assign(&ratios);
+        response.frat_val.column_mut(0).assign(&initial_ratios);
         response.lvl_db = Array2::from_elem((channels, 1), level);
         for ch in 0..channels {
             response.fp2[ch] = fr1_to_fp2(
@@ -780,14 +821,13 @@ fn gcfb_v234_internal(
                 response.c1_val[ch],
                 response.b2_val[ch],
                 response.c2_val[ch],
-                ratios[ch],
+                initial_ratios[ch],
                 response.fr1[ch],
             )?
             .0;
         }
         fixed_c2 = response.c2_val.clone();
     } else {
-        fixed_centers = response.fp1.mapv(|v| param.lvl_est.frat * v);
         fixed_c2 = &param.hloss.fb_compression_health * param.lvl_est.c2;
     }
     let level_b2 = [param.lvl_est.b2];
@@ -1124,23 +1164,89 @@ mod tests {
     }
 
     #[test]
-    fn sample_processing_path_updates_time_varying_filters() {
-        let dynamic = DynHpaf {
-            str_prc: "sample-base".into(),
-            ..DynHpaf::default()
+    fn sample_histories_are_channel_major_and_update_cadence_changes_filtering() {
+        let signal: Vec<f64> = (0..96)
+            .map(|sample| {
+                let envelope = match sample {
+                    0..=23 => 0.02,
+                    24..=47 => 1.0,
+                    48..=71 => 0.12,
+                    _ => 0.55,
+                };
+                let transient = match sample {
+                    8 => 1.0,
+                    56 => -0.7,
+                    _ => 0.0,
+                };
+                envelope * (2.0 * std::f64::consts::PI * 700.0 * sample as f64 / 8_000.0).sin()
+                    + transient
+            })
+            .collect();
+        let run = |num_update_asym_cmp| {
+            gcfb_v234(
+                &signal,
+                GcParam {
+                    fs: 8_000.0,
+                    out_mid_crct: "No".into(),
+                    num_ch: 4,
+                    f_range: [200.0, 2_000.0],
+                    num_update_asym_cmp,
+                    dyn_hpaf: DynHpaf {
+                        str_prc: "sample-base".into(),
+                        ..DynHpaf::default()
+                    },
+                    ..GcParam::default()
+                },
+            )
+            .unwrap()
         };
-        let p = GcParam {
-            out_mid_crct: "No".into(),
-            num_ch: 4,
-            f_range: [200., 2000.],
-            dyn_hpaf: dynamic,
-            ..GcParam::default()
-        };
-        let mut signal = vec![0.0; 24];
-        signal[0] = 1.0;
-        let out = gcfb_v234(&signal, p).unwrap();
-        assert_eq!(out.dcgc_out.dim(), (4, 24));
-        assert!(out.dcgc_out.iter().all(|v| v.is_finite()));
+        let every_sample = run(1);
+        let every_eighth_sample = run(8);
+
+        for output in [&every_sample, &every_eighth_sample] {
+            assert_eq!(output.dcgc_out.dim(), (4, signal.len()));
+            assert_eq!(output.gc_resp.fr2.dim(), (4, signal.len()));
+            assert_eq!(output.gc_resp.frat_val.dim(), (4, signal.len()));
+            assert_eq!(output.gc_resp.lvl_db.dim(), (4, signal.len()));
+            assert!(output.dcgc_out.iter().all(|value| value.is_finite()));
+            for history in [
+                &output.gc_resp.fr2,
+                &output.gc_resp.frat_val,
+                &output.gc_resp.lvl_db,
+            ] {
+                assert!(history.rows().into_iter().any(|row| {
+                    row.windows(2)
+                        .into_iter()
+                        .any(|pair| (pair[1] - pair[0]).abs() > 1e-12)
+                }));
+            }
+            for ch in 0..4 {
+                for sample in 0..signal.len() {
+                    assert_relative_eq!(
+                        output.gc_resp.fr2[[ch, sample]],
+                        output.gc_resp.fp1[ch] * output.gc_resp.frat_val[[ch, sample]],
+                        epsilon = 1e-12
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            every_sample.gc_resp.lvl_db,
+            every_eighth_sample.gc_resp.lvl_db
+        );
+        assert_eq!(
+            every_sample.gc_resp.frat_val,
+            every_eighth_sample.gc_resp.frat_val
+        );
+        assert_eq!(every_sample.gc_resp.fr2, every_eighth_sample.gc_resp.fr2);
+        assert!(
+            every_sample
+                .dcgc_out
+                .iter()
+                .zip(&every_eighth_sample.dcgc_out)
+                .any(|(left, right)| (left - right).abs() > 1e-12)
+        );
     }
 
     #[test]
@@ -1188,6 +1294,149 @@ mod tests {
             ..GcParam::default()
         };
         assert!(set_param(invalid_window).is_err());
+    }
+
+    #[test]
+    fn v234_channel_range_is_strictly_sub_nyquist() {
+        let nyquist = 4_000.0_f64;
+        let below_nyquist = f64::from_bits(nyquist.to_bits() - 1);
+        let above_nyquist = f64::from_bits(nyquist.to_bits() + 1);
+
+        let (_, response) = set_param(GcParam {
+            fs: 8_000.0,
+            num_ch: 4,
+            f_range: [100.0, below_nyquist],
+            out_mid_crct: "No".into(),
+            ..GcParam::default()
+        })
+        .unwrap();
+        assert_eq!(response.fr1[3], below_nyquist);
+
+        for high in [nyquist, above_nyquist] {
+            let error = set_param(GcParam {
+                fs: 8_000.0,
+                num_ch: 4,
+                f_range: [100.0, high],
+                out_mid_crct: "No".into(),
+                ..GcParam::default()
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::InvalidParameter(message)
+                    if message.contains("0 < low < high < fs / 2")
+            ));
+        }
+    }
+
+    #[test]
+    fn v234_processes_a_range_above_the_former_fs_over_three_limit() {
+        let output = gcfb_v234(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            GcParam {
+                fs: 8_000.0,
+                num_ch: 4,
+                f_range: [2_800.0, 3_200.0],
+                out_mid_crct: "No".into(),
+                ..GcParam::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.scgc_smpl.dim(), (4, 8));
+        assert!(output.scgc_smpl.iter().all(|value| value.is_finite()));
+        assert!(output.dcgc_out.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn v234_rejects_invalid_mode_specific_initial_centers_during_preparation() {
+        let static_param = GcParam {
+            fs: 8_000.0,
+            num_ch: 4,
+            f_range: [1_000.0, 2_000.0],
+            out_mid_crct: "No".into(),
+            ctrl: ControlMode::Static,
+            frat: [[10.0, 0.0], [0.0109, 0.0]],
+            ..GcParam::default()
+        };
+        let dynamic_param = GcParam {
+            fs: 8_000.0,
+            num_ch: 4,
+            f_range: [1_000.0, 2_000.0],
+            out_mid_crct: "No".into(),
+            lvl_est: LvlEst {
+                frat: 10.0,
+                ..LvlEst::default()
+            },
+            ..GcParam::default()
+        };
+
+        for param in [static_param, dynamic_param] {
+            let error = set_param(param).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::InvalidParameter(message)
+                    if message == "initial asymmetric filter centers must be finite, positive, and below Nyquist"
+            ));
+        }
+    }
+
+    #[test]
+    fn v234_dynamic_centers_remain_runtime_validated() {
+        let (param, mut response) = set_param(GcParam {
+            fs: 8_000.0,
+            num_ch: 4,
+            f_range: [200.0, 1_500.0],
+            out_mid_crct: "No".into(),
+            dyn_hpaf: DynHpaf {
+                str_prc: "sample-base".into(),
+                ..DynHpaf::default()
+            },
+            ..GcParam::default()
+        })
+        .unwrap();
+        response.frat0_pc.fill(100.0);
+        let pgc = Array2::ones((4, 1));
+        let scgc = Array2::ones((4, 1));
+
+        assert!(gcfb_v23_sample_base(&pgc, &scgc, &param, &mut response).is_err());
+    }
+
+    #[test]
+    fn v234_validates_derived_filter_centers_without_a_fixed_frequency_floor() {
+        for param in [
+            GcParam {
+                num_ch: 4,
+                f_range: [20.0, 1600.0],
+                out_mid_crct: "No".into(),
+                ..GcParam::default()
+            },
+            GcParam {
+                c1: [f64::NAN, 0.0],
+                out_mid_crct: "No".into(),
+                ..GcParam::default()
+            },
+            GcParam {
+                c1: [1000.0, 0.0],
+                out_mid_crct: "No".into(),
+                ..GcParam::default()
+            },
+        ] {
+            let error = set_param(param).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::InvalidParameter(message)
+                    if message == "derived filter centers must be finite, positive, and below Nyquist"
+            ));
+        }
+
+        let valid = GcParam {
+            num_ch: 4,
+            f_range: [39.0, 1600.0],
+            out_mid_crct: "No".into(),
+            ..GcParam::default()
+        };
+        assert!(set_param(valid).is_ok());
     }
 
     #[test]

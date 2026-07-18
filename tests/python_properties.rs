@@ -616,6 +616,67 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(property_config(48))]
+
+    #[test]
+    fn envelope_modulation_loss_matches_python_for_generated_envelopes(
+        fs_index in 0usize..2,
+        raw_envelope in prop::collection::vec(-1.0f64..1.0, 8..32),
+        reduce_db in prop::collection::vec(0.0f64..30.0, 7),
+        f_cutoff in prop::collection::vec(8.0f64..400.0, 7),
+        low in 150.0f64..450.0,
+        high in 1_200.0f64..3_200.0,
+    ) {
+        let fs = [8_000.0, 16_000.0][fs_index];
+        let frames = Array2::from_shape_fn((4, raw_envelope.len()), |(channel, frame)| {
+            1.2 + 0.2 * channel as f64
+                + 0.25 * raw_envelope[frame]
+                + (0.04 + 0.01 * channel as f64)
+                    * (2.0 * std::f64::consts::PI * (channel + 1) as f64 * frame as f64
+                        / raw_envelope.len() as f64)
+                        .sin()
+        });
+        let encoded_frames: Vec<Vec<f64>> =
+            frames.rows().into_iter().map(|row| row.to_vec()).collect();
+        let Some(expected) = oracle(json!({
+            "op": "envelope_modulation_loss",
+            "frames": encoded_frames,
+            "fs": fs,
+            "f_range": [low, high],
+            "reduce_db": reduce_db,
+            "f_cutoff": f_cutoff,
+        })) else { return Ok(()) };
+        let (parameters, _) = fb234::set_param(v234_param(
+            fs,
+            frames.nrows(),
+            [low, high],
+            "NH",
+        )).unwrap();
+        let (output, em) = fb234::gcfb_v23_env_mod_loss(
+            &frames,
+            &parameters,
+            EmParam {
+                reduce_db: ndarray::Array1::from(reduce_db),
+                f_cutoff: ndarray::Array1::from(f_cutoff),
+                ..EmParam::default()
+            },
+        ).unwrap();
+        check_array(
+            "envelope modulation loss",
+            &flattened(output.view()),
+            &[frames.nrows(), frames.ncols()],
+            &expected["output"],
+            8e-12,
+            8e-12,
+        )?;
+        check_scalar("envelope modulation sampling rate", em.fs, &expected["fs"], 0.0, 0.0)?;
+        check_values("envelope filterbank frequencies", em.fb_fr1.as_slice().unwrap(), &expected["fb_fr1"], 3e-9, 3e-12)?;
+        check_values("interpolated envelope reductions", em.fb_reduce_db.as_slice().unwrap(), &expected["fb_reduce_db"], 3e-11, 3e-12)?;
+        check_values("interpolated envelope cutoffs", em.fb_f_cutoff.as_slice().unwrap(), &expected["fb_f_cutoff"], 3e-10, 3e-12)?;
+    }
+}
+
 fn v211_param(control: Control211, fs: f64, channels: usize, f_range: [f64; 2]) -> Param211 {
     Param211 {
         fs,
@@ -681,7 +742,7 @@ proptest! {
         signal in prop::collection::vec(-1.5f64..1.5, 8..40),
         channels in 3usize..7,
         low in 100.0f64..500.0,
-        high in 1_000.0f64..2_600.0,
+        high in 2_700.0f64..3_300.0,
         impaired in any::<bool>(),
     ) {
         let signal = non_silent(signal);

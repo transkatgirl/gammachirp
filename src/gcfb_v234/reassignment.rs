@@ -1423,6 +1423,19 @@ mod tests {
             let mut parameters = compact_frame_parameters();
             parameters.out_mid_crct = correction.into();
             let (_, reassigned) = gcfb_v234_with_reassignment(&signal, parameters).unwrap();
+            let valid_coordinates = reassigned
+                .validity_mask
+                .iter()
+                .filter(|&&valid| valid)
+                .count();
+            assert!(
+                valid_coordinates > 0,
+                "{correction} correction produced no valid reassignment coordinates"
+            );
+            assert!(
+                reassigned.retained_energy() > 0.0,
+                "{correction} correction retained no reassigned energy"
+            );
             for ch in 0..reassigned.t_hat.nrows() {
                 for sample in 0..reassigned.t_hat.ncols() {
                     if reassigned.validity_mask[[ch, sample]] {

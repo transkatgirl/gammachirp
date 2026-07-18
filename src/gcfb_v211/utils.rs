@@ -141,12 +141,17 @@ pub fn equal_freq_scale(
         FrequencyScale::Log => [range_freq[0].log10(), range_freq[1].log10()],
     };
     let wrapped = Array1::linspace(wrapped_range[0], wrapped_range[1], num_ch);
-    let frequencies = match scale {
+    let mut frequencies = match scale {
         FrequencyScale::Linear => wrapped.clone(),
         FrequencyScale::Mel => wrapped.mapv(mel2freq),
         FrequencyScale::Erb => erb2freq(wrapped.as_slice().unwrap()).0,
         FrequencyScale::Log => wrapped.mapv(|v| 10_f64.powf(v)),
     };
+    // Inverse scale conversions can move either endpoint by an ulp.  The
+    // requested frequency interval is the public contract, so retain it
+    // exactly while leaving the scale-spaced interior channels unchanged.
+    frequencies[0] = range_freq[0];
+    frequencies[num_ch - 1] = range_freq[1];
     Ok((frequencies, wrapped))
 }
 

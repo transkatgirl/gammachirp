@@ -1089,6 +1089,66 @@ fn v234_modulation_filterbank_matches_python() {
     );
 }
 
+#[test]
+fn v234_envelope_modulation_loss_matches_python() {
+    let fixture = references();
+    let expected = &fixture["v234"]["envelope_modulation_loss"];
+    let parameters = fb234::set_param(v234_param(Control234::Dynamic, "frame-base", "NH"))
+        .unwrap()
+        .0;
+    let frames = Array2::from_shape_fn((4, 16), |(channel, frame)| {
+        let baseline = 1.25 + 0.35 * channel as f64;
+        let modulation = (0.15 + 0.04 * channel as f64)
+            * (2.0 * std::f64::consts::PI * (channel + 1) as f64 * frame as f64 / 16.0).sin();
+        baseline + modulation + if frame == channel + 4 { 0.2 } else { 0.0 }
+    });
+    let (output, em) = fb234::gcfb_v23_env_mod_loss(
+        &frames,
+        &parameters,
+        EmParam {
+            reduce_db: ndarray::arr1(&[0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0]),
+            f_cutoff: ndarray::arr1(&[32.0, 48.0, 64.0, 96.0, 128.0, 160.0, 192.0]),
+            ..EmParam::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(expected_shape(&expected["output"]), vec![4, 16]);
+    assert_values(
+        "envelope modulation loss",
+        &flattened(output.view()),
+        &expected["output"],
+        3e-12,
+        3e-12,
+    );
+    assert_scalar(
+        "envelope modulation sampling rate",
+        em.fs,
+        expected["fs"].as_f64().unwrap(),
+        0.0,
+        0.0,
+    );
+    for (label, actual, key) in [
+        (
+            "envelope filterbank frequencies",
+            em.fb_fr1.as_slice().unwrap(),
+            "fb_fr1",
+        ),
+        (
+            "interpolated envelope reductions",
+            em.fb_reduce_db.as_slice().unwrap(),
+            "fb_reduce_db",
+        ),
+        (
+            "interpolated envelope cutoffs",
+            em.fb_f_cutoff.as_slice().unwrap(),
+            "fb_f_cutoff",
+        ),
+    ] {
+        assert_values(label, actual, &expected[key], 3e-12, 3e-12);
+    }
+}
+
 fn assert_v234_filterbank(key: &str, hearing_loss: &str) {
     let fixture = references();
     let expected = &fixture["v234"]["filterbank"][key];

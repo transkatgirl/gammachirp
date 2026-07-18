@@ -288,6 +288,31 @@ def modulation_filterbank(request):
     return encoded(f234.gcfb_v23_env_mod_fb(np.asarray(request["signal"], dtype=float), param))
 
 
+def envelope_modulation_loss(request):
+    frames = np.asarray(request["frames"], dtype=float)
+    parameter_request = {
+        "fs": request["fs"],
+        "channels": int(frames.shape[0]),
+        "f_range": request["f_range"],
+        "hearing_loss": "NH",
+    }
+    param, _ = f234.set_param(make_v234_param(parameter_request))
+    # The reference set_param keeps channel frequencies as a column vector;
+    # flatten it for the scalar-per-channel envelope routine.
+    param.fr1 = np.asarray(param.fr1).reshape(-1)
+    em = Param()
+    em.reduce_db = np.asarray(request["reduce_db"], dtype=float)
+    em.f_cutoff = np.asarray(request["f_cutoff"], dtype=float)
+    output, em = f234.gcfb_v23_env_mod_loss(frames, param, em)
+    return {
+        "output": encoded(output),
+        "fs": float(em.fs),
+        "fb_fr1": encoded(em.fb_fr1),
+        "fb_reduce_db": encoded(em.fb_reduce_db),
+        "fb_f_cutoff": encoded(em.fb_f_cutoff),
+    }
+
+
 def v234_asymmetric_io(request):
     param, response = f234.set_param(make_v234_param(request))
     pins = np.asarray(request["pins"], dtype=float)
@@ -348,6 +373,7 @@ OPERATIONS = {
     "v234_utils": v234_utils,
     "field_transfer": field_transfer,
     "modulation_filterbank": modulation_filterbank,
+    "envelope_modulation_loss": envelope_modulation_loss,
     "v234_asymmetric_io": v234_asymmetric_io,
     "v211_filterbank": v211_filterbank,
     "v234_filterbank": v234_filterbank,
