@@ -103,14 +103,23 @@ effective support for the matched GCFB maps; that is an empirical observation
 of this implementation, not the paper's Gaussian-STFT white-noise theorem.
 
 `gcfb_v234_with_bandwidth_consensus` runs phase-aware analysis at several
-complete-filter bandwidths. Its default scales are `0.75`, `1.0`, and `1.5`.
+complete-filter bandwidths. Its default scales are `0.8`, `1.0`, and `1.2`.
 Each scale multiplies both coefficients of `b1`, every coefficient of `b2`, and
 `lvl_est.b2`; chirp, compression, level-control, hearing-loss, and frequency-
-grid parameters remain fixed. Each reassigned energy map is normalized by its
-own maximum. The agreement map counts the fraction above the relative support
-floor, and salience is the required-agreement order statistic (the default
-requires every scale). The returned ordinary `GcfbOutput` and the analysis at
-the unique `1.0` baseline share the exact unscaled run.
+grid parameters remain fixed. At 1 kHz and 50 dB, the endpoint scales produce
+composite-filter ERBs of approximately `0.81` and `1.19` times the baseline,
+bracketing the roughly 10% to 18% between-listener variation reported for normal
+hearing ([Moore et al., 1990](https://doi.org/10.1121/1.399960);
+[Shen and Richards, 2013](https://doi.org/10.1121/1.4812856)). They test
+stability around the configured listener rather than simulating hearing loss;
+listener-specific widening is already represented by the GCFB hearing-loss and
+compression-health parameters
+([Irino, 2023](https://doi.org/10.1109/ACCESS.2023.3298673)). Each reassigned
+energy map is normalized by its own maximum. The agreement map counts the
+fraction above the relative support floor, and salience is the
+required-agreement order statistic (the default requires every scale). The
+returned ordinary `GcfbOutput` and the analysis at the unique `1.0` baseline
+share the exact unscaled run.
 
 These extensions are model-specific analogues of the paper's Gaussian-STFT
 experiments. Its STFT-zero topology, unlimited localization precision, and
@@ -121,6 +130,24 @@ All complex and consensus paths use the offline/acausal imaginary branch. In
 sample mode they replay the realized coefficient history, so their meaning is
 conditional on that history and does not include differentiation through the
 nonlinear estimator.
+
+Render a self-contained, side-by-side comparison of the matched energy maps
+before and after time-frequency reassignment with:
+
+```bash
+cargo run --example v234_reassignment_spectrogram
+```
+
+The example writes `target/v234_reassignment_spectrogram.png` by default. Pass
+an alternative PNG path after `--` to choose the destination:
+
+```bash
+cargo run --example v234_reassignment_spectrogram -- /tmp/comparison.png
+```
+
+Both panels use the same retained analytic energy and the same -60 to 0 dB
+color scale, so the visual difference reflects reassignment rather than
+per-panel normalization.
 
 Run the deterministic tones, clicks, chirp, and seeded-noise example (it only
 prints measurements and writes no files) with:

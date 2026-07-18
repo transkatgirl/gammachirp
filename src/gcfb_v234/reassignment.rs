@@ -249,6 +249,17 @@ impl SparsityComparison {
 }
 
 /// Options for model-specific bandwidth consensus.
+///
+/// The default scales bracket the unscaled, psychophysically fitted GCFB with
+/// typical normal-hearing variation rather than simulating hearing loss. At
+/// 1 kHz and 50 dB, scales `0.8` and `1.2` produce composite-filter ERBs of
+/// approximately `0.81` and `1.19` times the baseline ERB. This is consistent
+/// with the roughly 10% to 18% between-listener variation reported by
+/// [Moore et al. (1990)](https://doi.org/10.1121/1.399960) and
+/// [Shen and Richards (2013)](https://doi.org/10.1121/1.4812856).
+/// Listener-specific widening remains the responsibility of the configured
+/// hearing-loss and compression-health parameters described by
+/// [Irino (2023)](https://doi.org/10.1109/ACCESS.2023.3298673).
 #[derive(Clone, Debug)]
 pub struct BandwidthConsensusConfig {
     /// Multipliers applied to `b1`, `b2`, and `lvl_est.b2`.
@@ -265,7 +276,7 @@ pub struct BandwidthConsensusConfig {
 impl Default for BandwidthConsensusConfig {
     fn default() -> Self {
         Self {
-            scales: vec![0.75, 1.0, 1.5],
+            scales: vec![0.8, 1.0, 1.2],
             relative_support_floor: 1e-6,
             required_agreement: 1.0,
             reassignment_config: ReassignmentConfig::default(),
@@ -1912,6 +1923,51 @@ mod tests {
             "reassigned fraction {} did not beat source fraction {}",
             comparison.reassigned.effective_bin_fraction,
             comparison.unreassigned.effective_bin_fraction
+        );
+    }
+
+    fn composite_erb_at_1khz(scale: f64) -> f64 {
+        let parameters = scale_bandwidths(GcParam::default(), scale);
+        let level = parameters.level_db_scgcfb;
+        let frat = parameters.frat[0][0] + parameters.frat[1][0] * level;
+        let response = cmprs_gc_frsp(
+            &[1000.0],
+            parameters.fs,
+            parameters.n,
+            &[parameters.b1[0]],
+            &[parameters.c1[0]],
+            &[frat],
+            &[parameters.b2[0][0]],
+            &[parameters.c2[0][0]],
+            4096,
+        )
+        .unwrap();
+        let bin_width = response.freq[1] - response.freq[0];
+        response
+            .cgc_nrm_frsp
+            .row(0)
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f64>()
+            * bin_width
+    }
+
+    #[test]
+    fn consensus_defaults_span_typical_normal_hearing_bandwidth_variation() {
+        let config = BandwidthConsensusConfig::default();
+        assert_eq!(config.scales, vec![0.8, 1.0, 1.2]);
+        assert_eq!(validate_consensus_config(&config).unwrap(), 1);
+
+        let baseline_erb = composite_erb_at_1khz(config.scales[1]);
+        let narrow_ratio = composite_erb_at_1khz(config.scales[0]) / baseline_erb;
+        let wide_ratio = composite_erb_at_1khz(config.scales[2]) / baseline_erb;
+        assert!(
+            (0.80..=0.82).contains(&narrow_ratio),
+            "narrow default produced an ERB ratio of {narrow_ratio}"
+        );
+        assert!(
+            (1.17..=1.20).contains(&wide_ratio),
+            "wide default produced an ERB ratio of {wide_ratio}"
         );
     }
 
