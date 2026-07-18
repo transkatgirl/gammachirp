@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gammachirpy::gcfb_v234::{
+use gammachirp_rs::gcfb_v234::{
     BandwidthConsensusConfig, BandwidthConsensusResult, ControlMode, GainReference, GcParam,
     gcfb_v234_with_bandwidth_consensus,
 };

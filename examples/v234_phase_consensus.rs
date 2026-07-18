@@ -2,12 +2,12 @@
 
 use std::f64::consts::PI;
 
-use gammachirpy::gcfb_v234::{
+use gammachirp_rs::gcfb_v234::{
     BandwidthConsensusConfig, ControlMode, GainReference, GcParam,
     gcfb_v234_with_bandwidth_consensus,
 };
 
-fn main() -> gammachirpy::Result<()> {
+fn main() -> gammachirp_rs::Result<()> {
     let sample_rate = 16_000.0;
     let samples = 4096;
     let click_samples = [960, 2880];

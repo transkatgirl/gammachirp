@@ -1,10 +1,10 @@
 [package]
-name = "gammachirpy"
+name = "gammachirp-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Dynamic compressive gammachirp auditory filterbanks"
 license = "Apache-2.0"
-repository = "https://github.com/kyama0321/gammachirpy"
+repository = "https://github.com/transkatgirl/gammachirp"
 keywords = ["audio", "auditory", "filterbank", "gammachirp", "dsp"]
 categories = ["multimedia::audio", "science"]
 include = [

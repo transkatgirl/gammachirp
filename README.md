@@ -1,7 +1,7 @@
-# GammachirPy / `gammachirpy` Rust crate
+# `gammachirp-rs` Rust crate
 
-Dynamic compressive gammachirp filterbanks, now available as a Rust crate as
-well as the original Python implementation.
+Dynamic compressive gammachirp filterbanks, provided as a Rust port of the
+original GammachirPy Python implementation.
 
 ## Rust crate
 
@@ -14,10 +14,10 @@ The Rust port keeps the original versioned structure:
 
 Filterbank matrices use the same channel-major orientation as Python: rows are
 channels and columns are samples or frames. Parameters are typed structs, and
-invalid inputs return `gammachirpy::Result`.
+invalid inputs return `gammachirp_rs::Result`.
 
 ```rust
-use gammachirpy::gcfb_v234::{GcParam, gcfb_v234};
+use gammachirp_rs::gcfb_v234::{GcParam, gcfb_v234};
 
 let input = [1.0, 0.0, 0.0, 0.0];
 let parameters = GcParam {
@@ -28,7 +28,7 @@ let parameters = GcParam {
 
 let output = gcfb_v234(&input, parameters)?;
 assert_eq!(output.dcgc_out.nrows(), 32);
-# Ok::<(), gammachirpy::Error>(())
+# Ok::<(), gammachirp_rs::Error>(())
 ```
 
 ### Reassigned dcGC analysis
@@ -44,7 +44,7 @@ is not pointwise or framewise `dcgc_out^2`, and the ordinary `GcfbOutput` is not
 changed.
 
 ```rust
-use gammachirpy::gcfb_v234::{GcParam, gcfb_v234_with_reassignment};
+use gammachirp_rs::gcfb_v234::{GcParam, gcfb_v234_with_reassignment};
 
 let input = [1.0, 0.0, 0.0, 0.0];
 let (filterbank, reassigned) =
@@ -58,7 +58,7 @@ assert_eq!(filterbank.dcgc_out.nrows(), 32);
 assert_eq!(reassigned.energy_map.nrows(), 32);
 assert!((reassigned.retained_energy() + reassigned.discarded_energy
     - reassigned.source_energy).abs() < 1e-10);
-# Ok::<(), gammachirpy::Error>(())
+# Ok::<(), gammachirp_rs::Error>(())
 ```
 
 The imaginary analysis branch is offline and acausal; the ordinary real GCFB

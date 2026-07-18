@@ -5,12 +5,12 @@
 //! not invoked by these tests, so downstream Rust builds do not need NumPy,
 //! SciPy, or Matplotlib installed.
 
-use gammachirpy::gcfb_v211::{
+use gammachirp_rs::gcfb_v211::{
     gammachirp::{self as gc, Carrier, Normalization},
     gcfb_v211::{self as fb211, AcfStatus, ControlMode as Control211, GcParam as Param211},
     utils as utils211,
 };
-use gammachirpy::gcfb_v234::{
+use gammachirp_rs::gcfb_v234::{
     gcfb_v234::{
         self as fb234, ControlMode as Control234, DynHpaf, EmParam, GainReference,
         GcParam as Param234,

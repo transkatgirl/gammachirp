@@ -334,7 +334,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gammachirpy"
+name = "gammachirp-rs"
 version = "0.1.0"
 dependencies = [
  "approx",

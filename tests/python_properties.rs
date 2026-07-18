@@ -13,12 +13,12 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use gammachirpy::gcfb_v211::{
+use gammachirp_rs::gcfb_v211::{
     gammachirp::{self as gc, Carrier, Normalization},
     gcfb_v211::{self as fb211, AcfStatus, ControlMode as Control211, GcParam as Param211},
     utils::{self as utils211, FrequencyScale},
 };
-use gammachirpy::gcfb_v234::{
+use gammachirp_rs::gcfb_v234::{
     gcfb_v234::{
         self as fb234, ControlMode as Control234, DynHpaf, EmParam, GainReference,
         GcParam as Param234,

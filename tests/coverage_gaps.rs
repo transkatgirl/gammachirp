@@ -4,7 +4,7 @@
 use std::{fs, time::SystemTime};
 
 use approx::assert_relative_eq;
-use gammachirpy::{
+use gammachirp_rs::{
     Error,
     gcfb_v211::{
         gammachirp::{self, Carrier, Normalization},

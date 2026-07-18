@@ -1,6 +1,6 @@
-use gammachirpy::gcfb_v234::{GcParam, gcfb_v234};
+use gammachirp_rs::gcfb_v234::{GcParam, gcfb_v234};
 
-fn main() -> gammachirpy::Result<()> {
+fn main() -> gammachirp_rs::Result<()> {
     let fs = 48_000;
     let period = fs / 100;
     let mut pulse_train = vec![0.0; period * 10];
