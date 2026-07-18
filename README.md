@@ -131,8 +131,9 @@ sample mode they replay the realized coefficient history, so their meaning is
 conditional on that history and does not include differentiation through the
 nonlinear estimator.
 
-Render a self-contained, side-by-side comparison of the matched energy maps
-before and after time-frequency reassignment with:
+Render a self-contained, three-panel comparison of the matched energy map,
+its time-frequency reassignment, and the default bandwidth-consensus salience
+with:
 
 ```bash
 cargo run --example v234_reassignment_spectrogram
@@ -145,9 +146,13 @@ an alternative PNG path after `--` to choose the destination:
 cargo run --example v234_reassignment_spectrogram -- /tmp/comparison.png
 ```
 
-Both panels use the same retained analytic energy and the same -60 to 0 dB
-color scale, so the visual difference reflects reassignment rather than
-per-panel normalization.
+The first two panels use the same retained analytic energy and the same -60 to
+0 dB color scale, so their visual difference reflects reassignment rather than
+per-panel normalization. The third panel shows salience for the default `0.8`,
+`1.0`, and `1.2` bandwidth scales, suppresses bins outside the consensus mask,
+and uses a separate -60 to 0 dB scale referenced to normalized salience `1.0`.
+The example also reports the active scales, agreement requirement, and accepted
+consensus-bin count and fraction.
 
 Run the deterministic tones, clicks, chirp, and seeded-noise example (it only
 prints measurements and writes no files) with:

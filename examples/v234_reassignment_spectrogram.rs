@@ -1,4 +1,4 @@
-//! Render matched GCFB spectrograms before and after time-frequency reassignment.
+//! Render matched GCFB reassignment and bandwidth-consensus spectrograms.
 
 use std::error::Error;
 use std::f64::consts::PI;
@@ -8,13 +8,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gammachirpy::gcfb_v234::{
-    ControlMode, GainReference, GcParam, gcfb_v234_with_phase_reassignment,
+    BandwidthConsensusConfig, BandwidthConsensusResult, ControlMode, GainReference, GcParam,
+    gcfb_v234_with_bandwidth_consensus,
 };
 use ndarray::{Array1, Array2};
 use plotters::coord::Shift;
 use plotters::prelude::*;
 
-const IMAGE_SIZE: (u32, u32) = (1600, 720);
+const IMAGE_SIZE: (u32, u32) = (2300, 720);
 const DB_FLOOR: f64 = -60.0;
 const DEFAULT_OUTPUT: &str = "target/v234_reassignment_spectrogram.png";
 
@@ -38,16 +39,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         gain_ref: GainReference::Db(50.0),
         ..GcParam::default()
     };
-    let (_, phase) = gcfb_v234_with_phase_reassignment(&input, parameters)?;
+    let consensus_config = BandwidthConsensusConfig::default();
+    let (_, consensus) = gcfb_v234_with_bandwidth_consensus(&input, parameters, &consensus_config)?;
+    let phase = &consensus.analyses[consensus.baseline_index];
     let comparison = phase.sparsity_comparison()?;
 
-    render_comparison(
-        &output_path,
-        &phase.unreassigned_energy_map,
-        &phase.reassignment.energy_map,
-        &phase.reassignment.time_axis,
-        &phase.reassignment.frequency_axis_erb,
-    )?;
+    render_comparison(&output_path, &consensus)?;
+
+    let accepted_bins = consensus
+        .consensus_mask
+        .iter()
+        .filter(|&&accepted| accepted)
+        .count();
+    let accepted_fraction = accepted_bins as f64 / consensus.consensus_mask.len() as f64;
+    let required_scales =
+        (consensus_config.required_agreement * consensus.scales.len() as f64).ceil() as usize;
 
     println!("wrote {}", output_path.display());
     println!(
@@ -58,6 +64,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "effective support: unreassigned={:.1} bins, reassigned={:.1} bins",
         comparison.unreassigned.effective_bins, comparison.reassigned.effective_bins,
+    );
+    println!(
+        "bandwidth consensus: scales=[{}], agreement requirement={:.3} ({required_scales}/{} scales)",
+        format_scales(&consensus.scales),
+        consensus_config.required_agreement,
+        consensus.scales.len(),
+    );
+    println!(
+        "accepted consensus bins: {accepted_bins}/{} ({:.3}%)",
+        consensus.consensus_mask.len(),
+        100.0 * accepted_fraction,
     );
     Ok(())
 }
@@ -121,16 +138,30 @@ fn example_signal() -> (Vec<f64>, f64) {
 
 fn render_comparison(
     output_path: &Path,
-    unreassigned: &Array2<f64>,
-    reassigned: &Array2<f64>,
-    time_axis: &Array1<f64>,
-    frequency_axis_erb: &Array1<f64>,
+    consensus: &BandwidthConsensusResult,
 ) -> Result<(), Box<dyn Error>> {
-    let expected_dimensions = (frequency_axis_erb.len(), time_axis.len());
-    if unreassigned.dim() != expected_dimensions || reassigned.dim() != expected_dimensions {
+    let phase = &consensus.analyses[consensus.baseline_index];
+    let unreassigned = &phase.unreassigned_energy_map;
+    let reassigned = &phase.reassignment.energy_map;
+    let salience = &consensus.salience_map;
+    let consensus_mask = &consensus.consensus_mask;
+    let time_axis = &phase.reassignment.time_axis;
+    let frequency_axis_erb = &phase.reassignment.frequency_axis_erb;
+    validate_render_dimensions(
+        unreassigned,
+        reassigned,
+        salience,
+        consensus_mask,
+        time_axis,
+        frequency_axis_erb,
+    )?;
+    if salience
+        .iter()
+        .any(|&value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "spectrogram maps and axes have incompatible dimensions",
+            "consensus salience must contain finite values from 0 to 1",
         )
         .into());
     }
@@ -152,9 +183,12 @@ fn render_comparison(
     let frequency_edges = bin_edges(frequency_axis_erb.as_slice().unwrap(), None)?;
     let root = BitMapBackend::new(output_path, IMAGE_SIZE).into_drawing_area();
     root.fill(&WHITE)?;
-    let body = root.titled("GCFB v2.34 Time-Frequency Reassignment", ("sans-serif", 30))?;
-    let (panel_area, colorbar_area) = body.split_horizontally(1400);
-    let panels = panel_area.split_evenly((1, 2));
+    let body = root.titled(
+        "GCFB v2.34 Time-Frequency Reassignment and Bandwidth Consensus",
+        ("sans-serif", 30),
+    )?;
+    let (panel_area, colorbar_area) = body.split_horizontally(2040);
+    let panels = panel_area.split_evenly((1, 3));
 
     draw_spectrogram(
         &panels[0],
@@ -172,9 +206,52 @@ fn render_comparison(
         &frequency_edges,
         maximum,
     )?;
-    draw_colorbar(&colorbar_area)?;
+    draw_consensus_salience(
+        &panels[2],
+        &format!(
+            "Consensus salience (scales {})",
+            format_scales(&consensus.scales)
+        ),
+        salience,
+        consensus_mask,
+        &time_edges,
+        &frequency_edges,
+    )?;
+    let colorbars = colorbar_area.split_evenly((2, 1));
+    draw_colorbar(&colorbars[0], "Matched energy (dB)")?;
+    draw_colorbar(&colorbars[1], "Consensus salience (dB)")?;
     root.present()?;
     Ok(())
+}
+
+fn validate_render_dimensions(
+    unreassigned: &Array2<f64>,
+    reassigned: &Array2<f64>,
+    salience: &Array2<f64>,
+    consensus_mask: &Array2<bool>,
+    time_axis: &Array1<f64>,
+    frequency_axis_erb: &Array1<f64>,
+) -> io::Result<()> {
+    let expected_dimensions = (frequency_axis_erb.len(), time_axis.len());
+    if unreassigned.dim() != expected_dimensions
+        || reassigned.dim() != expected_dimensions
+        || salience.dim() != expected_dimensions
+        || consensus_mask.dim() != expected_dimensions
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spectrogram maps, consensus mask, and axes have incompatible dimensions",
+        ));
+    }
+    Ok(())
+}
+
+fn format_scales(scales: &[f64]) -> String {
+    scales
+        .iter()
+        .map(|scale| format!("{scale:.1}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn bin_edges(centers: &[f64], lower_bound: Option<f64>) -> io::Result<Vec<f64>> {
@@ -242,11 +319,57 @@ fn draw_spectrogram(
     Ok(())
 }
 
-fn draw_colorbar(area: &DrawingArea<BitMapBackend<'_>, Shift>) -> Result<(), Box<dyn Error>> {
+fn draw_consensus_salience(
+    area: &DrawingArea<BitMapBackend<'_>, Shift>,
+    title: &str,
+    salience: &Array2<f64>,
+    consensus_mask: &Array2<bool>,
+    time_edges: &[f64],
+    frequency_edges: &[f64],
+) -> Result<(), Box<dyn Error>> {
     let mut chart = ChartBuilder::on(area)
-        .caption("Energy (dB)", ("sans-serif", 17))
-        .margin_top(65)
-        .margin_bottom(57)
+        .caption(title, ("sans-serif", 20))
+        .margin(12)
+        .x_label_area_size(45)
+        .y_label_area_size(75)
+        .build_cartesian_2d(
+            time_edges[0]..time_edges[time_edges.len() - 1],
+            frequency_edges[0]..frequency_edges[frequency_edges.len() - 1],
+        )?;
+    chart.plotting_area().fill(&heat_color(DB_FLOOR))?;
+    chart
+        .configure_mesh()
+        .x_desc("Time (s)")
+        .y_desc("Auditory frequency (Hz)")
+        .x_labels(6)
+        .y_labels(8)
+        .y_label_formatter(&|erb_rate| format!("{:.0}", erb_to_frequency(*erb_rate)))
+        .light_line_style(WHITE.mix(0.22))
+        .draw()?;
+
+    chart.draw_series((0..salience.nrows()).flat_map(|channel| {
+        (0..salience.ncols()).map(move |time| {
+            let db = salience_db(salience[[channel, time]], consensus_mask[[channel, time]]);
+            Rectangle::new(
+                [
+                    (time_edges[time], frequency_edges[channel]),
+                    (time_edges[time + 1], frequency_edges[channel + 1]),
+                ],
+                heat_color(db).filled(),
+            )
+        })
+    }))?;
+    Ok(())
+}
+
+fn draw_colorbar(
+    area: &DrawingArea<BitMapBackend<'_>, Shift>,
+    caption: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut chart = ChartBuilder::on(area)
+        .caption(caption, ("sans-serif", 17))
+        .margin_top(32)
+        .margin_bottom(28)
         .margin_left(20)
         .margin_right(45)
         .y_label_area_size(42)
@@ -270,6 +393,14 @@ fn draw_colorbar(area: &DrawingArea<BitMapBackend<'_>, Shift>) -> Result<(), Box
 fn energy_db(energy: f64, maximum: f64) -> f64 {
     if energy > 0.0 {
         (10.0 * (energy / maximum).log10()).clamp(DB_FLOOR, 0.0)
+    } else {
+        DB_FLOOR
+    }
+}
+
+fn salience_db(salience: f64, accepted: bool) -> f64 {
+    if accepted {
+        energy_db(salience, 1.0)
     } else {
         DB_FLOOR
     }
@@ -318,6 +449,55 @@ mod tests {
         assert_eq!(energy_db(0.0, 4.0), DB_FLOOR);
         assert_eq!(energy_db(4e-7, 4.0), DB_FLOOR);
         assert!((energy_db(0.4, 4.0) + 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn normalized_salience_uses_a_unit_reference_and_suppresses_masked_bins() {
+        assert_eq!(salience_db(1.0, true), 0.0);
+        assert!((salience_db(0.1, true) + 10.0).abs() < 1e-12);
+        assert_eq!(salience_db(1e-7, true), DB_FLOOR);
+        assert_eq!(salience_db(0.8, false), DB_FLOOR);
+    }
+
+    #[test]
+    fn rendering_validates_consensus_map_and_mask_dimensions() {
+        let time_axis = Array1::from_vec(vec![0.0, 0.1, 0.2]);
+        let frequency_axis = Array1::from_vec(vec![10.0, 11.0]);
+        let energy = Array2::zeros((2, 3));
+        let salience = Array2::zeros((2, 3));
+        let mask = Array2::from_elem((2, 3), true);
+
+        validate_render_dimensions(
+            &energy,
+            &energy,
+            &salience,
+            &mask,
+            &time_axis,
+            &frequency_axis,
+        )
+        .unwrap();
+        assert!(
+            validate_render_dimensions(
+                &energy,
+                &energy,
+                &Array2::zeros((2, 2)),
+                &mask,
+                &time_axis,
+                &frequency_axis,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_render_dimensions(
+                &energy,
+                &energy,
+                &salience,
+                &Array2::from_elem((1, 3), true),
+                &time_axis,
+                &frequency_axis,
+            )
+            .is_err()
+        );
     }
 
     #[test]
