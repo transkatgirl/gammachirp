@@ -77,6 +77,26 @@ requested EI population. Dynamic GCFB configurations are evaluated in sample
 mode to retain fine structure. Its output includes the EI map, both adapted
 internal representations, center frequencies, and both complete GCFB outputs.
 
+The runnable hybrid example generates deterministic broadband input at 16 kHz,
+delays the right ear by 0.5 ms, and analyzes it with a noise-free 24-channel
+static GCFB and an ITD-by-IID EI population:
+
+```text
+cargo run --example breebaart2001_hybrid
+cargo run --example breebaart2001_hybrid -- /tmp/breebaart.png
+```
+
+It prints the stimulus and expected EI sign convention, array dimensions,
+frequency range, observed best-matching unit, and the five lowest mean
+responses. The heatmap is written to `target/breebaart2001_hybrid.png` by
+default; one optional `.png` path selects another destination, and missing
+parent directories are created automatically. In an EI population, a unit
+whose characteristic ITD and IID match the stimulus cues cancels excitation
+against inhibition. Cue matching therefore appears as a minimum in activity,
+not a peak. With the paper's symmetric-delay convention, a right-ear waveform
+delay of +0.5 ms is matched by a characteristic ITD of -0.5 ms and an IID of
+0 dB.
+
 The default `EiConfig` follows the continuous-time equations in the paper.
 `EiConfig::amt_1_6()` instead selects AMT 1.6's one-sided integer delay,
 2.2 ms delay weighting, forward-backward filter boundaries, and noise-free
