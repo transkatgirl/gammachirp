@@ -18,8 +18,9 @@ use plotters::prelude::*;
 const SAMPLE_RATE_HZ: f64 = 16_000.0;
 const STIMULUS_SAMPLES: usize = 8_192;
 const STIMULUS_DELAY_SECONDS: f64 = 0.5e-3;
+const STIMULUS_IID_DB: f64 = 3.0;
 const EXPECTED_ITD_SECONDS: f64 = -STIMULUS_DELAY_SECONDS;
-const EXPECTED_IID_DB: f64 = 0.0;
+const EXPECTED_IID_DB: f64 = STIMULUS_IID_DB;
 const INTERIOR_MARGIN_SAMPLES: usize = 2_400;
 const DEFAULT_OUTPUT: &str = "target/breebaart2001_hybrid.png";
 const IMAGE_SIZE: (u32, u32) = (1_200, 800);
@@ -42,9 +43,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let observed = analysis.output.units[observed_index];
 
     println!(
-        "stimulus: deterministic broadband noise; right ear delayed by +{:.3} ms; IID {:+.1} dB",
+        "stimulus: deterministic broadband noise; right ear delayed by +{:.3} ms; right-minus-left IID {:+.1} dB",
         STIMULUS_DELAY_SECONDS * 1e3,
-        EXPECTED_IID_DB,
+        STIMULUS_IID_DB,
     );
     println!(
         "expected EI minimum: characteristic ITD {:+.3} ms and IID {:+.1} dB (paper-symmetric EI convention)",
@@ -123,7 +124,7 @@ fn ensure_png_path(path: &Path) -> io::Result<()> {
     }
 }
 
-fn delayed_broadband_stimulus() -> (Vec<f64>, Vec<f64>) {
+fn binaural_broadband_stimulus() -> (Vec<f64>, Vec<f64>) {
     let mut state = 0x6a09_e667_f3bc_c909_u64;
     let left: Vec<f64> = (0..STIMULUS_SAMPLES)
         .map(|_| {
@@ -135,8 +136,14 @@ fn delayed_broadband_stimulus() -> (Vec<f64>, Vec<f64>) {
         })
         .collect();
     let delay_samples = (STIMULUS_DELAY_SECONDS * SAMPLE_RATE_HZ).round() as usize;
+    let right_gain = 10_f64.powf(STIMULUS_IID_DB / 20.0);
     let mut right = vec![0.0; STIMULUS_SAMPLES];
-    right[delay_samples..].copy_from_slice(&left[..STIMULUS_SAMPLES - delay_samples]);
+    for (right_sample, &left_sample) in right[delay_samples..]
+        .iter_mut()
+        .zip(&left[..STIMULUS_SAMPLES - delay_samples])
+    {
+        *right_sample = right_gain * left_sample;
+    }
     (left, right)
 }
 
@@ -170,7 +177,7 @@ fn analysis_config() -> HybridBinauralConfig {
 }
 
 fn run_analysis() -> gammachirp_rs::Result<Analysis> {
-    let (left, right) = delayed_broadband_stimulus();
+    let (left, right) = binaural_broadband_stimulus();
     let units = ei_population();
     let output = hybrid_binaural(&left, &right, &units, analysis_config())?;
     let averaging_window = INTERIOR_MARGIN_SAMPLES..STIMULUS_SAMPLES - INTERIOR_MARGIN_SAMPLES;
@@ -344,14 +351,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn stimulus_delays_the_right_ear_by_exactly_half_a_millisecond() {
-        let (left, right) = delayed_broadband_stimulus();
+    fn stimulus_has_the_configured_itd_and_iid() {
+        let (left, right) = binaural_broadband_stimulus();
         let delay_samples = (STIMULUS_DELAY_SECONDS * SAMPLE_RATE_HZ).round() as usize;
+        let right_gain = 10_f64.powf(STIMULUS_IID_DB / 20.0);
         assert_eq!(delay_samples, 8);
         assert_eq!(left.len(), STIMULUS_SAMPLES);
         assert_eq!(right.len(), STIMULUS_SAMPLES);
         assert!(right[..delay_samples].iter().all(|&sample| sample == 0.0));
-        assert_eq!(right[delay_samples..], left[..left.len() - delay_samples]);
+        for (&right_sample, &left_sample) in right[delay_samples..]
+            .iter()
+            .zip(&left[..left.len() - delay_samples])
+        {
+            assert_eq!(right_sample, right_gain * left_sample);
+        }
     }
 
     #[test]
@@ -404,7 +417,8 @@ mod tests {
             .map(|index| index as f64)
             .collect();
 
-        render_heatmap(&output, &values, (-0.5, 0.0), (-0.5, 0.0)).unwrap();
+        let expected = (EXPECTED_ITD_SECONDS * 1e3, EXPECTED_IID_DB);
+        render_heatmap(&output, &values, expected, expected).unwrap();
         let bytes = fs::read(&output).unwrap();
         assert!(bytes.starts_with(&[137, b'P', b'N', b'G', 13, 10, 26, 10]));
         fs::remove_dir_all(directory).unwrap();

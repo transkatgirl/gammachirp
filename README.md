@@ -78,8 +78,9 @@ mode to retain fine structure. Its output includes the EI map, both adapted
 internal representations, center frequencies, and both complete GCFB outputs.
 
 The runnable hybrid example generates deterministic broadband input at 16 kHz,
-delays the right ear by 0.5 ms, and analyzes it with a noise-free 24-channel
-static GCFB and an ITD-by-IID EI population:
+delays the right ear by 0.5 ms, makes it 3 dB louder than the left ear, and
+analyzes it with a noise-free 24-channel static GCFB and an ITD-by-IID EI
+population:
 
 ```text
 cargo run --example breebaart2001_hybrid
@@ -95,7 +96,7 @@ whose characteristic ITD and IID match the stimulus cues cancels excitation
 against inhibition. Cue matching therefore appears as a minimum in activity,
 not a peak. With the paper's symmetric-delay convention, a right-ear waveform
 delay of +0.5 ms is matched by a characteristic ITD of -0.5 ms and an IID of
-0 dB.
++3 dB (defined here as the right-ear level minus the left-ear level).
 
 The default `EiConfig` follows the continuous-time equations in the paper.
 `EiConfig::amt_1_6()` instead selects AMT 1.6's one-sided integer delay,
