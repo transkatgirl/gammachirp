@@ -101,17 +101,44 @@ delay of +0.5 ms is matched by a characteristic ITD of -0.5 ms and an IID of
 The default `EiConfig` follows the continuous-time equations in the paper.
 `EiConfig::amt_1_6()` instead selects AMT 1.6's one-sided integer delay,
 2.2 ms delay weighting, forward-backward filter boundaries, and noise-free
-EI-cell output. AMT adds its internal noise in the later central processor, so
-that decision noise remains the caller's responsibility. This option matches
-the AMT EI cell; the end-to-end hybrid still uses the GCFB rather than AMT's
-linear gammatone filterbank.
+EI-cell output. It also disables the paper's 5 ms and 10 dB population limits,
+which the AMT EI cell does not enforce. AMT adds its internal noise in the later
+central processor, so that decision noise remains the caller's responsibility.
+This option matches the AMT EI cell; the end-to-end hybrid still uses the GCFB
+rather than AMT's linear gammatone filterbank.
 
 `CentralTemplate::fit` estimates the masker mean and variance and the expected
 target-minus-masker difference from labeled trials. `score` applies the
 Appendix-B weighting, and `choose_interval` selects the largest score in a
-forced-choice task. The three array axes are generic; callers that need the
-paper's complete central detector should combine the hybrid's binaural EI map
-with their desired monaural channels before fitting the template.
+forced-choice task. For the paper's detector, select the single EI unit suited
+to the experiment; do not pass the complete EI population, whose internal
+noise is shared across units. The detector representation has axes `(detector
+channel, frequency channel, sample)`, with the selected binaural channel and
+any processed left/right monaural channels on its first axis.
+
+The hybrid's `left_internal` and `right_internal` fields are raw adaptation-loop
+outputs, not detector-ready monaural channels. Process them with
+`breebaart2001_monaural`, which defaults to the paper's double-sided 10 ms
+exponential and 0.0003 sensitivity. `MonauralConfig::amt_1_6()` selects AMT's
+causal one-pole convention instead. The helper is deterministic; internal
+noise required by the selected central decision model must be represented in
+the trials or added at that later stage.
+
+```rust
+use gammachirp_rs::breebaart2001::{
+    MonauralConfig, breebaart2001_monaural,
+};
+use ndarray::{Axis, stack};
+
+# let output: gammachirp_rs::breebaart2001::HybridBinauralOutput = todo!();
+let sample_rate = output.left_filterbank.gc_param.fs;
+let monaural = MonauralConfig::default();
+let left = breebaart2001_monaural(&output.left_internal, sample_rate, &monaural)?;
+let right = breebaart2001_monaural(&output.right_internal, sample_rate, &monaural)?;
+let selected_ei = output.ei_map.index_axis(Axis(0), 0);
+let representation = stack(Axis(0), &[selected_ei, left.view(), right.view()])?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 When generating those training trials, derive each presentation from a common
 base configuration with `config.for_trial(trial_index)`. This preserves exact

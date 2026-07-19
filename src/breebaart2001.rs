@@ -13,6 +13,8 @@
 //!   right peripheral representations are already available in model units.
 //! - [`hybrid_binaural`] accepts paired waveforms and runs the GCFB,
 //!   inner-hair-cell, adaptation-loop, and EI stages.
+//! - [`breebaart2001_monaural`] prepares an adaptation-loop output for the
+//!   monaural channels of the central detector.
 //! - [`CentralTemplate`] fits and applies the paper's Appendix-B ideal-observer
 //!   template to caller-supplied internal representations.
 //!
@@ -143,6 +145,54 @@ pub enum EiIntegrationBoundary {
     AmtFiltfilt,
 }
 
+/// Temporal processing used to prepare a monaural central-detector channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MonauralTemporalMode {
+    /// Apply the paper's normalized, double-sided 10 ms exponential with zero
+    /// extension outside the supplied representation.
+    #[default]
+    PaperDoubleSided,
+    /// Reproduce AMT 1.6's causal first-order 10 ms low-pass with zero initial
+    /// state.
+    AmtCausal,
+}
+
+/// Parameters for the monaural channels of the Breebaart central detector.
+#[derive(Clone, Debug)]
+pub struct MonauralConfig {
+    /// Time constant of the temporal low-pass, in seconds.
+    ///
+    /// Must be finite and positive. The default is 10 ms.
+    pub integration_time_constant_seconds: f64,
+    /// Constant sensitivity multiplier applied after temporal integration.
+    ///
+    /// Must be finite and non-negative. The default is 0.0003, as used by the
+    /// reference simulations and AMT 1.6.
+    pub sensitivity: f64,
+    /// Finite-record temporal-processing convention.
+    pub temporal_mode: MonauralTemporalMode,
+}
+
+impl Default for MonauralConfig {
+    fn default() -> Self {
+        Self {
+            integration_time_constant_seconds: 10e-3,
+            sensitivity: 0.0003,
+            temporal_mode: MonauralTemporalMode::PaperDoubleSided,
+        }
+    }
+}
+
+impl MonauralConfig {
+    /// Returns the monaural-channel defaults used by AMT 1.6.
+    pub fn amt_1_6() -> Self {
+        Self {
+            temporal_mode: MonauralTemporalMode::AmtCausal,
+            ..Self::default()
+        }
+    }
+}
+
 /// Parameters of the Breebaart EI stage.
 #[derive(Clone, Debug)]
 pub struct EiConfig {
@@ -183,15 +233,15 @@ pub struct EiConfig {
     pub noise_seed: u64,
     /// Largest allowed absolute characteristic delay, in seconds.
     ///
-    /// Must be finite and non-negative. This validation limit defaults to 5 ms,
-    /// the range used in the paper. It does not create population units
-    /// automatically.
+    /// Must be non-negative and not NaN; positive infinity disables the limit.
+    /// This validation limit defaults to 5 ms, the range used in the paper. It
+    /// does not create population units automatically.
     pub max_abs_delay_seconds: f64,
     /// Largest allowed absolute characteristic IID, in decibels.
     ///
-    /// Must be finite and non-negative. This validation limit defaults to 10
-    /// dB, the range used in the paper. It does not create population units
-    /// automatically.
+    /// Must be non-negative and not NaN; positive infinity disables the limit.
+    /// This validation limit defaults to 10 dB, the range used in the paper. It
+    /// does not create population units automatically.
     pub max_abs_iid_db: f64,
 }
 
@@ -217,7 +267,9 @@ impl EiConfig {
     ///
     /// This selects AMT's one-sided integer delay, forward-backward filter
     /// boundaries, 2.2 ms delay-weight time constant, and noise-free EI-cell
-    /// output. AMT introduces its unit-variance internal noise later in
+    /// output. It also disables the paper-specific 5 ms and 10 dB population
+    /// limits because `breebaart2001_eicell` does not impose them. AMT
+    /// introduces its unit-variance internal noise later in
     /// `breebaart2001_centralproc`; callers reproducing that complete detector
     /// must model the decision noise separately.
     pub fn amt_1_6() -> Self {
@@ -226,6 +278,8 @@ impl EiConfig {
             delay_convention: EiDelayConvention::AmtOneSidedInteger,
             integration_boundary: EiIntegrationBoundary::AmtFiltfilt,
             internal_noise_std_mu: 0.0,
+            max_abs_delay_seconds: f64::INFINITY,
+            max_abs_iid_db: f64::INFINITY,
             ..Self::default()
         }
     }
@@ -365,8 +419,14 @@ pub struct HybridBinauralOutput {
     /// EI units corresponding, in order, to axis 0 of [`Self::ei_map`].
     pub units: Vec<EiUnit>,
     /// Left-ear adaptation-loop output in MU, with shape `(channel, sample)`.
+    ///
+    /// This is the raw peripheral representation used by the EI stage. Apply
+    /// [`breebaart2001_monaural`] before using it as a central-detector channel.
     pub left_internal: Array2<f64>,
     /// Right-ear adaptation-loop output in MU, with shape `(channel, sample)`.
+    ///
+    /// This is the raw peripheral representation used by the EI stage. Apply
+    /// [`breebaart2001_monaural`] before using it as a central-detector channel.
     pub right_internal: Array2<f64>,
     /// GCFB center frequency for each channel, in hertz.
     pub center_frequencies_hz: Array1<f64>,
@@ -418,13 +478,13 @@ fn validate_ei_inputs(
         || config.delay_weight_time_constant_seconds <= 0.0
         || !config.internal_noise_std_mu.is_finite()
         || config.internal_noise_std_mu < 0.0
-        || !config.max_abs_delay_seconds.is_finite()
+        || config.max_abs_delay_seconds.is_nan()
         || config.max_abs_delay_seconds < 0.0
-        || !config.max_abs_iid_db.is_finite()
+        || config.max_abs_iid_db.is_nan()
         || config.max_abs_iid_db < 0.0
     {
         return Err(Error::InvalidParameter(
-            "EI time constants, compression, noise, and population limits must be finite and in their positive ranges"
+            "EI time constants, compression, and noise must be finite and in their positive ranges; population limits must be non-negative and not NaN"
                 .into(),
         ));
     }
@@ -445,6 +505,17 @@ fn validate_ei_inputs(
             "EI units must be finite and lie within +/-{} s and +/-{} dB",
             config.max_abs_delay_seconds, config.max_abs_iid_db
         )));
+    }
+    if config.delay_convention == EiDelayConvention::AmtOneSidedInteger
+        && units.iter().any(|unit| {
+            let delay_samples = (unit.delay_seconds.abs() * sample_rate_hz).round();
+            !delay_samples.is_finite() || delay_samples > left.ncols() as f64
+        })
+    {
+        return Err(Error::InvalidParameter(
+            "AMT one-sided delay must round to no more samples than the supplied representation"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -606,6 +677,76 @@ fn double_sided_exponential(
     }
 }
 
+/// Prepare one monaural adaptation-loop output for the central detector.
+///
+/// `input` is a channel-major `(frequency channel, sample)` array such as
+/// [`HybridBinauralOutput::left_internal`] or
+/// [`HybridBinauralOutput::right_internal`]. The returned array has the same
+/// shape. The default applies the paper's normalized double-sided exponential
+/// with a 10 ms time constant, then multiplies the result by the reference
+/// monaural sensitivity. [`MonauralConfig::amt_1_6`] instead selects AMT's
+/// causal one-pole finite-record convention.
+///
+/// This helper is deterministic and implements only the temporal-filter and
+/// sensitivity stages. Any internal noise required by the chosen central
+/// decision model must be represented in the trials or added at that later
+/// stage.
+///
+/// The paper's Appendix-B detector uses at most one selected EI unit together
+/// with any desired processed monaural channels. Do not treat all units in a
+/// population returned by [`breebaart2001_ei`] as independent detector
+/// channels; their internal noise is shared.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidParameter`] if `input` is empty or non-finite, the
+/// sample rate or time constant is not finite and positive, or the sensitivity
+/// is not finite and non-negative.
+pub fn breebaart2001_monaural(
+    input: &Array2<f64>,
+    sample_rate_hz: f64,
+    config: &MonauralConfig,
+) -> Result<Array2<f64>> {
+    if input.is_empty() || input.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InvalidParameter(
+            "monaural representation must be non-empty and contain only finite values".into(),
+        ));
+    }
+    if !sample_rate_hz.is_finite()
+        || sample_rate_hz <= 0.0
+        || !config.integration_time_constant_seconds.is_finite()
+        || config.integration_time_constant_seconds <= 0.0
+        || !config.sensitivity.is_finite()
+        || config.sensitivity < 0.0
+    {
+        return Err(Error::InvalidParameter(
+            "monaural sample rate and time constant must be finite and positive, and sensitivity must be finite and non-negative"
+                .into(),
+        ));
+    }
+
+    let mut output = Array2::zeros(input.dim());
+    let pole = (-1.0 / (sample_rate_hz * config.integration_time_constant_seconds)).exp();
+    let amt_b = [1.0 - pole];
+    let amt_a = [1.0, -pole];
+    for channel in 0..input.nrows() {
+        let values = input.row(channel).to_vec();
+        let mut integrated = match config.temporal_mode {
+            MonauralTemporalMode::PaperDoubleSided => zero_extended_double_sided_exponential(
+                &values,
+                sample_rate_hz,
+                config.integration_time_constant_seconds,
+            ),
+            MonauralTemporalMode::AmtCausal => dsp::lfilter(&amt_b, &amt_a, &values)?,
+        };
+        for value in &mut integrated {
+            *value *= config.sensitivity;
+        }
+        output.row_mut(channel).assign(&Array1::from(integrated));
+    }
+    Ok(output)
+}
+
 fn derive_trial_seed(base_seed: u64, trial_index: u64) -> u64 {
     // SplitMix64 finalization gives nearby trial indices well-separated streams
     // while retaining deterministic replay from the base seed and index.
@@ -671,8 +812,9 @@ impl GaussianNoise {
 /// Returns [`Error::InvalidParameter`] if the inputs are empty, differently
 /// shaped, or non-finite; if the sample rate is not positive; if no units are
 /// supplied; if a unit exceeds the configured population limits; or if an EI
-/// parameter is outside its documented range, or if AMT forward-backward
-/// integration is requested for a representation of three samples or fewer.
+/// parameter is outside its documented range; if AMT forward-backward
+/// integration is requested for a representation of three samples or fewer;
+/// or if an AMT one-sided delay rounds to more samples than the representation.
 pub fn breebaart2001_ei(
     left: &Array2<f64>,
     right: &Array2<f64>,
@@ -1074,11 +1216,35 @@ pub fn hybrid_binaural(
 
 /// Appendix-B template for an ideal-observer decision stage.
 ///
-/// The three axes are intentionally generic.  They can be EI unit, frequency,
-/// and time, or a caller-created stack of binaural and monaural channels.
-/// [`hybrid_binaural`] returns the binaural EI channels; callers reproducing
-/// the paper's complete detector must add any desired monaural channels before
-/// fitting and scoring the template.
+/// The numerical template accepts any consistent three-dimensional shape. For
+/// the paper's detector, however, the axes are detector channel, frequency, and
+/// time. [`hybrid_binaural`] returns a population, so callers must first select
+/// the single EI unit appropriate to the experiment. The first template axis
+/// then contains that one binaural channel plus any left and right monaural
+/// channels prepared by [`breebaart2001_monaural`].
+/// Passing a complete EI population instead produces a generalized detector,
+/// not the detector in Appendix B, because the EI units share internal noise.
+///
+/// # Assembling a paper detector representation
+///
+/// ```
+/// use gammachirp_rs::breebaart2001::{
+///     MonauralConfig, breebaart2001_monaural,
+/// };
+/// use ndarray::{Array2, Array3, Axis, stack};
+///
+/// let sample_rate_hz = 48_000.0;
+/// let ei_population = Array3::zeros((3, 2, 64));
+/// let left_internal = Array2::zeros((2, 64));
+/// let right_internal = Array2::zeros((2, 64));
+/// let monaural = MonauralConfig::default();
+/// let left = breebaart2001_monaural(&left_internal, sample_rate_hz, &monaural)?;
+/// let right = breebaart2001_monaural(&right_internal, sample_rate_hz, &monaural)?;
+/// let selected_ei = ei_population.index_axis(Axis(0), 1);
+/// let representation = stack(Axis(0), &[selected_ei, left.view(), right.view()])?;
+/// assert_eq!(representation.dim(), (3, 2, 64));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug)]
 pub struct CentralTemplate {
     /// Element-wise mean of the masker-only training trials.
@@ -1101,11 +1267,12 @@ impl CentralTemplate {
     /// divides by the number of masker trials (the population-variance
     /// convention), then clamps each value to `variance_floor`.
     ///
-    /// Trial representations generated by [`breebaart2001_ei`] or
-    /// [`hybrid_binaural`] must use a distinct trial-specific configuration;
-    /// see [`EiConfig::for_trial`] and [`HybridBinauralConfig::for_trial`]. An
-    /// unchanged seeded configuration intentionally repeats its noise and
-    /// therefore cannot contribute internal-noise variability to this fit.
+    /// When a representation is assembled from [`breebaart2001_ei`] or
+    /// [`hybrid_binaural`], each trial must use a distinct trial-specific
+    /// configuration; see [`EiConfig::for_trial`] and
+    /// [`HybridBinauralConfig::for_trial`]. An unchanged seeded configuration
+    /// intentionally repeats its noise and therefore cannot contribute
+    /// internal-noise variability to this fit.
     ///
     /// # Errors
     ///
@@ -1503,6 +1670,111 @@ mod tests {
         );
         assert_eq!(config.delay_weight_time_constant_seconds, 2.2e-3);
         assert_eq!(config.internal_noise_std_mu, 0.0);
+        assert_eq!(config.max_abs_delay_seconds, f64::INFINITY);
+        assert_eq!(config.max_abs_iid_db, f64::INFINITY);
+    }
+
+    #[test]
+    fn amt_ei_config_accepts_units_outside_the_paper_population() {
+        let input = Array2::ones((1, 256));
+        let unit = EiUnit::new(6e-3, 12.0);
+
+        assert!(matches!(
+            breebaart2001_ei(&input, &input, 8_000.0, &[unit], &noise_free_config()),
+            Err(Error::InvalidParameter(_))
+        ));
+        let output =
+            breebaart2001_ei(&input, &input, 8_000.0, &[unit], &EiConfig::amt_1_6()).unwrap();
+        assert_eq!(output.dim(), (1, 1, 256));
+        assert!(output.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn amt_ei_config_rejects_delays_longer_than_the_representation() {
+        let input = Array2::ones((1, 32));
+        let error = breebaart2001_ei(
+            &input,
+            &input,
+            8_000.0,
+            &[EiUnit::new(6e-3, 0.0)],
+            &EiConfig::amt_1_6(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidParameter(_)));
+    }
+
+    #[test]
+    fn monaural_defaults_match_the_paper_and_amt_reference() {
+        let paper = MonauralConfig::default();
+        assert_eq!(paper.temporal_mode, MonauralTemporalMode::PaperDoubleSided);
+        assert_eq!(paper.integration_time_constant_seconds, 10e-3);
+        assert_eq!(paper.sensitivity, 0.0003);
+
+        let amt = MonauralConfig::amt_1_6();
+        assert_eq!(amt.temporal_mode, MonauralTemporalMode::AmtCausal);
+        assert_eq!(amt.integration_time_constant_seconds, 10e-3);
+        assert_eq!(amt.sensitivity, 0.0003);
+    }
+
+    #[test]
+    fn paper_monaural_channel_matches_the_normalized_double_sided_exponential() {
+        let sample_rate_hz = 1_000.0;
+        let mut input = Array2::zeros((2, 7));
+        input[[0, 3]] = 1.0;
+        input[[1, 3]] = 2.0;
+        let config = MonauralConfig::default();
+        let actual = breebaart2001_monaural(&input, sample_rate_hz, &config).unwrap();
+        let pole = (-1.0 / (sample_rate_hz * config.integration_time_constant_seconds)).exp();
+        let normalization = (1.0 - pole) / (1.0 + pole);
+
+        for channel in 0..2 {
+            for sample in 0..7 {
+                let expected = (channel + 1) as f64
+                    * config.sensitivity
+                    * normalization
+                    * pole.powi((sample as i32 - 3).abs());
+                assert_abs_diff_eq!(actual[[channel, sample]], expected, epsilon = 1e-18);
+            }
+        }
+    }
+
+    #[test]
+    fn amt_monaural_channel_matches_the_zero_state_causal_one_pole() {
+        let sample_rate_hz = 1_000.0;
+        let input = Array2::from_shape_vec((1, 5), vec![1.0, 0.0, 0.0, 0.0, 0.0]).unwrap();
+        let config = MonauralConfig::amt_1_6();
+        let actual = breebaart2001_monaural(&input, sample_rate_hz, &config).unwrap();
+        let pole = (-1.0 / (sample_rate_hz * config.integration_time_constant_seconds)).exp();
+
+        for sample in 0..5 {
+            let expected = config.sensitivity * (1.0 - pole) * pole.powi(sample as i32);
+            assert_abs_diff_eq!(actual[[0, sample]], expected, epsilon = 1e-18);
+        }
+    }
+
+    #[test]
+    fn monaural_channel_rejects_invalid_inputs_and_parameters() {
+        let valid = Array2::ones((1, 8));
+        let invalid_values = Array2::from_elem((1, 1), f64::NAN);
+        assert!(
+            breebaart2001_monaural(&Array2::zeros((0, 0)), 8_000.0, &MonauralConfig::default())
+                .is_err()
+        );
+        assert!(
+            breebaart2001_monaural(&invalid_values, 8_000.0, &MonauralConfig::default()).is_err()
+        );
+        assert!(breebaart2001_monaural(&valid, 0.0, &MonauralConfig::default()).is_err());
+
+        let invalid_time = MonauralConfig {
+            integration_time_constant_seconds: 0.0,
+            ..MonauralConfig::default()
+        };
+        assert!(breebaart2001_monaural(&valid, 8_000.0, &invalid_time).is_err());
+        let invalid_sensitivity = MonauralConfig {
+            sensitivity: -1.0,
+            ..MonauralConfig::default()
+        };
+        assert!(breebaart2001_monaural(&valid, 8_000.0, &invalid_sensitivity).is_err());
     }
 
     #[test]
