@@ -110,5 +110,5 @@ venv.bak/
 launch.json
 
 # Untracked reference materials
-amtoolbox-full-*
+amtoolbox-*
 *.pdf
