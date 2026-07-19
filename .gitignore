@@ -108,3 +108,7 @@ venv.bak/
 
 # VS code
 launch.json
+
+# Untracked reference materials
+amtoolbox-full-*
+*.pdf

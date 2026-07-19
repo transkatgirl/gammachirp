@@ -31,6 +31,74 @@ assert_eq!(output.dcgc_out.nrows(), 32);
 # Ok::<(), gammachirp_rs::Error>(())
 ```
 
+### Breebaart 2001 binaural processing
+
+The `breebaart2001` module combines the dynamic compressive gammachirp
+filterbank with the inner-hair-cell and adaptation-loop stages and the
+contralateral-inhibition stage described by
+[Breebaart, van de Par, and Kohlrausch (2001)](https://doi.org/10.1121/1.1383297).
+This is intentionally a hybrid: the original paper used a linear gammatone
+filterbank, whereas `hybrid_binaural` uses this crate's GCFB v2.34. Call
+`breebaart2001_ei` directly to apply the paper's EI equations to an existing
+peripheral representation in model units.
+
+Peripheral arrays have shape `(frequency channel, sample)`. EI maps add the
+population axis and have shape `(unit, frequency channel, sample)`. The
+pre-inner-hair-cell absolute-threshold noise and the post-EI internal noise are
+separate, reproducibly seeded sources; disable both for deterministic,
+noise-free activity maps.
+
+```rust
+use gammachirp_rs::breebaart2001::{
+    EiConfig, EiUnit, breebaart2001_ei,
+};
+use ndarray::Array2;
+
+let left = Array2::from_elem((32, 256), 10.0);
+let right = left.clone();
+let units = [
+    EiUnit::default(),
+    EiUnit::new(0.0, 3.0),
+    EiUnit::new(0.5e-3, 0.0),
+];
+let config = EiConfig {
+    internal_noise_std_mu: 0.0,
+    ..EiConfig::default()
+};
+
+let activity = breebaart2001_ei(&left, &right, 48_000.0, &units, &config)?;
+assert_eq!(activity.dim(), (3, 32, 256));
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+`hybrid_binaural` accepts equal-length left and right waveforms. It runs each
+ear through the same configured GCFB and peripheral stages, then evaluates the
+requested EI population. Dynamic GCFB configurations are evaluated in sample
+mode to retain fine structure. Its output includes the EI map, both adapted
+internal representations, center frequencies, and both complete GCFB outputs.
+
+The default `EiConfig` follows the continuous-time equations in the paper.
+`EiConfig::amt_1_6()` instead selects AMT 1.6's one-sided integer delay,
+2.2 ms delay weighting, forward-backward filter boundaries, and noise-free
+EI-cell output. AMT adds its internal noise in the later central processor, so
+that decision noise remains the caller's responsibility. This option matches
+the AMT EI cell; the end-to-end hybrid still uses the GCFB rather than AMT's
+linear gammatone filterbank.
+
+`CentralTemplate::fit` estimates the masker mean and variance and the expected
+target-minus-masker difference from labeled trials. `score` applies the
+Appendix-B weighting, and `choose_interval` selects the largest score in a
+forced-choice task. The three array axes are generic; callers that need the
+paper's complete central detector should combine the hybrid's binaural EI map
+with their desired monaural channels before fitting the template.
+
+When generating those training trials, derive each presentation from a common
+base configuration with `config.for_trial(trial_index)`. This preserves exact
+replay for a given index while giving every trial distinct absolute-threshold
+and post-EI internal-noise realizations. Reusing an unchanged seeded
+configuration intentionally replays the same noise and must not be used to
+estimate trial-to-trial masker variance.
+
 ### Reassigned dcGC analysis
 
 GCFB v2.34 also exposes an analysis-only, energy-conserving reassignment map.
