@@ -120,8 +120,8 @@ impl Default for EiUnit {
 /// Convention used to apply an EI unit's characteristic delay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EiDelayConvention {
-    /// Evaluate the continuous-time expression from Eq. 3 of the paper using
-    /// symmetric, fractionally interpolated shifts of `+tau / 2` and
+    /// Approximate the continuous-time expression from Eq. 3 of the paper
+    /// using symmetric Lanczos-8 fractional shifts of `+tau / 2` and
     /// `-tau / 2`.
     #[default]
     PaperSymmetric,
@@ -274,9 +274,10 @@ pub struct PeripheralConfig {
     /// Configured values must be finite and at least one, and large enough for
     /// the selected minimum level to give every limiter a positive range.
     pub overshoot_limit: Option<f64>,
-    /// Level assigned to a filterbank amplitude of one.  If omitted, the
-    /// GCFB level estimator's `rms2spldb` value is used. This calibration is
-    /// used for both adaptation and absolute-threshold noise.
+    /// Level assigned to a waveform and filterbank amplitude of one. If
+    /// omitted, the GCFB level estimator's `rms2spldb` value is used. This
+    /// calibration is propagated into the GCFB level estimator and used for
+    /// both adaptation and absolute-threshold noise.
     ///
     /// A configured value must be finite.
     pub amplitude_one_db_spl: Option<f64>,
@@ -448,17 +449,76 @@ fn validate_ei_inputs(
     Ok(())
 }
 
-fn shifted_sample(row: ndarray::ArrayView1<'_, f64>, output_sample: usize, shift: f64) -> f64 {
-    let source = output_sample as f64 + shift;
-    if source < 0.0 || source > (row.len() - 1) as f64 {
-        return 0.0;
+const LANCZOS_RADIUS: isize = 8;
+const LANCZOS_TAPS: usize = (2 * LANCZOS_RADIUS) as usize;
+
+/// A fixed fractional shift whose Lanczos weights are shared by every sample.
+///
+/// Samples beyond the supplied representation are zero. The source-position
+/// check preserves that convention even when part of the finite interpolation
+/// kernel would otherwise overlap the representation.
+#[derive(Clone, Debug)]
+struct FractionalShift {
+    shift: f64,
+    integer_offset: isize,
+    weights: Option<[f64; LANCZOS_TAPS]>,
+}
+
+impl FractionalShift {
+    fn new(shift: f64) -> Self {
+        let integer_offset = shift.floor() as isize;
+        let fraction = shift - shift.floor();
+        let weights = (fraction != 0.0).then(|| {
+            std::array::from_fn(|tap_index| {
+                let tap_offset = tap_index as isize - (LANCZOS_RADIUS - 1);
+                let distance = fraction - tap_offset as f64;
+                lanczos_8(distance)
+            })
+        });
+        Self {
+            shift,
+            integer_offset,
+            weights,
+        }
     }
-    let lower = source.floor() as usize;
-    let fraction = source - lower as f64;
-    if fraction == 0.0 || lower + 1 == row.len() {
-        row[lower]
+
+    fn sample(&self, row: ndarray::ArrayView1<'_, f64>, output_sample: usize) -> f64 {
+        let source = output_sample as f64 + self.shift;
+        if source < 0.0 || source > (row.len() - 1) as f64 {
+            return 0.0;
+        }
+        if self.weights.is_none() {
+            return row[(output_sample as isize + self.integer_offset) as usize];
+        }
+
+        self.weights
+            .as_ref()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(tap_index, weight)| {
+                let tap_offset = tap_index as isize - (LANCZOS_RADIUS - 1);
+                let input_sample = output_sample as isize + self.integer_offset + tap_offset;
+                (input_sample >= 0 && input_sample < row.len() as isize)
+                    .then(|| row[input_sample as usize] * weight)
+            })
+            .sum()
+    }
+}
+
+fn lanczos_8(value: f64) -> f64 {
+    if value.abs() >= LANCZOS_RADIUS as f64 {
+        0.0
     } else {
-        row[lower] + fraction * (row[lower + 1] - row[lower])
+        sinc_pi(value) * sinc_pi(value / LANCZOS_RADIUS as f64)
+    }
+}
+
+fn sinc_pi(value: f64) -> f64 {
+    if value == 0.0 {
+        1.0
+    } else {
+        (std::f64::consts::PI * value).sin() / (std::f64::consts::PI * value)
     }
 }
 
@@ -643,6 +703,8 @@ pub fn breebaart2001_ei(
                 }
             }
         };
+        let left_shift = FractionalShift::new(left_shift_samples);
+        let right_shift = FractionalShift::new(right_shift_samples);
         let left_gain = 10_f64.powf(unit.iid_db / 40.0);
         let right_gain = 10_f64.powf(-unit.iid_db / 40.0);
         let delay_weight =
@@ -652,10 +714,8 @@ pub fn breebaart2001_ei(
             let right_row = right.row(channel);
             let instantaneous: Vec<f64> = (0..samples)
                 .map(|sample| {
-                    let left_value =
-                        shifted_sample(left_row, sample, left_shift_samples) * left_gain;
-                    let right_value =
-                        shifted_sample(right_row, sample, right_shift_samples) * right_gain;
+                    let left_value = left_shift.sample(left_row, sample) * left_gain;
+                    let right_value = right_shift.sample(right_row, sample) * right_gain;
                     (left_value - right_value).powi(2)
                 })
                 .collect();
@@ -950,6 +1010,11 @@ pub fn hybrid_binaural(
     if config.filterbank.ctrl == ControlMode::Dynamic {
         config.filterbank.dyn_hpaf.str_prc = "sample-base".into();
     }
+    let amplitude_one_db_spl = config
+        .peripheral
+        .amplitude_one_db_spl
+        .unwrap_or(config.filterbank.lvl_est.rms2spldb);
+    config.filterbank.lvl_est.rms2spldb = amplitude_one_db_spl;
     let left_filterbank = gcfb_v234(left, config.filterbank.clone())?;
     let right_filterbank = gcfb_v234(right, config.filterbank)?;
     if left_filterbank.dcgc_out.dim() != right_filterbank.dcgc_out.dim()
@@ -960,10 +1025,6 @@ pub fn hybrid_binaural(
         ));
     }
     let sample_rate = left_filterbank.gc_param.fs;
-    let amplitude_one_db_spl = config
-        .peripheral
-        .amplitude_one_db_spl
-        .unwrap_or(left_filterbank.gc_param.lvl_est.rms2spldb);
     let (left_peripheral, right_peripheral) = add_absolute_threshold_noise(
         &left_filterbank.dcgc_out,
         &right_filterbank.dcgc_out,
@@ -1207,6 +1268,56 @@ mod tests {
         .unwrap();
         assert_eq!(output.dim(), (1, 2, 128));
         assert!(output.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn fractional_shift_is_exact_for_integers_and_zero_extended_at_boundaries() {
+        let input = Array2::from_shape_vec((1, 4), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let row = input.row(0);
+
+        let forward = FractionalShift::new(1.0);
+        assert_eq!(forward.sample(row, 0), 2.0);
+        assert_eq!(forward.sample(row, 2), 4.0);
+        assert_eq!(forward.sample(row, 3), 0.0);
+
+        let backward = FractionalShift::new(-1.0);
+        assert_eq!(backward.sample(row, 0), 0.0);
+        assert_eq!(backward.sample(row, 1), 1.0);
+        assert_eq!(backward.sample(row, 3), 3.0);
+
+        assert_eq!(FractionalShift::new(-0.25).sample(row, 0), 0.0);
+        assert_eq!(FractionalShift::new(0.25).sample(row, 3), 0.0);
+    }
+
+    #[test]
+    fn lanczos_fractional_shifts_cancel_a_half_sample_sinusoidal_delay() {
+        let sample_rate = 8_000.0;
+        let frequency = 3_000.0;
+        let samples = 2_048;
+        let angular_frequency = 2.0 * std::f64::consts::PI * frequency / sample_rate;
+        let left = Array2::from_shape_fn((1, samples), |(_, sample)| {
+            (angular_frequency * sample as f64).sin()
+        });
+        let right = Array2::from_shape_fn((1, samples), |(_, sample)| {
+            (angular_frequency * (sample as f64 - 0.5)).sin()
+        });
+        let left_shift = FractionalShift::new(-0.25);
+        let right_shift = FractionalShift::new(0.25);
+        let mut residual_energy = 0.0;
+        let mut reference_energy = 0.0;
+
+        for sample in 32..samples - 32 {
+            let left_value = left_shift.sample(left.row(0), sample);
+            let right_value = right_shift.sample(right.row(0), sample);
+            residual_energy += (left_value - right_value).powi(2);
+            reference_energy += left_value.powi(2);
+        }
+
+        let relative_rms = (residual_energy / reference_energy).sqrt();
+        assert!(
+            relative_rms < 0.02,
+            "Lanczos-8 fractional-delay residual was {relative_rms}"
+        );
     }
 
     #[test]
@@ -1570,5 +1681,64 @@ mod tests {
                 .iter()
                 .all(|value| value.abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn hybrid_uses_one_calibration_for_filterbank_noise_and_adaptation() {
+        let samples = 384;
+        let sample_rate = 8_000.0;
+        let input: Vec<f64> = (0..samples)
+            .map(|sample| {
+                0.1 * (2.0 * std::f64::consts::PI * 500.0 * sample as f64 / sample_rate).sin()
+            })
+            .collect();
+        let mut overridden = HybridBinauralConfig::default();
+        overridden.filterbank.fs = sample_rate;
+        overridden.filterbank.num_ch = 4;
+        overridden.filterbank.f_range = [100.0, 3_000.0];
+        overridden.filterbank.out_mid_crct = "No".into();
+        overridden.filterbank.ctrl = ControlMode::Dynamic;
+        overridden.filterbank.lvl_est.rms2spldb = 30.0;
+        overridden.peripheral.amplitude_one_db_spl = Some(72.0);
+        overridden.peripheral.absolute_threshold_noise_level_db_spl = None;
+        overridden.ei.internal_noise_std_mu = 0.0;
+
+        let mut explicit = overridden.clone();
+        explicit.filterbank.lvl_est.rms2spldb = 72.0;
+        explicit.peripheral.amplitude_one_db_spl = None;
+
+        let units = [EiUnit::default()];
+        let overridden_output = hybrid_binaural(&input, &input, &units, overridden).unwrap();
+        let explicit_output = hybrid_binaural(&input, &input, &units, explicit).unwrap();
+
+        assert_eq!(
+            overridden_output.left_filterbank.gc_param.lvl_est.rms2spldb,
+            72.0
+        );
+        assert_eq!(
+            overridden_output
+                .right_filterbank
+                .gc_param
+                .lvl_est
+                .rms2spldb,
+            72.0
+        );
+        assert_eq!(
+            explicit_output.left_filterbank.gc_param.lvl_est.rms2spldb,
+            72.0
+        );
+        assert_eq!(
+            overridden_output.left_filterbank.dcgc_out,
+            explicit_output.left_filterbank.dcgc_out
+        );
+        assert_eq!(
+            overridden_output.right_filterbank.dcgc_out,
+            explicit_output.right_filterbank.dcgc_out
+        );
+        assert_eq!(
+            overridden_output.left_internal,
+            explicit_output.left_internal
+        );
+        assert_eq!(overridden_output.ei_map, explicit_output.ei_map);
     }
 }

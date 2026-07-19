@@ -124,8 +124,11 @@ impl ReassignmentResult {
 /// Phase-preserving, analysis-only reassignment output.
 ///
 /// `complex_map` contains the bilinearly transported, phase-corrected analytic
-/// coefficients.  Its squared magnitude is not generally equal to
-/// `reassignment.energy_map`, because multiple contributions may interfere.
+/// coefficients. For an interpolation weight `w`, an isolated contribution
+/// deposits energy `E * w` but complex-map power `E * w^2`, because the
+/// complex histogram is interpolated linearly in amplitude. Its squared
+/// magnitude is therefore not an energy map; multiple contributions may also
+/// interfere.
 #[derive(Clone, Debug)]
 pub struct PhaseReassignmentResult {
     /// Coordinates, energy map, masks, axes, and energy accounting.
@@ -1721,6 +1724,13 @@ mod tests {
         for time_bin in 0..2 {
             assert_relative_eq!(phase.complex_map[[1, time_bin]].re, -1.2, epsilon = 2e-15);
             assert_relative_eq!(phase.complex_map[[1, time_bin]].im, 0.9, epsilon = 2e-15);
+            // Linear amplitude interpolation gives E * w^2 = 9 * 0.5^2,
+            // while the conserved energy map above receives E * w = 4.5.
+            assert_relative_eq!(
+                phase.complex_map[[1, time_bin]].norm_sqr(),
+                2.25,
+                epsilon = 2e-15
+            );
             assert_relative_eq!(
                 phase.contribution_magnitude_map[[1, time_bin]],
                 1.5,

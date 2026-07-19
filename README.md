@@ -177,11 +177,15 @@ so its squared magnitude is the transported energy, then applies
 
 before bilinear deposition. `PhaseReassignmentResult::complex_map` retains
 absolute phase for analysis, while `phase_coherence_map` is the magnitude of
-the complex sum divided by the sum of contribution magnitudes. Empty bins have
-zero coherence. The matched `unreassigned_energy_map` contains only the same
-floor- and boundary-accepted contributions on the reassigned map's grid. Its
-time coordinate is the source sample for sample-based analyses and the
-originating frame for frame-based analyses.
+the complex sum divided by the sum of contribution magnitudes. The complex map
+is a linearly interpolated amplitude histogram, not an energy map: a single
+contribution deposited with weight `w` has complex-map power proportional to
+`w^2`, while `energy_map` receives energy proportional to `w`. Multiple
+contributions may additionally interfere. Empty bins have zero coherence. The
+matched `unreassigned_energy_map` contains only the same floor- and
+boundary-accepted contributions on the reassigned map's grid. Its time
+coordinate is the source sample for sample-based analyses and the originating
+frame for frame-based analyses.
 
 `SparsityMetrics` reports Shannon entropy in nats, its exponential as the
 effective number of bins, and the effective-bin fraction. A
