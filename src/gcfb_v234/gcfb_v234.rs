@@ -113,6 +113,8 @@ pub struct GcParam {
     pub num_update_asym_cmp: usize,
     pub dyn_hpaf: DynHpaf,
     pub hloss_type: String,
+    /// Cochlear compression health, where `0.0` is fully impaired and `1.0`
+    /// is healthy. Values must be finite and in `0.0..=1.0`.
     pub hloss_compression_health: Option<f64>,
     pub hloss_hearing_level_db: Option<Array1<f64>>,
     pub hloss: HLoss,
@@ -192,6 +194,49 @@ fn validate_prepared_frequencies(fs: f64, frequencies: &[f64], name: &str) -> Re
         return Err(Error::InvalidParameter(format!(
             "{name} must be finite, positive, and below Nyquist"
         )));
+    }
+    Ok(())
+}
+
+fn validate_user_controlled_parameters(param: &GcParam) -> Result<()> {
+    let coefficients_are_finite = param
+        .b1
+        .iter()
+        .chain(&param.c1)
+        .chain(param.frat.iter().flatten())
+        .chain(param.b2.iter().flatten())
+        .chain(param.c2.iter().flatten())
+        .all(|value| value.is_finite());
+    let level_parameters_are_finite = [
+        param.gain_cmpnst_db,
+        param.level_db_scgcfb,
+        param.meddis_hc_level_rms0db_spldb,
+        param.lvl_est.lct_erb,
+        param.lvl_est.decay_hl,
+        param.lvl_est.b2,
+        param.lvl_est.c2,
+        param.lvl_est.frat,
+        param.lvl_est.rms2spldb,
+        param.lvl_est.weight,
+        param.lvl_est.ref_db,
+        param.lvl_est.pwr[0],
+        param.lvl_est.pwr[1],
+    ]
+    .iter()
+    .all(|value| value.is_finite());
+    let gain_reference_is_finite = match param.gain_ref {
+        GainReference::Db(value) => value.is_finite(),
+        GainReference::NormalizeIoFunction => true,
+    };
+    if !coefficients_are_finite
+        || !level_parameters_are_finite
+        || !gain_reference_is_finite
+        || param.lvl_est.decay_hl <= 0.0
+    {
+        return Err(Error::InvalidParameter(
+            "v2.34 filter coefficients, gain references, and level parameters must be finite, and level decay must be positive"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -298,6 +343,7 @@ fn set_param_with_preserved_hearing_loss(
     let fp1 =
         Array1::from_iter((0..param.num_ch).map(|i| fr1[i] + c1[i] * width[i] * b1[i] / param.n));
     validate_prepared_frequencies(param.fs, fp1.as_slice().unwrap(), "derived filter centers")?;
+    validate_user_controlled_parameters(&param)?;
     let b2 = ef.mapv(|v| param.b2[0][0] + param.b2[0][1] * v);
     let c2 = ef.mapv(|v| param.c2[0][0] + param.c2[0][1] * v);
     let frat0 = ef.mapv(|v| param.frat[0][0] + param.frat[0][1] * v);
@@ -410,6 +456,14 @@ fn hearing_pattern(
 }
 
 pub fn gcfb_v23_hearing_loss(mut param: GcParam, response: &GcResp) -> Result<GcParam> {
+    if param
+        .hloss_compression_health
+        .is_some_and(|health| !health.is_finite() || !(0.0..=1.0).contains(&health))
+    {
+        return Err(Error::InvalidParameter(
+            "hearing-loss compression health must be finite and in 0.0..=1.0".into(),
+        ));
+    }
     let (name, hearing) =
         hearing_pattern(&param.hloss_type, param.hloss_hearing_level_db.as_ref())?;
     let mut loss = HLoss {
@@ -788,9 +842,9 @@ fn gcfb_v234_internal(
     gc_param: GcParam,
     preserved_hearing_loss: Option<&HLoss>,
 ) -> Result<GcfbOutput> {
-    if snd_in.is_empty() {
+    if snd_in.is_empty() || snd_in.iter().any(|sample| !sample.is_finite()) {
         return Err(Error::InvalidParameter(
-            "input sound cannot be empty".into(),
+            "input sound must be non-empty and finite".into(),
         ));
     }
     let (param, mut response) =
@@ -1008,10 +1062,14 @@ pub fn gcfb_v23_env_mod_loss(
             .f_cutoff
             .iter()
             .any(|value| !value.is_finite() || *value <= 0.0 || *value >= em.fs / 2.0)
+        || frames.nrows() == 0
+        || frames.ncols() == 0
+        || frames.iter().any(|value| !value.is_finite())
+        || frames.nrows() != param.num_ch
         || frames.nrows() != param.fr1.len()
     {
         return Err(Error::InvalidParameter(
-            "envelope modulation parameters must be finite, cutoffs must be below Nyquist, and frame channels must match the filterbank".into(),
+            "envelope modulation parameters and frames must be finite and non-empty, cutoffs must be below Nyquist, and frame channels must match the prepared filterbank".into(),
         ));
     }
     let (aud, _) = utils::freq2erb(param.hloss.f_audgram_list.as_slice().unwrap());
@@ -1092,6 +1150,17 @@ pub fn gcfb_v23_ana_env_mod(
     if !param.dyn_hpaf.str_prc.contains("frame") {
         return Err(Error::InvalidParameter(
             "modulation analysis requires frame processing".into(),
+        ));
+    }
+    if frames.nrows() == 0
+        || frames.ncols() == 0
+        || frames.iter().any(|value| !value.is_finite())
+        || frames.nrows() != param.num_ch
+        || frames.nrows() != param.fr1.len()
+    {
+        return Err(Error::InvalidParameter(
+            "modulation analysis requires finite, non-empty frames whose channels match the prepared filterbank"
+                .into(),
         ));
     }
     if em.fs == 0. {

@@ -75,6 +75,11 @@ pub fn eqlz2meddis_hc_level(
         ));
     }
     if let Some(rms1_spl) = input_rms1_dbspl {
+        if !rms1_spl.is_finite() {
+            return Err(Error::InvalidParameter(
+                "input_rms1_dbspl must be finite".into(),
+            ));
+        }
         let source_db = 20.0 * signal_rms.log10() + rms1_spl;
         let compensation_db = rms1_spl - 30.0;
         let output = Array1::from_iter(snd.iter().map(|v| v * 10_f64.powf(compensation_db / 20.0)));
@@ -373,6 +378,11 @@ pub fn spl_at_hl_0db_table() -> SplAtHl0Db {
 }
 
 pub fn hl2spl(freq: f64, hl_db: f64) -> Result<f64> {
+    if !hl_db.is_finite() {
+        return Err(Error::InvalidParameter(
+            "hearing level must be finite".into(),
+        ));
+    }
     let table = spl_at_hl_0db_table();
     let index = table
         .freq

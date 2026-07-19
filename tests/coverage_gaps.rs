@@ -30,6 +30,49 @@ fn prepared_v234() -> Param234 {
     .0
 }
 
+fn compact_v211() -> Param211 {
+    Param211 {
+        fs: 8_000.0,
+        num_ch: 4,
+        f_range: [200.0, 1_500.0],
+        out_mid_crct: "No".into(),
+        ..Param211::default()
+    }
+}
+
+fn compact_v234() -> Param234 {
+    Param234 {
+        fs: 8_000.0,
+        num_ch: 4,
+        f_range: [200.0, 1_500.0],
+        out_mid_crct: "No".into(),
+        ..Param234::default()
+    }
+}
+
+fn read_wav_bytes(label: &str, bytes: &[u8]) -> gammachirp_rs::Result<(Array1<f64>, u32)> {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "gammachirpy-{label}-{}-{nonce}.wav",
+        std::process::id()
+    ));
+    fs::write(&path, bytes).unwrap();
+    let result = utils211::audioread(&path);
+    fs::remove_file(path).unwrap();
+    result
+}
+
+fn riff_wave(chunks: &[u8]) -> Vec<u8> {
+    let mut wav = Vec::from(&b"RIFF"[..]);
+    wav.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(chunks);
+    wav
+}
+
 #[test]
 fn smooth_spectrum_covers_both_windows_and_reports_frame_times() {
     let input = Array2::from_shape_fn((2, 480), |(channel, _)| channel as f64 + 1.0);
@@ -183,6 +226,33 @@ fn envelope_modulation_loss_and_analysis_cover_success_and_validation() {
         )
         .is_err()
     );
+
+    let invalid_frames = [
+        Array2::zeros((3, frames.ncols())),
+        Array2::zeros((5, frames.ncols())),
+        Array2::zeros((frames.nrows(), 0)),
+    ];
+    for invalid in &invalid_frames {
+        assert!(fb234::gcfb_v23_env_mod_loss(invalid, &param, EmParam::default()).is_err());
+        assert!(fb234::gcfb_v23_ana_env_mod(invalid, &param, EmParam::default()).is_err());
+    }
+
+    for invalid_value in [f64::NAN, f64::INFINITY] {
+        let mut invalid = frames.clone();
+        invalid[[0, 0]] = invalid_value;
+        assert!(fb234::gcfb_v23_env_mod_loss(&invalid, &param, EmParam::default()).is_err());
+        assert!(fb234::gcfb_v23_ana_env_mod(&invalid, &param, EmParam::default()).is_err());
+    }
+
+    let mut wrong_num_ch = param.clone();
+    wrong_num_ch.num_ch -= 1;
+    assert!(fb234::gcfb_v23_env_mod_loss(&frames, &wrong_num_ch, EmParam::default()).is_err());
+    assert!(fb234::gcfb_v23_ana_env_mod(&frames, &wrong_num_ch, EmParam::default()).is_err());
+
+    let mut wrong_fr1 = param.clone();
+    wrong_fr1.fr1 = wrong_fr1.fr1.slice(ndarray::s![..3]).to_owned();
+    assert!(fb234::gcfb_v23_env_mod_loss(&frames, &wrong_fr1, EmParam::default()).is_err());
+    assert!(fb234::gcfb_v23_ana_env_mod(&frames, &wrong_fr1, EmParam::default()).is_err());
 }
 
 #[test]
@@ -210,6 +280,7 @@ fn valid_wav_with_an_odd_unknown_chunk_is_read_as_mono_pcm() {
     }
     let riff_size = (wav.len() - 8) as u32;
     wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"ignored trailing bytes");
 
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -235,9 +306,177 @@ fn valid_wav_with_an_odd_unknown_chunk_is_read_as_mono_pcm() {
 }
 
 #[test]
+fn wav_reader_rejects_malformed_data_inside_the_riff_boundary() {
+    let mut physically_truncated = riff_wave(&[]);
+    physically_truncated[4..8].copy_from_slice(&20_u32.to_le_bytes());
+
+    let partial_header = riff_wave(b"JUN");
+
+    let mut missing_unknown_payload_chunks = Vec::from(&b"JUNK"[..]);
+    missing_unknown_payload_chunks.extend_from_slice(&4_u32.to_le_bytes());
+    let missing_unknown_payload = riff_wave(&missing_unknown_payload_chunks);
+
+    let mut missing_padding_chunks = Vec::from(&b"JUNK"[..]);
+    missing_padding_chunks.extend_from_slice(&3_u32.to_le_bytes());
+    missing_padding_chunks.extend_from_slice(&[1, 2, 3]);
+    let missing_padding = riff_wave(&missing_padding_chunks);
+
+    for (label, wav) in [
+        ("truncated-riff", physically_truncated),
+        ("partial-header", partial_header),
+        ("missing-unknown-payload", missing_unknown_payload),
+        ("missing-padding", missing_padding),
+    ] {
+        assert!(matches!(read_wav_bytes(label, &wav), Err(Error::Wav(_))));
+    }
+}
+
+#[test]
+fn filterbanks_reject_non_finite_waveform_samples() {
+    for invalid in [f64::NAN, f64::INFINITY] {
+        let signal = [1.0, invalid, 0.0];
+        assert!(matches!(
+            fb211::gcfb_v211(&signal, compact_v211()),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            fb234::gcfb_v234(&signal, compact_v234()),
+            Err(Error::InvalidParameter(_))
+        ));
+    }
+}
+
+#[test]
+fn filterbank_preparation_rejects_non_finite_user_parameters() {
+    let mut v211_gain = compact_v211();
+    v211_gain.gain_cmpnst_db = f64::NAN;
+    let mut v211_reference = compact_v211();
+    v211_reference.gain_ref_db = f64::INFINITY;
+    let mut v211_static_level = compact_v211();
+    v211_static_level.level_db_scgcfb = f64::NEG_INFINITY;
+    let mut v211_coefficient = compact_v211();
+    v211_coefficient.b2[0][0] = f64::NAN;
+    let mut v211_level_estimation = compact_v211();
+    v211_level_estimation.lvl_est.weight = f64::INFINITY;
+    let mut v211_zero_decay = compact_v211();
+    v211_zero_decay.lvl_est.decay_hl = 0.0;
+    for invalid in [
+        v211_gain,
+        v211_reference,
+        v211_static_level,
+        v211_coefficient,
+        v211_level_estimation,
+        v211_zero_decay,
+    ] {
+        assert!(matches!(
+            fb211::set_param(invalid),
+            Err(Error::InvalidParameter(_))
+        ));
+    }
+
+    let mut v234_gain = compact_v234();
+    v234_gain.gain_cmpnst_db = f64::NAN;
+    let mut v234_reference = compact_v234();
+    v234_reference.gain_ref = GainReference::Db(f64::INFINITY);
+    let mut v234_static_level = compact_v234();
+    v234_static_level.level_db_scgcfb = f64::NEG_INFINITY;
+    let mut v234_coefficient = compact_v234();
+    v234_coefficient.c2[0][0] = f64::NAN;
+    let mut v234_level_estimation = compact_v234();
+    v234_level_estimation.lvl_est.pwr[1] = f64::INFINITY;
+    let mut v234_negative_decay = compact_v234();
+    v234_negative_decay.lvl_est.decay_hl = -1.0;
+    for invalid in [
+        v234_gain,
+        v234_reference,
+        v234_static_level,
+        v234_coefficient,
+        v234_level_estimation,
+        v234_negative_decay,
+    ] {
+        assert!(matches!(
+            fb234::set_param(invalid),
+            Err(Error::InvalidParameter(_))
+        ));
+    }
+}
+
+#[test]
+fn parameter_preparation_overwrites_derived_caches_without_validating_them() {
+    let mut v211 = compact_v211();
+    v211.lvl_est.exp_decay_val = f64::NAN;
+    v211.lvl_est.erb_space1 = f64::NAN;
+    v211.lvl_est.n_ch_shift = isize::MAX;
+    v211.lvl_est.n_ch_lvl_est = Array1::from(vec![usize::MAX]);
+    v211.lvl_est.lvl_lin_min_lim = f64::NAN;
+    v211.lvl_est.lvl_lin_ref = f64::NAN;
+    let (v211, _) = fb211::set_param(v211).unwrap();
+    assert!(v211.lvl_est.exp_decay_val.is_finite());
+    assert!(v211.lvl_est.erb_space1.is_finite());
+    assert_eq!(v211.lvl_est.n_ch_lvl_est.len(), v211.num_ch);
+    assert!(v211.lvl_est.lvl_lin_min_lim.is_finite());
+    assert!(v211.lvl_est.lvl_lin_ref.is_finite());
+
+    let mut v234 = compact_v234();
+    v234.fr1 = Array1::from(vec![f64::NAN]);
+    v234.hloss.compression_health = Array1::from(vec![f64::NAN]);
+    v234.dyn_hpaf.len_frame = usize::MAX;
+    v234.dyn_hpaf.len_shift = usize::MAX;
+    v234.dyn_hpaf.fs = f64::NAN;
+    v234.dyn_hpaf.val_win = Array1::from(vec![f64::NAN]);
+    v234.lvl_est.exp_decay_val = f64::NAN;
+    v234.lvl_est.erb_space1 = f64::NAN;
+    v234.lvl_est.n_ch_shift = isize::MAX;
+    v234.lvl_est.n_ch_lvl_est = Array1::from(vec![usize::MAX]);
+    v234.lvl_est.lvl_lin_min_lim = f64::NAN;
+    v234.lvl_est.lvl_lin_ref = f64::NAN;
+    let (v234, _) = fb234::set_param(v234).unwrap();
+    assert_eq!(v234.fr1.len(), v234.num_ch);
+    assert!(v234.fr1.iter().all(|value| value.is_finite()));
+    assert!(
+        v234.hloss
+            .compression_health
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert!(v234.dyn_hpaf.fs.is_finite());
+    assert_eq!(v234.dyn_hpaf.val_win.len(), v234.dyn_hpaf.len_frame);
+    assert_eq!(v234.lvl_est.n_ch_lvl_est.len(), v234.num_ch);
+    assert!(v234.lvl_est.exp_decay_val.is_finite());
+    assert!(v234.lvl_est.lvl_lin_min_lim.is_finite());
+    assert!(v234.lvl_est.lvl_lin_ref.is_finite());
+}
+
+#[test]
+fn compression_health_accepts_only_the_closed_unit_interval() {
+    for health in [0.0, 1.0] {
+        let mut param = compact_v234();
+        param.hloss_type = "HL3".into();
+        param.hloss_compression_health = Some(health);
+        assert!(fb234::set_param(param).is_ok());
+    }
+
+    for health in [-f64::EPSILON, 1.0 + f64::EPSILON, f64::NAN] {
+        let mut param = compact_v234();
+        param.hloss_type = "HL3".into();
+        param.hloss_compression_health = Some(health);
+        assert!(matches!(
+            fb234::set_param(param),
+            Err(Error::InvalidParameter(_))
+        ));
+    }
+}
+
+#[test]
 fn public_signal_utilities_cover_empty_inputs_aliases_and_rejections() {
     assert!(utils211::rms(&[]).is_nan());
     assert!(utils211::eqlz2meddis_hc_level(&[0.0, 0.0], 60.0).is_err());
+    for level in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(utils211::eqlz2meddis_hc_level(&[1.0, -1.0], level).is_err());
+        assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], Some(level), None).is_err());
+        assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], None, Some(level)).is_err());
+    }
+    assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], Some(f64::NAN), Some(94.0)).is_ok());
     assert_eq!(utils211::fftfilt(&[], &[1.0, 2.0]).to_vec(), vec![0.0, 0.0]);
     assert!(utils211::isrow(&[1.0, 2.0]));
     assert!(utils211::iscolumn(&Array2::<f64>::zeros((3, 1))));
@@ -316,6 +555,10 @@ fn transfer_function_selectors_filters_and_noise_floor_are_covered() {
     assert!(utils234::mk_filter_field2cochlea("Unknown", 8_000.0, true).is_err());
     assert!(utils234::hl2spl(123.0, 0.0).is_err());
     assert!(utils234::hl2pin_cochlea(123.0, 0.0).is_err());
+    for level in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(utils234::hl2spl(1_000.0, level).is_err());
+        assert!(utils234::hl2pin_cochlea(1_000.0, level).is_err());
+    }
 
     let input = Array2::from_shape_vec((2, 2), vec![0.0, 0.5, -0.5, 1.0]).unwrap();
     let first = utils234::eqlz_gcfb2rms1_at_0db(&input, Floor::NoiseFloor);

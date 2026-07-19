@@ -241,6 +241,41 @@ fn validate_prepared_frequencies(fs: f64, frequencies: &[f64], name: &str) -> Re
     Ok(())
 }
 
+fn validate_user_controlled_parameters(param: &GcParam) -> Result<()> {
+    let coefficients_are_finite = param
+        .b1
+        .iter()
+        .chain(&param.c1)
+        .chain(param.frat.iter().flatten())
+        .chain(param.b2.iter().flatten())
+        .chain(param.c2.iter().flatten())
+        .all(|value| value.is_finite());
+    let level_parameters_are_finite = [
+        param.gain_cmpnst_db,
+        param.gain_ref_db,
+        param.level_db_scgcfb,
+        param.lvl_est.lct_erb,
+        param.lvl_est.decay_hl,
+        param.lvl_est.b2,
+        param.lvl_est.c2,
+        param.lvl_est.frat,
+        param.lvl_est.rms2spldb,
+        param.lvl_est.weight,
+        param.lvl_est.ref_db,
+        param.lvl_est.pwr[0],
+        param.lvl_est.pwr[1],
+    ]
+    .iter()
+    .all(|value| value.is_finite());
+    if !coefficients_are_finite || !level_parameters_are_finite || param.lvl_est.decay_hl <= 0.0 {
+        return Err(Error::InvalidParameter(
+            "v2.11 filter coefficients and level parameters must be finite, and level decay must be positive"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn initial_asymmetric_ratio_and_centers(
     param: &GcParam,
     response: &GcResp,
@@ -298,6 +333,7 @@ pub fn set_param(mut param: GcParam) -> Result<(GcParam, GcResp)> {
         (0..param.num_ch).map(|i| fr1[i] + c1_val[i] * erb_width[i] * b1_val[i] / param.n),
     );
     validate_prepared_frequencies(param.fs, fp1.as_slice().unwrap(), "derived filter centers")?;
+    validate_user_controlled_parameters(&param)?;
     let b2_val = ef.mapv(|v| param.b2[0][0] + param.b2[0][1] * v);
     let c2_val = ef.mapv(|v| param.c2[0][0] + param.c2[0][1] * v);
     let shift = (param.lvl_est.lct_erb / erb_space1).round() as isize;
@@ -627,9 +663,9 @@ pub fn fp2_to_fr1(
 
 /// Run the v2.11 filterbank.
 pub fn gcfb_v211(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
-    if snd_in.is_empty() {
+    if snd_in.is_empty() || snd_in.iter().any(|sample| !sample.is_finite()) {
         return Err(Error::InvalidParameter(
-            "input sound cannot be empty".into(),
+            "input sound must be non-empty and finite".into(),
         ));
     }
     let (param, mut response) = set_param(gc_param)?;

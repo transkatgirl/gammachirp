@@ -30,25 +30,50 @@ pub fn nextpow2(n: usize) -> u32 {
 pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
     let mut file = File::open(path)?;
     let mut header = [0_u8; 12];
-    file.read_exact(&mut header)?;
+    file.read_exact(&mut header)
+        .map_err(|_| Error::Wav("truncated RIFF header".into()))?;
     if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
         return Err(Error::Wav("missing RIFF/WAVE signature".into()));
+    }
+    let riff_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+    if riff_size < 4 {
+        return Err(Error::Wav(
+            "RIFF container is shorter than its WAVE header".into(),
+        ));
+    }
+    let riff_end = 8 + riff_size;
+    if file.metadata()?.len() < riff_end {
+        return Err(Error::Wav(
+            "file is shorter than the declared RIFF container".into(),
+        ));
     }
     let mut sample_rate = None;
     let mut format = None;
     let mut channels = None;
     let mut bits = None;
     let mut data = Vec::new();
-    loop {
-        let mut chunk_header = [0_u8; 8];
-        if file.read_exact(&mut chunk_header).is_err() {
-            break;
+    let mut position = 12_u64;
+    while position < riff_end {
+        if riff_end - position < 8 {
+            return Err(Error::Wav("partial chunk header".into()));
         }
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header)
+            .map_err(|_| Error::Wav("partial chunk header".into()))?;
+        position += 8;
         let size = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap()) as usize;
+        let size_u64 = size as u64;
+        if size_u64 > riff_end - position {
+            return Err(Error::Wav("partial chunk payload".into()));
+        }
+        if size % 2 == 1 && size_u64 + 1 > riff_end - position {
+            return Err(Error::Wav("missing odd-byte chunk padding".into()));
+        }
         match &chunk_header[0..4] {
             b"fmt " => {
                 let mut chunk = vec![0; size];
-                file.read_exact(&mut chunk)?;
+                file.read_exact(&mut chunk)
+                    .map_err(|_| Error::Wav("partial fmt chunk payload".into()))?;
                 if size < 16 {
                     return Err(Error::Wav("short fmt chunk".into()));
                 }
@@ -59,14 +84,20 @@ pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
             }
             b"data" => {
                 data.resize(size, 0);
-                file.read_exact(&mut data)?;
+                file.read_exact(&mut data)
+                    .map_err(|_| Error::Wav("partial data chunk payload".into()))?;
             }
             _ => {
-                file.seek(SeekFrom::Current(size as i64))?;
+                file.seek(SeekFrom::Current(size as i64))
+                    .map_err(|_| Error::Wav("could not skip unknown chunk payload".into()))?;
             }
         }
+        position += size_u64;
         if size % 2 == 1 {
-            file.seek(SeekFrom::Current(1))?;
+            let mut padding = [0_u8; 1];
+            file.read_exact(&mut padding)
+                .map_err(|_| Error::Wav("missing odd-byte chunk padding".into()))?;
+            position += 1;
         }
     }
     if format != Some(1)
@@ -92,6 +123,11 @@ pub fn audioread(path: impl AsRef<Path>) -> Result<(Array1<f64>, u32)> {
 
 /// Equalize an input to a requested Meddis hair-cell level.
 pub fn eqlz2meddis_hc_level(snd: &[f64], out_level_db: f64) -> Result<(Array1<f64>, [f64; 3])> {
+    if !out_level_db.is_finite() {
+        return Err(Error::InvalidParameter(
+            "requested calibration level must be finite".into(),
+        ));
+    }
     let source_level = rms(snd) * 10_f64.powf(30.0 / 20.0);
     if !source_level.is_finite() || source_level <= 0.0 {
         return Err(Error::InvalidParameter(
