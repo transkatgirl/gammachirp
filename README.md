@@ -124,7 +124,7 @@ causal one-pole convention instead. The helper is deterministic; internal
 noise required by the selected central decision model must be represented in
 the trials or added at that later stage.
 
-```rust
+```rust,no_run
 use gammachirp_rs::breebaart2001::{
     MonauralConfig, breebaart2001_monaural,
 };

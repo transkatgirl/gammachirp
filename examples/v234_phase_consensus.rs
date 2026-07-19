@@ -75,7 +75,7 @@ fn main() -> gammachirp_rs::Result<()> {
     energy_bins.sort_by(|&left, &right| {
         phase.reassignment.energy_map[right].total_cmp(&phase.reassignment.energy_map[left])
     });
-    println!("strongest reassigned localization peaks:");
+    println!("strongest reassigned localization bins:");
     for &(channel, time) in energy_bins.iter().take(5) {
         println!(
             "  t={:.5} s, f={:.1} Hz, coherence={:.3}, energy={:.3e}",
@@ -114,7 +114,7 @@ fn main() -> gammachirp_rs::Result<()> {
     salience_bins.sort_by(|&left, &right| {
         consensus.salience_map[right].total_cmp(&consensus.salience_map[left])
     });
-    println!("strongest full-bandwidth-consensus peaks:");
+    println!("strongest full-bandwidth-consensus bins:");
     for &(channel, time) in salience_bins.iter().take(5) {
         println!(
             "  t={:.5} s, f={:.1} Hz, agreement={:.3}, salience={:.3e}",
