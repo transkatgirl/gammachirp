@@ -164,17 +164,19 @@ internal representations, center frequencies, and both complete GCFB outputs.
 
 The runnable hybrid example generates deterministic broadband input at 16 kHz,
 delays the right ear by 0.5 ms, makes it 3 dB louder than the left ear, and
-analyzes it with a noise-free 24-channel static GCFB and an ITD-by-IID EI
-population:
+analyzes it sample by sample with a noise-free 24-channel static GCFB and a
+causal ITD-by-IID EI population:
 
 ```text
 cargo run --example breebaart2001_hybrid
 cargo run --example breebaart2001_hybrid -- /tmp/breebaart.png
 ```
 
-It prints the stimulus and expected EI sign convention, array dimensions,
-frequency range, observed best-matching unit, and the five lowest mean
-responses. The heatmap is written to `target/breebaart2001_hybrid.png` by
+It accumulates the requested interior-window means directly from indexed
+stream events, flushes the delayed EI tail, and prints the stream latency along
+with the stimulus, expected EI sign convention, dimensions, frequency range,
+observed best-matching unit, and five lowest mean responses. The heatmap is
+written to `target/breebaart2001_hybrid.png` by
 default; one optional `.png` path selects another destination, and missing
 parent directories are created automatically. In an EI population, a unit
 whose characteristic ITD and IID match the stimulus cues cancels excitation
@@ -460,9 +462,9 @@ coefficient history; in streaming sample mode, it is the wrapped backward phase
 increment. Both include the realized HP-AF variation without differentiating
 through the nonlinear level estimator.
 
-Render a self-contained, three-panel comparison of the matched energy map,
-its time-frequency reassignment, and the default bandwidth-consensus salience
-with:
+Render a self-contained, three-panel comparison of causal source energy, its
+rolling time-frequency reassignment, and streaming bandwidth-consensus
+salience with:
 
 ```bash
 cargo run --example v234_reassignment_spectrogram
@@ -475,16 +477,18 @@ an alternative PNG path after `--` to choose the destination:
 cargo run --example v234_reassignment_spectrogram -- /tmp/comparison.png
 ```
 
-The first two panels use the same retained analytic energy and the same -60 to
-0 dB color scale, so their visual difference reflects reassignment rather than
-per-panel normalization. The third panel shows salience for the default `0.8`,
-`1.0`, and `1.2` bandwidth scales, suppresses bins outside the consensus mask,
-and uses a separate -60 to 0 dB scale referenced to normalized salience `1.0`.
-The example also reports the active scales, agreement requirement, and accepted
-consensus-bin count and fraction.
+The first two panels share a -60 to 0 dB color scale referenced to their joint
+maximum. The target-grid panel can contain slightly less energy because causal
+coordinates outside the finite plotting grid are discarded. The third panel
+shows rolling salience for the default `0.8`, `1.0`, and `1.2` bandwidth
+scales, suppresses bins outside the consensus mask, and uses a separate -60 to
+0 dB scale referenced to normalized salience `1.0`. The example also reports
+the rolling window, active scales, agreement requirement, accepted
+consensus-bin count, and retained energy.
 
-Run the deterministic tones, clicks, chirp, and seeded-noise example (it only
-prints measurements and writes no files) with:
+Run the deterministic tones, clicks, chirp, and seeded-noise example to inspect
+immediate causal phase coordinates and delayed rolling-consensus frames (it
+only prints measurements and writes no files) with:
 
 ```bash
 cargo run --example v234_phase_consensus

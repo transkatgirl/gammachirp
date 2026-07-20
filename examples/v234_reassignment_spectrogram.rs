@@ -1,4 +1,4 @@
-//! Render matched GCFB reassignment and bandwidth-consensus spectrograms.
+//! Render causal GCFB reassignment and rolling-consensus spectrograms.
 
 use std::error::Error;
 use std::f64::consts::PI;
@@ -8,8 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gammachirp_rs::gcfb_v234::{
-    BandwidthConsensusConfig, BandwidthConsensusResult, ControlMode, GainReference, GcParam,
-    gcfb_v234_with_bandwidth_consensus,
+    BandwidthConsensusStream, BandwidthConsensusStreamConfig, BandwidthConsensusStreamFrame,
+    ControlMode, GainReference, GcParam, utils,
 };
 use ndarray::{Array1, Array2};
 use plotters::coord::Shift;
@@ -18,6 +18,18 @@ use plotters::prelude::*;
 const IMAGE_SIZE: (u32, u32) = (2300, 720);
 const DB_FLOOR: f64 = -60.0;
 const DEFAULT_OUTPUT: &str = "target/v234_reassignment_spectrogram.png";
+
+struct StreamingConsensusResult {
+    source_energy_map: Array2<f64>,
+    reassigned_energy_map: Array2<f64>,
+    agreement_map: Array2<f64>,
+    consensus_mask: Array2<bool>,
+    salience_map: Array2<f64>,
+    time_axis: Array1<f64>,
+    frequency_axis_erb: Array1<f64>,
+    scales: Vec<f64>,
+    window_samples: usize,
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let output_path = output_path(std::env::args_os().skip(1))?;
@@ -39,10 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         gain_ref: GainReference::Db(50.0),
         ..GcParam::default()
     };
-    let consensus_config = BandwidthConsensusConfig::default();
-    let (_, consensus) = gcfb_v234_with_bandwidth_consensus(&input, parameters, &consensus_config)?;
-    let phase = &consensus.analyses[consensus.baseline_index];
-    let comparison = phase.sparsity_comparison()?;
+    let consensus_config = BandwidthConsensusStreamConfig::default();
+    let required_agreement = consensus_config.required_agreement;
+    let consensus = collect_streaming_consensus(&input, parameters, consensus_config)?;
 
     render_comparison(&output_path, &consensus)?;
 
@@ -52,23 +63,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|&&accepted| accepted)
         .count();
     let accepted_fraction = accepted_bins as f64 / consensus.consensus_mask.len() as f64;
-    let required_scales =
-        (consensus_config.required_agreement * consensus.scales.len() as f64).ceil() as usize;
+    let required_scales = (required_agreement * consensus.scales.len() as f64).ceil() as usize;
 
     println!("wrote {}", output_path.display());
     println!(
-        "matched retained energy: unreassigned={:.6e}, reassigned={:.6e}",
-        phase.unreassigned_energy_map.sum(),
-        phase.reassignment.retained_energy(),
+        "causal energy: source={:.6e}, retained on rolling target grid={:.6e}",
+        consensus.source_energy_map.sum(),
+        consensus.reassigned_energy_map.sum(),
     );
     println!(
-        "effective support: unreassigned={:.1} bins, reassigned={:.1} bins",
-        comparison.unreassigned.effective_bins, comparison.reassigned.effective_bins,
+        "effective support: source={:.1} bins, reassigned={:.1} bins",
+        effective_bins(&consensus.source_energy_map),
+        effective_bins(&consensus.reassigned_energy_map),
     );
     println!(
-        "bandwidth consensus: scales=[{}], agreement requirement={:.3} ({required_scales}/{} scales)",
+        "rolling bandwidth consensus: scales=[{}], window={} samples, agreement requirement={required_agreement:.3} ({required_scales}/{} scales)",
         format_scales(&consensus.scales),
-        consensus_config.required_agreement,
+        consensus.window_samples,
         consensus.scales.len(),
     );
     println!(
@@ -77,6 +88,82 @@ fn main() -> Result<(), Box<dyn Error>> {
         100.0 * accepted_fraction,
     );
     Ok(())
+}
+
+fn collect_streaming_consensus(
+    input: &[f64],
+    parameters: GcParam,
+    config: BandwidthConsensusStreamConfig,
+) -> gammachirp_rs::Result<StreamingConsensusResult> {
+    let mut stream = BandwidthConsensusStream::new(parameters, config)?;
+    let channels = stream.gc_param().num_ch;
+    let samples = input.len();
+    let sample_rate = stream.gc_param().fs;
+    let baseline_index = stream.baseline_index();
+    let scales = stream.scales().to_vec();
+    let window_samples = stream.window_samples();
+    let (frequency_axis_erb, _) = utils::freq2erb(stream.gc_param().fr1.as_slice().unwrap());
+    let time_axis = Array1::from_iter((0..samples).map(|sample| sample as f64 / sample_rate));
+    let mut result = StreamingConsensusResult {
+        source_energy_map: Array2::zeros((channels, samples)),
+        reassigned_energy_map: Array2::zeros((channels, samples)),
+        agreement_map: Array2::zeros((channels, samples)),
+        consensus_mask: Array2::from_elem((channels, samples), false),
+        salience_map: Array2::zeros((channels, samples)),
+        time_axis,
+        frequency_axis_erb,
+        scales,
+        window_samples,
+    };
+
+    for (sample_index, &sample) in input.iter().enumerate() {
+        let step = stream.process_sample(sample)?;
+        result
+            .source_energy_map
+            .column_mut(sample_index)
+            .assign(&step.baseline().source_energy);
+        if let Some(frame) = step.consensus {
+            assign_consensus_frame(&mut result, frame, baseline_index);
+        }
+    }
+    for frame in stream.finish()? {
+        assign_consensus_frame(&mut result, frame, baseline_index);
+    }
+    Ok(result)
+}
+
+fn assign_consensus_frame(
+    result: &mut StreamingConsensusResult,
+    frame: BandwidthConsensusStreamFrame,
+    baseline_index: usize,
+) {
+    let sample = frame.sample_index;
+    result
+        .reassigned_energy_map
+        .column_mut(sample)
+        .assign(&frame.scale_energy_columns[baseline_index]);
+    result
+        .agreement_map
+        .column_mut(sample)
+        .assign(&frame.agreement);
+    result
+        .consensus_mask
+        .column_mut(sample)
+        .assign(&frame.consensus_mask);
+    result
+        .salience_map
+        .column_mut(sample)
+        .assign(&frame.salience);
+}
+
+fn effective_bins(map: &Array2<f64>) -> f64 {
+    let sum = map.sum();
+    let sum_of_squares = map.iter().map(|value| value * value).sum::<f64>();
+    if sum_of_squares > 0.0 {
+        sum * sum / sum_of_squares
+    } else {
+        0.0
+    }
 }
 
 fn output_path(mut arguments: impl Iterator<Item = OsString>) -> io::Result<PathBuf> {
@@ -138,15 +225,14 @@ fn example_signal() -> (Vec<f64>, f64) {
 
 fn render_comparison(
     output_path: &Path,
-    consensus: &BandwidthConsensusResult,
+    consensus: &StreamingConsensusResult,
 ) -> Result<(), Box<dyn Error>> {
-    let phase = &consensus.analyses[consensus.baseline_index];
-    let unreassigned = &phase.unreassigned_energy_map;
-    let reassigned = &phase.reassignment.energy_map;
+    let unreassigned = &consensus.source_energy_map;
+    let reassigned = &consensus.reassigned_energy_map;
     let salience = &consensus.salience_map;
     let consensus_mask = &consensus.consensus_mask;
-    let time_axis = &phase.reassignment.time_axis;
-    let frequency_axis_erb = &phase.reassignment.frequency_axis_erb;
+    let time_axis = &consensus.time_axis;
+    let frequency_axis_erb = &consensus.frequency_axis_erb;
     validate_render_dimensions(
         unreassigned,
         reassigned,
@@ -184,7 +270,7 @@ fn render_comparison(
     let root = BitMapBackend::new(output_path, IMAGE_SIZE).into_drawing_area();
     root.fill(&WHITE)?;
     let body = root.titled(
-        "GCFB v2.34 Time-Frequency Reassignment and Bandwidth Consensus",
+        "GCFB v2.34 Causal Reassignment and Rolling Bandwidth Consensus",
         ("sans-serif", 30),
     )?;
     let (panel_area, colorbar_area) = body.split_horizontally(2040);
@@ -192,7 +278,7 @@ fn render_comparison(
 
     draw_spectrogram(
         &panels[0],
-        "Without reassignment (matched energy)",
+        "Causal source energy (before transport)",
         unreassigned,
         &time_edges,
         &frequency_edges,
@@ -200,7 +286,7 @@ fn render_comparison(
     )?;
     draw_spectrogram(
         &panels[1],
-        "With time-frequency reassignment",
+        "Causal time-frequency reassignment",
         reassigned,
         &time_edges,
         &frequency_edges,
@@ -209,7 +295,7 @@ fn render_comparison(
     draw_consensus_salience(
         &panels[2],
         &format!(
-            "Consensus salience (scales {})",
+            "Rolling consensus salience (scales {})",
             format_scales(&consensus.scales)
         ),
         salience,
@@ -218,7 +304,7 @@ fn render_comparison(
         &frequency_edges,
     )?;
     let colorbars = colorbar_area.split_evenly((2, 1));
-    draw_colorbar(&colorbars[0], "Matched energy (dB)")?;
+    draw_colorbar(&colorbars[0], "Causal energy (dB)")?;
     draw_colorbar(&colorbars[1], "Consensus salience (dB)")?;
     root.present()?;
     Ok(())

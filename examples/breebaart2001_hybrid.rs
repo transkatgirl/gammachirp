@@ -8,10 +8,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gammachirp_rs::breebaart2001::{
-    EiUnit, HybridBinauralConfig, HybridBinauralOutput, hybrid_binaural,
+    EiStreamSample, EiUnit, HybridBinauralConfig, HybridBinauralStream,
 };
 use gammachirp_rs::gcfb_v234::{ControlMode, GainReference, GcParam};
-use ndarray::{Array3, s};
 use plotters::coord::Shift;
 use plotters::prelude::*;
 
@@ -28,7 +27,11 @@ const ITD_MS: [f64; 9] = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0];
 const IID_DB: [f64; 5] = [-6.0, -3.0, 0.0, 3.0, 6.0];
 
 struct Analysis {
-    output: HybridBinauralOutput,
+    units: Vec<EiUnit>,
+    center_frequencies_hz: Vec<f64>,
+    frequency_channels: usize,
+    samples: usize,
+    latency_samples: usize,
     mean_activity: Vec<f64>,
     averaging_window: Range<usize>,
 }
@@ -40,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let analysis = run_analysis()?;
     let ranking = ranked_units(&analysis.mean_activity);
     let observed_index = ranking[0];
-    let observed = analysis.output.units[observed_index];
+    let observed = analysis.units[observed_index];
 
     println!(
         "stimulus: deterministic broadband noise; right ear delayed by +{:.3} ms; right-minus-left IID {:+.1} dB",
@@ -54,14 +57,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "EI output: {} units x {} frequency channels x {} samples",
-        analysis.output.ei_map.len_of(ndarray::Axis(0)),
-        analysis.output.ei_map.len_of(ndarray::Axis(1)),
-        analysis.output.ei_map.len_of(ndarray::Axis(2)),
+        analysis.units.len(),
+        analysis.frequency_channels,
+        analysis.samples,
+    );
+    println!(
+        "streaming EI latency: {} samples ({:.3} ms)",
+        analysis.latency_samples,
+        1e3 * analysis.latency_samples as f64 / SAMPLE_RATE_HZ,
     );
     println!(
         "frequency range: {:.1}-{:.1} Hz",
-        analysis.output.center_frequencies_hz[0],
-        analysis.output.center_frequencies_hz[analysis.output.center_frequencies_hz.len() - 1],
+        analysis.center_frequencies_hz[0],
+        analysis.center_frequencies_hz[analysis.center_frequencies_hz.len() - 1],
     );
     println!(
         "averaging window: {:.3}-{:.3} s (all frequency channels)",
@@ -76,7 +84,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("five lowest mean responses:");
     for &index in ranking.iter().take(5) {
-        let unit = analysis.output.units[index];
+        let unit = analysis.units[index];
         println!(
             "  ITD {:+.3} ms, IID {:+.1} dB: {:.6} MU",
             unit.delay_seconds * 1e3,
@@ -159,17 +167,15 @@ fn ei_population() -> Vec<EiUnit> {
 }
 
 fn analysis_config() -> HybridBinauralConfig {
-    let mut config = HybridBinauralConfig {
-        filterbank: GcParam {
-            fs: SAMPLE_RATE_HZ,
-            num_ch: 24,
-            f_range: [100.0, 6_000.0],
-            out_mid_crct: "No".into(),
-            ctrl: ControlMode::Static,
-            gain_ref: GainReference::Db(50.0),
-            ..GcParam::default()
-        },
-        ..HybridBinauralConfig::default()
+    let mut config = HybridBinauralConfig::streaming();
+    config.filterbank = GcParam {
+        fs: SAMPLE_RATE_HZ,
+        num_ch: 24,
+        f_range: [100.0, 6_000.0],
+        out_mid_crct: "No".into(),
+        ctrl: ControlMode::Static,
+        gain_ref: GainReference::Db(50.0),
+        ..GcParam::default()
     };
     config.peripheral.absolute_threshold_noise_level_db_spl = None;
     config.ei.internal_noise_std_mu = 0.0;
@@ -179,21 +185,75 @@ fn analysis_config() -> HybridBinauralConfig {
 fn run_analysis() -> gammachirp_rs::Result<Analysis> {
     let (left, right) = binaural_broadband_stimulus();
     let units = ei_population();
-    let output = hybrid_binaural(&left, &right, &units, analysis_config())?;
     let averaging_window = INTERIOR_MARGIN_SAMPLES..STIMULUS_SAMPLES - INTERIOR_MARGIN_SAMPLES;
-    let mean_activity = mean_activity(&output.ei_map, averaging_window.clone());
+    let mut processor = HybridBinauralStream::new(&units, analysis_config())?;
+    let center_frequencies_hz = processor.center_frequencies_hz().to_vec();
+    let frequency_channels = center_frequencies_hz.len();
+    let latency_samples = processor.latency_samples();
+    let mut activity_sums = vec![0.0; units.len()];
+    let mut events_seen = 0;
+    for (&left_sample, &right_sample) in left.iter().zip(&right) {
+        if let Some(event) = processor
+            .process_sample(left_sample, right_sample)?
+            .ei_event
+        {
+            accumulate_activity(
+                event,
+                &averaging_window,
+                &mut activity_sums,
+                &mut events_seen,
+            )?;
+        }
+    }
+    for event in processor.finish()? {
+        accumulate_activity(
+            event,
+            &averaging_window,
+            &mut activity_sums,
+            &mut events_seen,
+        )?;
+    }
+    if events_seen != STIMULUS_SAMPLES {
+        return Err(gammachirp_rs::Error::Numerical(format!(
+            "stream emitted {events_seen} EI samples for {STIMULUS_SAMPLES} inputs"
+        )));
+    }
+    let values_per_unit = frequency_channels * averaging_window.len();
+    let mean_activity = activity_sums
+        .into_iter()
+        .map(|sum| sum / values_per_unit as f64)
+        .collect();
     Ok(Analysis {
-        output,
+        units,
+        center_frequencies_hz,
+        frequency_channels,
+        samples: STIMULUS_SAMPLES,
+        latency_samples,
         mean_activity,
         averaging_window,
     })
 }
 
-fn mean_activity(activity: &Array3<f64>, window: Range<usize>) -> Vec<f64> {
-    let values_per_unit = activity.len_of(ndarray::Axis(1)) * window.len();
-    (0..activity.len_of(ndarray::Axis(0)))
-        .map(|unit| activity.slice(s![unit, .., window.clone()]).sum() / values_per_unit as f64)
-        .collect()
+fn accumulate_activity(
+    event: EiStreamSample,
+    window: &Range<usize>,
+    sums: &mut [f64],
+    events_seen: &mut usize,
+) -> gammachirp_rs::Result<()> {
+    if event.sample_index != *events_seen {
+        return Err(gammachirp_rs::Error::Numerical(format!(
+            "EI stream emitted sample {} after sample {}",
+            event.sample_index,
+            events_seen.saturating_sub(1),
+        )));
+    }
+    *events_seen += 1;
+    if window.contains(&event.sample_index) {
+        for (sum, activity) in sums.iter_mut().zip(event.activity.rows()) {
+            *sum += activity.sum();
+        }
+    }
+    Ok(())
 }
 
 fn ranked_units(mean_activity: &[f64]) -> Vec<usize> {
@@ -397,7 +457,7 @@ mod tests {
         let analysis = run_analysis().unwrap();
         let best = ranked_units(&analysis.mean_activity)[0];
         assert_eq!(
-            analysis.output.units[best],
+            analysis.units[best],
             EiUnit::new(EXPECTED_ITD_SECONDS, EXPECTED_IID_DB)
         );
     }

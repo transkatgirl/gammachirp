@@ -1,4 +1,4 @@
-use gammachirp_rs::gcfb_v234::{GcParam, gcfb_v234};
+use gammachirp_rs::gcfb_v234::{GcParam, GcfbStream};
 
 fn main() -> gammachirp_rs::Result<()> {
     let fs = 48_000;
@@ -8,15 +8,18 @@ fn main() -> gammachirp_rs::Result<()> {
         pulse_train[sample] = 1.0;
     }
 
-    let parameters = GcParam {
+    let mut filterbank = GcfbStream::new(GcParam {
         out_mid_crct: "No".into(),
         ..GcParam::default()
-    };
-    let output = gcfb_v234(&pulse_train, parameters)?;
-    println!(
-        "{} channels × {} frames",
-        output.dcgc_out.nrows(),
-        output.dcgc_out.ncols()
-    );
+    })?;
+    let channels = filterbank.gc_param().num_ch;
+    let mut output_samples = 0;
+    for sample in pulse_train {
+        if filterbank.process_sample(sample)?.event.is_some() {
+            output_samples += 1;
+        }
+    }
+    output_samples += filterbank.finish()?.len();
+    println!("{channels} channels × {output_samples} streaming outputs");
     Ok(())
 }
