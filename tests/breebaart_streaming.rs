@@ -147,6 +147,7 @@ proptest! {
         mode in 0u8..3,
         update in 1usize..5,
         symmetric_delay in any::<bool>(),
+        corrected in any::<bool>(),
         threshold_noise in any::<bool>(),
         internal_noise in any::<bool>(),
         seed in any::<u64>(),
@@ -164,7 +165,7 @@ proptest! {
         config.filterbank.fs = 8_000.0;
         config.filterbank.num_ch = channels;
         config.filterbank.f_range = [180.0, 1_800.0];
-        config.filterbank.out_mid_crct = "No".into();
+        config.filterbank.out_mid_crct = if corrected { "ELC" } else { "No" }.into();
         config.filterbank.ctrl = match mode {
             0 => ControlMode::Static,
             1 => ControlMode::Level,

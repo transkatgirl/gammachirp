@@ -360,7 +360,11 @@ pub fn set_frame4time_sequence(
     Ok((output, positions))
 }
 
-/// Tabulated legacy outer/middle-ear correction, returned as linear power.
+/// Tabulated outer/middle-ear correction, returned as linear power.
+///
+/// Requested grids use a not-a-knot cubic spline in dB within the table and
+/// hold the endpoint values outside it. Clamping avoids the severe low- and
+/// high-frequency excursions produced by unconstrained cubic extrapolation.
 pub fn out_mid_crct(
     kind: &str,
     n_frq_rsl: usize,
@@ -418,7 +422,10 @@ pub fn out_mid_crct(
         let f: Vec<f64> = (0..n_frq_rsl)
             .map(|i| i as f64 / n_frq_rsl as f64 * fs / 2.0)
             .collect();
-        (f.clone(), dsp::interp1(&table_f, &table_db, &f, true)?)
+        (
+            f.clone(),
+            dsp::cubic_spline_not_a_knot_clamped(&table_f, &table_db, &f)?,
+        )
     };
     let power = db.iter().map(|v| 10_f64.powf(-v / 10.0)).collect();
     Ok((power, Array1::from(freq), Array1::from(db)))
@@ -441,12 +448,58 @@ pub(crate) fn correction_filter_coefficient_count(sr: f64, fft_len: usize) -> Re
     Ok(half_count.min(max_half_count) * 2 + 1)
 }
 
-/// Construct the legacy outer/middle-ear correction FIR.
+pub(crate) fn frequency_sampling_linear_phase_fir(
+    positive_magnitude: &[f64],
+    fft_len: usize,
+    coefficient_count: usize,
+) -> Result<Vec<f64>> {
+    if fft_len < 4
+        || !fft_len.is_multiple_of(2)
+        || positive_magnitude.len() != fft_len / 2
+        || coefficient_count == 0
+        || coefficient_count > fft_len
+        || coefficient_count.is_multiple_of(2)
+        || positive_magnitude
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(Error::InvalidParameter(
+            "frequency-sampling FIR requires finite non-negative positive-frequency magnitudes, an even FFT length, and a fitting odd tap count"
+                .into(),
+        ));
+    }
+    let bins = fft_len / 2;
+    let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
+    spectrum[0].re = positive_magnitude[0];
+    for bin in 1..bins {
+        spectrum[bin].re = positive_magnitude[bin];
+        spectrum[fft_len - bin].re = positive_magnitude[bin];
+    }
+    // The sampled response omits Nyquist itself. Hold its final magnitude to
+    // the endpoint instead of accidentally introducing a zero there.
+    spectrum[bins].re = *positive_magnitude.last().unwrap();
+    dsp::fft(&mut spectrum, true);
+
+    let center = coefficient_count / 2;
+    let taper_len = 20.min(center);
+    let (window, _) = taper_window(coefficient_count, "HAN", Some(taper_len), 3.0)?;
+    Ok((0..coefficient_count)
+        .map(|index| {
+            let circular_index = (fft_len + index - center) % fft_len;
+            spectrum[circular_index].re * window[index]
+        })
+        .collect())
+}
+
+/// Construct an outer/middle-ear correction FIR.
 ///
 /// `filter_type` follows the Python switch: 0 is forward linear phase, 1 is
 /// inverse linear phase, and 2 is forward minimum phase. The Rust port uses a
-/// frequency-sampling FIR design; its magnitude follows the same correction
-/// table while avoiding a dependency on SciPy's Parks–McClellan implementation.
+/// frequency-sampling FIR design with the reference implementation's short
+/// edge taper, avoiding a dependency on SciPy's Parks–McClellan implementation.
+/// At 48 kHz the retained 601-tap latency tracks ELC within 1 dB from roughly
+/// 80 Hz upward; the table's steeper sub-80-Hz transition would require a
+/// materially longer filter.
 pub fn out_mid_crct_filt(kind: &str, sr: f64, filter_type: u8) -> Result<Array1<f64>> {
     if !matches!(filter_type, 0..=2) {
         return Err(Error::InvalidParameter(
@@ -463,21 +516,7 @@ pub fn out_mid_crct_filt(kind: &str, sr: f64, filter_type: u8) -> Result<Array1<
             *value = 1.0 / value.max(0.1);
         }
     }
-    let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
-    spectrum[0].re = magnitude[0];
-    for i in 1..bins {
-        spectrum[i].re = magnitude[i];
-        spectrum[fft_len - i].re = magnitude[i];
-    }
-    spectrum[bins].re = *magnitude.last().unwrap();
-    dsp::fft(&mut spectrum, true);
-    let center = coefficient_count / 2;
-    let window = dsp::hanning(coefficient_count);
-    let mut linear = vec![0.0; coefficient_count];
-    for i in 0..coefficient_count {
-        let circular_index = (fft_len + i - center) % fft_len;
-        linear[i] = spectrum[circular_index].re * window[i];
-    }
+    let linear = frequency_sampling_linear_phase_fir(&magnitude, fft_len, coefficient_count)?;
     if filter_type == 2 {
         let (_, minimum) = rceps(&linear)?;
         Ok(minimum
@@ -516,6 +555,69 @@ mod tests {
         assert!(out_mid_crct_filt("ELC", 128.0, 2).is_err());
         assert!(out_mid_crct_filt("ELC", f64::NAN, 2).is_err());
         assert!(!out_mid_crct_filt("ELC", 160.0, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn correction_spline_matches_not_a_knot_reference_and_clamps_below_table() {
+        // A 1,920-bin grid at 48 kHz has 12.5 Hz spacing, placing every query
+        // below exactly on a response bin. References are from Octave's
+        // not-a-knot `spline`, equivalent to SciPy's s=0 cubic spline.
+        let (_, frequency, db) = out_mid_crct("ELC", 1_920, 48_000.0).unwrap();
+        let references = [
+            (37.5, 17.944_993_830_675_39),
+            (112.5, 7.240_088_296_268_912),
+            (1_750.0, 1.844_862_105_483_36),
+            (6_250.0, 6.397_915_373_043_234),
+            (12_000.0, 10.948_670_614_853_92),
+            (18_000.0, 54.808_369_064_620_58),
+        ];
+        assert_relative_eq!(db[0], 31.8, epsilon = 1e-13);
+        for (query, expected) in references {
+            let index = frequency.iter().position(|value| *value == query).unwrap();
+            assert_relative_eq!(db[index], expected, epsilon = 2e-10);
+        }
+    }
+
+    #[test]
+    fn correction_fir_keeps_delay_and_tracks_the_usable_elc_band() {
+        let fs = 48_000.0;
+        let coefficients = out_mid_crct_filt("ELC", fs, 0).unwrap();
+        let minimum_phase = out_mid_crct_filt("ELC", fs, 2).unwrap();
+        assert_eq!(coefficients.len(), 601);
+        assert_eq!(minimum_phase.len(), 300);
+        for index in 0..coefficients.len() / 2 {
+            assert_relative_eq!(
+                coefficients[index],
+                coefficients[coefficients.len() - 1 - index],
+                epsilon = 2e-14
+            );
+        }
+        for (name, filter) in [
+            ("linear", coefficients.as_slice().unwrap()),
+            ("minimum-phase", minimum_phase.as_slice().unwrap()),
+        ] {
+            for frequency in [
+                50.0, 63.0, 80.0, 100.0, 1_000.0, 6_000.0, 12_000.0, 18_000.0,
+            ] {
+                let response = filter.iter().enumerate().fold(
+                    Complex64::new(0.0, 0.0),
+                    |sum, (sample, &value)| {
+                        sum + Complex64::from_polar(
+                            value,
+                            -2.0 * std::f64::consts::PI * frequency * sample as f64 / fs,
+                        )
+                    },
+                );
+                let (_, _, target_db) = out_mid_crct("ELC", 24_000, fs).unwrap();
+                let target_index = frequency.round() as usize;
+                let error_db = 20.0 * response.norm().log10() + target_db[target_index];
+                let tolerance = if frequency < 80.0 { 1.5 } else { 1.0 };
+                assert!(
+                    error_db.abs() < tolerance,
+                    "{name} ELC error at {frequency} Hz was {error_db} dB"
+                );
+            }
+        }
     }
 
     #[test]

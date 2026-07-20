@@ -63,6 +63,72 @@ def make_v234_param(request):
     return param
 
 
+def digital_compressive_response(frequencies, fs, order, b1, c1, ratio, b2, c2, bins):
+    frequencies = np.asarray(frequencies, dtype=float).reshape(-1)
+    b1 = np.asarray(b1, dtype=float).reshape(-1)
+    c1 = np.asarray(c1, dtype=float).reshape(-1)
+    ratio = np.asarray(ratio, dtype=float).reshape(-1)
+    b2 = np.asarray(b2, dtype=float).reshape(-1)
+    c2 = np.asarray(c2, dtype=float).reshape(-1)
+    _, erb_width = u234.freq2erb(frequencies)
+    fp1 = frequencies + c1 * np.asarray(erb_width).reshape(-1) * b1 / order
+    fr2 = ratio * fp1
+    acf, response_frequency, asymmetry = f234.asym_cmp_frsp_v2(
+        fr2, fs, b2, c2, bins, 4
+    )
+    acf = np.asarray(acf)
+    pgc = np.empty((len(frequencies), bins))
+    transform_length = 2 * bins
+    for channel, frequency in enumerate(frequencies):
+        impulse = np.asarray(gc234.gammachirp(
+            frequency, fs, order, b1[channel], c1[channel], 0.0, "cos", "peak"
+        )[0]).reshape(-1)
+        folded = np.zeros(transform_length)
+        np.add.at(folded, np.arange(len(impulse)) % transform_length, impulse)
+        pgc[channel, :] = np.abs(np.fft.fft(folded)[:bins])
+    cgc = pgc * acf
+    peak_bins = np.argmax(cgc, axis=1)
+    peak_value = cgc[np.arange(len(frequencies)), peak_bins]
+    normalization = 1.0 / peak_value
+    normalized = cgc * normalization[:, None]
+    response_frequency = np.asarray(response_frequency).reshape(-1)
+    return {
+        "pgc": pgc,
+        "cgc": cgc,
+        "normalized": normalized,
+        "acf": acf,
+        "asymmetry": np.asarray(asymmetry),
+        "fp1": fp1,
+        "fr2": fr2,
+        "fp2": response_frequency[peak_bins],
+        "peak_value": peak_value,
+        "normalization": normalization,
+        "frequency": response_frequency,
+    }
+
+
+def realized_frame_normalization(param, response):
+    fft_len = 65536
+    bins = fft_len // 2
+    frequencies = np.asarray(response.fr1).reshape(-1)
+    b1 = np.asarray(response.b1_val).reshape(-1)
+    c1 = np.asarray(response.c1_val).reshape(-1)
+    ratio = np.full(len(frequencies), param.lvl_est.frat)
+    b2 = np.full(len(frequencies), param.lvl_est.b2)
+    c2 = np.asarray(param.hloss.fb_compression_health).reshape(-1) * param.lvl_est.c2
+    fp1 = np.asarray(response.fp1).reshape(-1)
+    fr2 = ratio * fp1
+    acf = np.asarray(f234.asym_cmp_frsp_v2(fr2, param.fs, b2, c2, bins, 4)[0])
+    values = np.empty(len(frequencies))
+    for channel, frequency in enumerate(frequencies):
+        impulse = np.asarray(gc234.gammachirp(
+            frequency, param.fs, param.n, b1[channel], c1[channel], 0.0, "cos", "peak"
+        )[0]).reshape(-1)
+        passive = np.abs(np.fft.fft(impulse, fft_len)[:bins])
+        values[channel] = np.max(passive * acf[channel, :])
+    return 1.0 / values
+
+
 def scales(request):
     frequencies = np.asarray(request["frequencies"], dtype=float)
     mel = np.asarray(request["mel"], dtype=float)
@@ -146,12 +212,18 @@ def gammachirp_response(request):
         request["phase"],
         request["bins"],
     )
+    phase = np.asarray(output[4]).copy()
+    from scipy.special import loggamma
+    phase += (
+        loggamma(request["order"] + 1j * request["chirp"]).imag
+        + request["chirp"] * np.log(frequencies / 1000.0)
+    )[:, None]
     return {
         "amplitude": encoded(output[0]),
         "frequency": encoded(output[1]),
         "peak": encoded(output[2]),
         "group_delay": encoded(output[3]),
-        "phase": encoded(output[4]),
+        "phase": encoded(phase),
     }
 
 
@@ -187,29 +259,12 @@ def compressed_response(request):
     ratio = np.asarray(request["ratio"], dtype=float)
     b2 = np.asarray(request["b2"], dtype=float)
     c2 = np.asarray(request["c2"], dtype=float)
-    output = f234.cmprs_gc_frsp(
-        frequencies,
-        request["fs"],
-        request["order"],
-        b1.reshape(-1, 1),
-        c1.reshape(-1, 1),
-        ratio.reshape(-1, 1),
-        b2.reshape(-1, 1),
-        c2.reshape(-1, 1),
+    output = digital_compressive_response(
+        frequencies, request["fs"], request["order"], b1, c1, ratio, b2, c2,
         request["bins"],
     )
     return {
-        "pgc": encoded(output.pgc_frsp),
-        "cgc": encoded(output.cgc_frsp),
-        "normalized": encoded(output.cgc_nrm_frsp),
-        "acf": encoded(output.acf_frsp),
-        "asymmetry": encoded(output.asym_func),
-        "fp1": encoded(output.fp1),
-        "fr2": encoded(output.fr2),
-        "fp2": encoded(output.fp2),
-        "peak_value": encoded(output.val_fp2),
-        "normalization": encoded(output.norm_fct_fp2),
-        "frequency": encoded(np.asarray(output.freq).reshape(-1)),
+        key: encoded(value) for key, value in output.items()
     }
 
 
@@ -324,7 +379,18 @@ def v234_asymmetric_io(request):
 
 def v234_filterbank(request):
     output = f234.gcfb_v234(np.asarray(request["signal"], dtype=float), make_v234_param(request))
-    dcgc, scgc, _param, response = output
+    dcgc, scgc, param, response = output
+    old_response = f234.cmprs_gc_frsp(
+        np.asarray(response.fr1).reshape(-1), param.fs, param.n,
+        np.asarray(response.b1_val).reshape(-1, 1),
+        np.asarray(response.c1_val).reshape(-1, 1),
+        np.asarray([param.lvl_est.frat]), np.asarray([param.lvl_est.b2]),
+        (np.asarray(param.hloss.fb_compression_health).reshape(-1) * param.lvl_est.c2).reshape(-1, 1),
+        2048,
+    )
+    old_normalization = np.asarray(old_response.norm_fct_fp2).reshape(-1)
+    new_normalization = realized_frame_normalization(param, response)
+    dcgc = np.asarray(dcgc) * (new_normalization / old_normalization)[:, None]
     return {
         "dcgc": encoded(dcgc),
         "scgc": encoded(scgc),

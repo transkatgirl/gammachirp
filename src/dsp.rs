@@ -219,6 +219,115 @@ pub(crate) fn interp1(x: &[f64], y: &[f64], x_new: &[f64], extrapolate: bool) ->
     Ok(out)
 }
 
+/// Interpolate with the not-a-knot cubic spline used by SciPy's
+/// `UnivariateSpline(..., s=0)`, holding the endpoint values outside the
+/// tabulated interval.
+pub(crate) fn cubic_spline_not_a_knot_clamped(
+    x: &[f64],
+    y: &[f64],
+    x_new: &[f64],
+) -> Result<Vec<f64>> {
+    if x.len() != y.len()
+        || x.len() < 4
+        || x.windows(2).any(|pair| pair[1] <= pair[0])
+        || x.iter()
+            .chain(y)
+            .chain(x_new)
+            .any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidParameter(
+            "cubic-spline inputs must be finite, equally sized, contain at least four points, and have increasing x"
+                .into(),
+        ));
+    }
+
+    let count = x.len();
+    let intervals: Vec<f64> = x.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let mut matrix = vec![vec![0.0; count + 1]; count];
+
+    // Equal third derivatives in the first and second polynomial pieces.
+    matrix[0][0] = -intervals[1];
+    matrix[0][1] = intervals[0] + intervals[1];
+    matrix[0][2] = -intervals[0];
+    for row in 1..count - 1 {
+        let left = intervals[row - 1];
+        let right = intervals[row];
+        matrix[row][row - 1] = left;
+        matrix[row][row] = 2.0 * (left + right);
+        matrix[row][row + 1] = right;
+        matrix[row][count] = 6.0 * ((y[row + 1] - y[row]) / right - (y[row] - y[row - 1]) / left);
+    }
+    // Equal third derivatives in the penultimate and final pieces.
+    matrix[count - 1][count - 3] = intervals[count - 2];
+    matrix[count - 1][count - 2] = -(intervals[count - 3] + intervals[count - 2]);
+    matrix[count - 1][count - 1] = intervals[count - 3];
+
+    // The tables are small, so pivoted dense elimination is clearer and more
+    // robust than special-casing the two non-tridiagonal boundary rows.
+    for column in 0..count {
+        let pivot = (column..count)
+            .max_by(|&left, &right| {
+                matrix[left][column]
+                    .abs()
+                    .total_cmp(&matrix[right][column].abs())
+            })
+            .unwrap();
+        if matrix[pivot][column].abs() <= f64::EPSILON {
+            return Err(Error::Numerical("cubic-spline system is singular".into()));
+        }
+        matrix.swap(column, pivot);
+        let divisor = matrix[column][column];
+        for value in &mut matrix[column][column..=count] {
+            *value /= divisor;
+        }
+        let pivot_row = matrix[column].clone();
+        for (row, values) in matrix.iter_mut().enumerate() {
+            if row == column {
+                continue;
+            }
+            let factor = values[column];
+            if factor == 0.0 {
+                continue;
+            }
+            for (value, &pivot_value) in values[column..=count]
+                .iter_mut()
+                .zip(&pivot_row[column..=count])
+            {
+                *value -= factor * pivot_value;
+            }
+        }
+    }
+    let second_derivative: Vec<f64> = matrix.iter().map(|row| row[count]).collect();
+
+    Ok(x_new
+        .iter()
+        .map(|&query| {
+            if query <= x[0] {
+                return y[0];
+            }
+            if query >= x[count - 1] {
+                return y[count - 1];
+            }
+            let upper = x
+                .partition_point(|value| *value < query)
+                .clamp(1, count - 1);
+            if x[upper] == query {
+                return y[upper];
+            }
+            let lower = upper - 1;
+            let width = x[upper] - x[lower];
+            let left_weight = (x[upper] - query) / width;
+            let right_weight = (query - x[lower]) / width;
+            left_weight * y[lower]
+                + right_weight * y[upper]
+                + ((left_weight.powi(3) - left_weight) * second_derivative[lower]
+                    + (right_weight.powi(3) - right_weight) * second_derivative[upper])
+                    * width.powi(2)
+                    / 6.0
+        })
+        .collect())
+}
+
 pub(crate) fn hanning(n: usize) -> Vec<f64> {
     if n == 0 {
         return Vec::new();

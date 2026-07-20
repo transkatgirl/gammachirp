@@ -142,10 +142,14 @@ pub struct AsymCmpResponse {
 #[derive(Clone, Debug)]
 pub struct CgcResponse {
     pub fr1: Array1<f64>,
+    /// Magnitude of the implemented, peak-normalized cosine pGC FIR.
     pub pgc_frsp: Array2<f64>,
+    /// Magnitude of the implemented pGC FIR followed by the digital HP-AF.
     pub cgc_frsp: Array2<f64>,
     pub cgc_nrm_frsp: Array2<f64>,
+    /// Magnitude of the implemented four-section digital HP-AF.
     pub acf_frsp: Array2<f64>,
+    /// Ideal continuous asymmetric function, retained as theoretical metadata.
     pub asym_func: Array2<f64>,
     pub fp1: Array1<f64>,
     pub fr2: Array1<f64>,
@@ -154,6 +158,7 @@ pub struct CgcResponse {
     pub norm_fct_fp2: Array1<f64>,
     pub freq: Array1<f64>,
 }
+
 /// Compute coefficients for the four-section asymmetric compensation filterbank.
 pub fn make_asym_cmp_filters_v2(fs: f64, frs: &[f64], b: &[f64], c: &[f64]) -> Result<AcfCoef> {
     if !fs.is_finite()
@@ -317,6 +322,12 @@ pub fn asym_cmp_frsp_v2(
     })
 }
 
+/// Sample the realized digital compressive-gammachirp cascade.
+///
+/// Unlike [`gammachirp::gammachirp_frsp`], this response measures the finite
+/// cosine pGC FIR and the implemented four-section HP-AF. Peak metadata is the
+/// maximum on the requested frequency grid. Power-of-two grids use an FFT;
+/// other grid sizes retain exact DFT sampling and may be slower.
 pub fn cmprs_gc_frsp(
     fr1: &[f64],
     fs: f64,
@@ -333,12 +344,44 @@ pub fn cmprs_gc_frsp(
     let frat = broadcast(frat, fr1.len(), "frat")?;
     let b2 = broadcast(b2, fr1.len(), "b2")?;
     let c2 = broadcast(c2, fr1.len(), "c2")?;
-    let pgc = gammachirp::gammachirp_frsp(fr1, fs, n, &b1, &c1, 0.0, n_frq_rsl)?;
-    let (_, widths) = utils::freq2erb(fr1);
-    let fp1 = Array1::from_iter((0..fr1.len()).map(|i| fr1[i] + c1[i] * widths[i] * b1[i] / n));
+    if n_frq_rsl < 256 {
+        return Err(Error::InvalidParameter(
+            "compressive response requires at least 256 frequency bins".into(),
+        ));
+    }
+    let fft_len = n_frq_rsl.checked_mul(2).ok_or_else(|| {
+        Error::Unsupported("compressive-response transform length overflow".into())
+    })?;
+    let freq =
+        Array1::from_iter((0..n_frq_rsl).map(|bin| bin as f64 / n_frq_rsl as f64 * fs / 2.0));
+    let mut pgc_frsp = Array2::zeros((fr1.len(), n_frq_rsl));
+    let mut fp1 = Array1::zeros(fr1.len());
+    for ch in 0..fr1.len() {
+        let impulse = gammachirp::gammachirp(
+            &[fr1[ch]],
+            fs,
+            n,
+            b1[ch],
+            c1[ch],
+            0.0,
+            gammachirp::Carrier::Cosine,
+            gammachirp::Normalization::Peak,
+        )?;
+        fp1[ch] = impulse.fps[0];
+        let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
+        for (sample, &value) in impulse.gc.row(0).iter().take(impulse.len_gc[0]).enumerate() {
+            // Folding is exact at the DFT frequencies and supports unusually
+            // low requested resolutions without truncating the FIR.
+            spectrum[sample % fft_len].re += value;
+        }
+        dsp::transform(&mut spectrum, false);
+        for bin in 0..n_frq_rsl {
+            pgc_frsp[[ch, bin]] = spectrum[bin].norm();
+        }
+    }
     let fr2 = Array1::from_iter((0..fr1.len()).map(|i| frat[i] * fp1[i]));
     let acf = asym_cmp_frsp_v2(fr2.as_slice().unwrap(), fs, &b2, &c2, n_frq_rsl, 4)?;
-    let cgc_frsp = &pgc.amp_frsp * &acf.asym_func;
+    let cgc_frsp = &pgc_frsp * &acf.acf_frsp;
     let mut values = Array1::zeros(fr1.len());
     let mut peaks = Array1::zeros(fr1.len());
     let mut normalized = cgc_frsp.clone();
@@ -350,13 +393,13 @@ pub fn cmprs_gc_frsp(
             .max_by(|a, b| a.1.total_cmp(b.1))
             .unwrap();
         values[ch] = *value;
-        peaks[ch] = pgc.freq[index];
+        peaks[ch] = freq[index];
         normalized.row_mut(ch).mapv_inplace(|v| v / value);
     }
     let norm = values.mapv(|v| 1.0 / v);
     Ok(CgcResponse {
         fr1: Array1::from(fr1.to_vec()),
-        pgc_frsp: pgc.amp_frsp,
+        pgc_frsp,
         cgc_frsp,
         cgc_nrm_frsp: normalized,
         acf_frsp: acf.acf_frsp,
@@ -366,8 +409,98 @@ pub fn cmprs_gc_frsp(
         fp2: peaks,
         val_fp2: values,
         norm_fct_fp2: norm,
-        freq: pgc.freq,
+        freq,
     })
+}
+
+#[cfg(test)]
+mod response_tests {
+    use approx::assert_relative_eq;
+
+    use super::*;
+
+    #[test]
+    fn compressive_response_matches_the_implemented_fir_and_iir_cascade() {
+        let fs = 48_000.0;
+        let bins = 300; // Exercise the exact non-radix-2 DFT path.
+        let response = cmprs_gc_frsp(
+            &[1_000.0],
+            fs,
+            4.0,
+            &[1.81],
+            &[-2.96],
+            &[1.08],
+            &[2.17],
+            &[2.2],
+            bins,
+        )
+        .unwrap();
+        let impulse = gammachirp::gammachirp(
+            &[1_000.0],
+            fs,
+            4.0,
+            1.81,
+            -2.96,
+            0.0,
+            gammachirp::Carrier::Cosine,
+            gammachirp::Normalization::Peak,
+        )
+        .unwrap();
+        let coefficients =
+            make_asym_cmp_filters_v2(fs, &[response.fr2[0]], &[2.17], &[2.2]).unwrap();
+        for bin in [0, 25, 75, 150, 299] {
+            let omega = -2.0 * PI * bin as f64 / (2 * bins) as f64;
+            let z1 = Complex64::from_polar(1.0, omega);
+            let z2 = z1 * z1;
+            let passive = impulse
+                .gc
+                .row(0)
+                .iter()
+                .take(impulse.len_gc[0])
+                .enumerate()
+                .fold(Complex64::new(0.0, 0.0), |sum, (sample, &value)| {
+                    sum + value * z1.powu(sample as u32)
+                })
+                .norm();
+            let mut asymmetric = 1.0;
+            for section in 0..4 {
+                let numerator = coefficients.bz[[0, 0, section]]
+                    + coefficients.bz[[0, 1, section]] * z1
+                    + coefficients.bz[[0, 2, section]] * z2;
+                let denominator = coefficients.ap[[0, 0, section]]
+                    + coefficients.ap[[0, 1, section]] * z1
+                    + coefficients.ap[[0, 2, section]] * z2;
+                asymmetric *= (numerator / denominator).norm();
+            }
+            assert_relative_eq!(response.pgc_frsp[[0, bin]], passive, epsilon = 3e-11);
+            assert_relative_eq!(response.acf_frsp[[0, bin]], asymmetric, epsilon = 1e-10);
+            assert_relative_eq!(
+                response.cgc_frsp[[0, bin]],
+                passive * asymmetric,
+                epsilon = 2e-10
+            );
+        }
+        let (peak_bin, &peak) = response
+            .cgc_frsp
+            .row(0)
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap();
+        assert_eq!(response.fp2[0], response.freq[peak_bin]);
+        assert_eq!(response.val_fp2[0], peak);
+        assert_relative_eq!(response.norm_fct_fp2[0] * peak, 1.0, epsilon = 1e-14);
+        assert_relative_eq!(
+            response
+                .cgc_nrm_frsp
+                .row(0)
+                .iter()
+                .copied()
+                .fold(0.0, f64::max),
+            1.0,
+            epsilon = 1e-14
+        );
+    }
 }
 
 pub fn fr1_to_fp2(

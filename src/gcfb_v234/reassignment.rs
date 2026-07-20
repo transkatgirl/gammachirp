@@ -58,9 +58,9 @@ use num_complex::Complex64;
 
 use super::gammachirp::{self, Carrier, Normalization};
 use super::gcfb_v234::{
-    AcfCoef, ControlMode, GcParam, GcfbOutput, cmprs_gc_frsp, gcfb_v234,
-    gcfb_v234_with_bandwidth_peak_lock, make_asym_cmp_filters_v2, prepare_bandwidth_peak_grid,
-    scale_bandwidths,
+    AcfCoef, ControlMode, GcParam, GcfbOutput, gcfb_v234, gcfb_v234_with_bandwidth_peak_lock,
+    make_asym_cmp_filters_v2, prepare_bandwidth_peak_grid, prepare_passive_impulses,
+    realized_cascade_peaks, scale_bandwidths,
 };
 use super::utils;
 use crate::{Error, Result, dsp};
@@ -1251,25 +1251,21 @@ fn transport_frame_energy(
         (0..frames).map(|frame| frame as f64 * param.dyn_hpaf.len_shift as f64 / param.fs),
     );
     let (frequency_axis, _) = utils::freq2erb(param.fr1.as_slice().unwrap());
-    let static_response = cmprs_gc_frsp(
-        response.fr1.as_slice().unwrap(),
-        param.fs,
-        param.n,
-        response.b1_val.as_slice().unwrap(),
-        response.c1_val.as_slice().unwrap(),
-        &[param.lvl_est.frat],
-        &[param.lvl_est.b2],
-        (&param.hloss.fb_compression_health * param.lvl_est.c2)
-            .as_slice()
-            .unwrap(),
-        2048,
+    let passive_impulses = prepare_passive_impulses(param, response)?;
+    let static_peaks = realized_cascade_peaks(
+        param,
+        response,
+        &passive_impulses,
+        &Array1::from_elem(param.num_ch, param.lvl_est.frat),
+        &Array1::from_elem(param.num_ch, param.lvl_est.b2),
+        &(&param.hloss.fb_compression_health * param.lvl_est.c2),
     )?;
     let mut accounting = TransportAccounting::new((param.num_ch, frames), include_phase);
     let half = param.dyn_hpaf.len_frame / 2;
     for ch in 0..param.num_ch {
         for frame in 0..frames {
             let gain = response.gain_factor[ch]
-                * static_response.norm_fct_fp2[ch]
+                * static_peaks.normalization[ch]
                 * response.asym_func_gain[[ch, frame]];
             for offset in 0..param.dyn_hpaf.len_frame {
                 let source = frame as isize * param.dyn_hpaf.len_shift as isize + offset as isize
@@ -1432,7 +1428,8 @@ mod tests {
 
     use super::*;
     use crate::gcfb_v234::gcfb_v234::{
-        discrete_cascade_peak_bins, fp2_to_fr1, fr1_to_fp2, initial_asymmetric_ratio_and_centers,
+        cmprs_gc_frsp, discrete_cascade_peak_bins, fp2_to_fr1, fr1_to_fp2,
+        initial_asymmetric_ratio_and_centers,
     };
     use crate::gcfb_v234::{DynHpaf, GainReference, GcParam};
 
@@ -1860,14 +1857,25 @@ mod tests {
     }
 
     #[test]
-    fn gain_reference_variants_are_supported() {
-        let signal = vec![1.0; 64];
-        let parameters = GcParam {
+    fn gain_reference_changes_energy_but_not_reassignment_coordinates() {
+        let signal: Vec<f64> = (0..128)
+            .map(|sample| (2.0 * PI * 700.0 * sample as f64 / 8_000.0).cos())
+            .collect();
+        let reference_parameters = GcParam {
             gain_ref: GainReference::Db(50.0),
             ..compact_frame_parameters()
         };
-        let (_, result) = gcfb_v234_with_reassignment(&signal, parameters).unwrap();
-        assert!(result.source_energy.is_finite());
+        let normalized_parameters = GcParam {
+            gain_ref: GainReference::NormalizeIoFunction,
+            ..compact_frame_parameters()
+        };
+        let (_, reference) = gcfb_v234_with_reassignment(&signal, reference_parameters).unwrap();
+        let (_, normalized) = gcfb_v234_with_reassignment(&signal, normalized_parameters).unwrap();
+        assert_eq!(reference.t_hat, normalized.t_hat);
+        assert_eq!(reference.f_hat, normalized.f_hat);
+        assert_eq!(reference.validity_mask, normalized.validity_mask);
+        assert!(reference.source_energy.is_finite() && normalized.source_energy.is_finite());
+        assert_ne!(reference.energy_map, normalized.energy_map);
     }
 
     #[test]
@@ -2194,7 +2202,7 @@ mod tests {
             "narrow default produced an ERB ratio of {narrow_ratio}"
         );
         assert!(
-            (1.17..=1.20).contains(&wide_ratio),
+            (1.15..=1.18).contains(&wide_ratio),
             "wide default produced an ERB ratio of {wide_ratio}"
         );
     }

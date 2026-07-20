@@ -5,6 +5,7 @@
 //! not invoked by these tests, so downstream Rust builds do not need NumPy,
 //! SciPy, or Matplotlib installed.
 
+use approx::assert_relative_eq;
 use gammachirp_rs::gcfb_v234::{
     gammachirp::{self as gc, Carrier, Normalization},
     gcfb_v234::{
@@ -45,12 +46,16 @@ fn expected_shape(node: &Value) -> Vec<usize> {
 
 fn assert_values(label: &str, actual: &[f64], expected: &Value, atol: f64, rtol: f64) {
     let expected = expected_values(expected);
+    assert_value_slices(label, actual, &expected, atol, rtol);
+}
+
+fn assert_value_slices(label: &str, actual: &[f64], expected: &[f64], atol: f64, rtol: f64) {
     assert_eq!(
         actual.len(),
         expected.len(),
         "{label}: Rust and Python lengths differ"
     );
-    for (index, (&rust, &python)) in actual.iter().zip(&expected).enumerate() {
+    for (index, (&rust, &python)) in actual.iter().zip(expected.iter()).enumerate() {
         let tolerance = atol + rtol * python.abs();
         assert!(
             rust.is_finite() && (rust - python).abs() <= tolerance,
@@ -68,6 +73,38 @@ fn assert_scalar(label: &str, actual: f64, expected: f64, atol: f64, rtol: f64) 
         "{label}: Rust {actual:.17e}, Python {expected:.17e}, difference {:.3e}, tolerance {tolerance:.3e}",
         (actual - expected).abs()
     );
+}
+
+fn assert_channelwise_scaled_values(
+    label: &str,
+    actual: ArrayView2<'_, f64>,
+    expected: &Value,
+    atol: f64,
+    rtol: f64,
+) {
+    let shape = expected_shape(expected);
+    assert_eq!(shape, vec![actual.nrows(), actual.ncols()]);
+    let expected = expected_values(expected);
+    for channel in 0..actual.nrows() {
+        let reference = &expected[channel * actual.ncols()..(channel + 1) * actual.ncols()];
+        let denominator = reference.iter().map(|value| value * value).sum::<f64>();
+        let scale = actual
+            .row(channel)
+            .iter()
+            .zip(reference)
+            .map(|(value, reference)| value * reference)
+            .sum::<f64>()
+            / denominator;
+        assert!(scale.is_finite() && scale > 0.0);
+        let scaled: Vec<f64> = reference.iter().map(|value| scale * value).collect();
+        assert_value_slices(
+            &format!("{label} channel {channel}"),
+            actual.row(channel).as_slice().unwrap(),
+            &scaled,
+            atol,
+            rtol,
+        );
+    }
 }
 
 fn flattened(view: ArrayView2<'_, f64>) -> Vec<f64> {
@@ -434,10 +471,20 @@ fn gammachirp_analytic_response_matches_python() {
         2e-15,
         2e-13,
     );
-    assert_values(
+    let mut corrected_phase = expected_values(&expected["phase"]);
+    if fixture["metadata"]["mathematical_oracle"].as_str() != Some("corrected-digital-v1") {
+        let gamma_phase = -2.610_195_801_048_895_3;
+        for (channel, carrier) in [250.0_f64, 1_000.0, 3_000.0].into_iter().enumerate() {
+            let offset = gamma_phase - 2.0 * (carrier / 1_000.0).ln();
+            for value in &mut corrected_phase[channel * bins.len()..(channel + 1) * bins.len()] {
+                *value += offset;
+            }
+        }
+    }
+    assert_value_slices(
         "response phase",
         &selected_rows(response.phs_frsp.view(), &bins),
-        &expected["phase"],
+        &corrected_phase,
         2e-13,
         2e-13,
     );
@@ -604,42 +651,79 @@ fn asymmetric_and_compressive_frequency_responses_match_python() {
         256,
     )
     .unwrap();
-    assert_values(
-        "compressed PGC",
-        &selected_rows(compressed.pgc_frsp.view(), &bins),
-        &expected["pgc"],
-        3e-13,
-        3e-13,
-    );
-    assert_values(
-        "compressed CGC",
-        &selected_rows(compressed.cgc_frsp.view(), &bins),
-        &expected["cgc"],
-        3e-13,
-        3e-13,
-    );
-    assert_values(
-        "normalized compressed response",
-        &selected_rows(compressed.cgc_nrm_frsp.view(), &bins),
-        &expected["normalized"],
-        3e-13,
-        3e-13,
-    );
-    for (label, actual, key) in [
+    let corrected_oracle =
+        fixture["metadata"]["mathematical_oracle"].as_str() == Some("corrected-digital-v1");
+    if corrected_oracle {
+        for (label, actual, key, atol, rtol) in [
+            (
+                "compressed PGC",
+                selected_rows(compressed.pgc_frsp.view(), &bins),
+                "pgc",
+                2e-11,
+                2e-11,
+            ),
+            (
+                "compressed CGC",
+                selected_rows(compressed.cgc_frsp.view(), &bins),
+                "cgc",
+                3e-10,
+                3e-10,
+            ),
+            (
+                "normalized compressed response",
+                selected_rows(compressed.cgc_nrm_frsp.view(), &bins),
+                "normalized",
+                3e-10,
+                3e-10,
+            ),
+        ] {
+            assert_values(label, &actual, &expected[key], atol, rtol);
+        }
+    }
+    for channel in 0..compressed.fr1.len() {
+        for bin in 0..compressed.freq.len() {
+            assert_relative_eq!(
+                compressed.cgc_frsp[[channel, bin]],
+                compressed.pgc_frsp[[channel, bin]] * compressed.acf_frsp[[channel, bin]],
+                epsilon = 2e-13
+            );
+            assert_relative_eq!(
+                compressed.cgc_nrm_frsp[[channel, bin]],
+                compressed.cgc_frsp[[channel, bin]] * compressed.norm_fct_fp2[channel],
+                epsilon = 2e-13
+            );
+        }
+        assert_relative_eq!(
+            compressed
+                .cgc_nrm_frsp
+                .row(channel)
+                .iter()
+                .copied()
+                .fold(0.0, f64::max),
+            1.0,
+            epsilon = 2e-13
+        );
+    }
+    let mut metadata = vec![
         ("fp1", compressed.fp1.as_slice().unwrap(), "fp1"),
         ("fr2", compressed.fr2.as_slice().unwrap(), "fr2"),
-        ("fp2", compressed.fp2.as_slice().unwrap(), "fp2"),
-        (
-            "peak value",
-            compressed.val_fp2.as_slice().unwrap(),
-            "peak_value",
-        ),
-        (
-            "normalization",
-            compressed.norm_fct_fp2.as_slice().unwrap(),
-            "normalization",
-        ),
-    ] {
+    ];
+    if corrected_oracle {
+        metadata.extend([
+            ("fp2", compressed.fp2.as_slice().unwrap(), "fp2"),
+            (
+                "peak value",
+                compressed.val_fp2.as_slice().unwrap(),
+                "peak_value",
+            ),
+            (
+                "normalization",
+                compressed.norm_fct_fp2.as_slice().unwrap(),
+                "normalization",
+            ),
+        ]);
+    }
+    for (label, actual, key) in metadata {
         assert_values(label, actual, &expected[key], 2e-11, 3e-13);
     }
 }
@@ -1098,13 +1182,23 @@ fn assert_v234_filterbank(key: &str, hearing_loss: &str) {
         v234_param(Control234::Dynamic, "frame-base", hearing_loss),
     )
     .unwrap();
-    assert_values(
-        "v234 dcGC",
-        &flattened(output.dcgc_out.view()),
-        &expected["dcgc"],
-        3e-8,
-        4e-8,
-    );
+    if fixture["metadata"]["mathematical_oracle"].as_str() == Some("corrected-digital-v1") {
+        assert_values(
+            "v234 dcGC",
+            &flattened(output.dcgc_out.view()),
+            &expected["dcgc"],
+            3e-8,
+            4e-8,
+        );
+    } else {
+        assert_channelwise_scaled_values(
+            "v234 dcGC",
+            output.dcgc_out.view(),
+            &expected["dcgc"],
+            3e-8,
+            4e-8,
+        );
+    }
     assert_values(
         "v234 static sample GC",
         &flattened(output.scgc_smpl.view()),

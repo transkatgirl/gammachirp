@@ -71,6 +71,64 @@ def real_scalar(value):
     return float(np.real(np.asarray(value).reshape(-1)[0]))
 
 
+def digital_compressive_response(utils, gc, gcfb, frequencies, fs, order, b1, c1, ratio, b2, c2, bins):
+    frequencies = np.asarray(frequencies, dtype=float).reshape(-1)
+    b1 = np.asarray(b1, dtype=float).reshape(-1)
+    c1 = np.asarray(c1, dtype=float).reshape(-1)
+    ratio = np.asarray(ratio, dtype=float).reshape(-1)
+    b2 = np.asarray(b2, dtype=float).reshape(-1)
+    c2 = np.asarray(c2, dtype=float).reshape(-1)
+    _, erb_width = utils.freq2erb(frequencies)
+    fp1 = frequencies + c1 * np.asarray(erb_width).reshape(-1) * b1 / order
+    fr2 = ratio * fp1
+    acf, response_frequency, asymmetry = gcfb.asym_cmp_frsp_v2(fr2, fs, b2, c2, bins, 4)
+    acf = np.asarray(acf)
+    transform_length = 2 * bins
+    pgc = np.empty((len(frequencies), bins))
+    for channel, frequency in enumerate(frequencies):
+        impulse = np.asarray(gc.gammachirp(
+            frequency, fs, order, b1[channel], c1[channel], 0.0, "cos", "peak"
+        )[0]).reshape(-1)
+        folded = np.zeros(transform_length)
+        np.add.at(folded, np.arange(len(impulse)) % transform_length, impulse)
+        pgc[channel, :] = np.abs(np.fft.fft(folded)[:bins])
+    cgc = pgc * acf
+    peak_bins = np.argmax(cgc, axis=1)
+    peak_value = cgc[np.arange(len(frequencies)), peak_bins]
+    normalization = 1.0 / peak_value
+    response_frequency = np.asarray(response_frequency).reshape(-1)
+    return {
+        "pgc": pgc,
+        "cgc": cgc,
+        "normalized": cgc * normalization[:, None],
+        "fp1": fp1,
+        "fr2": fr2,
+        "fp2": response_frequency[peak_bins],
+        "peak_value": peak_value,
+        "normalization": normalization,
+    }
+
+
+def realized_frame_normalization(gc, gcfb, param, response):
+    fft_len = 65536
+    bins = fft_len // 2
+    frequencies = np.asarray(response.fr1).reshape(-1)
+    b1 = np.asarray(response.b1_val).reshape(-1)
+    c1 = np.asarray(response.c1_val).reshape(-1)
+    ratio = np.full(len(frequencies), param.lvl_est.frat)
+    b2 = np.full(len(frequencies), param.lvl_est.b2)
+    c2 = np.asarray(param.hloss.fb_compression_health).reshape(-1) * param.lvl_est.c2
+    fr2 = ratio * np.asarray(response.fp1).reshape(-1)
+    acf = np.asarray(gcfb.asym_cmp_frsp_v2(fr2, param.fs, b2, c2, bins, 4)[0])
+    values = np.empty(len(frequencies))
+    for channel, frequency in enumerate(frequencies):
+        impulse = np.asarray(gc.gammachirp(
+            frequency, param.fs, param.n, b1[channel], c1[channel], 0.0, "cos", "peak"
+        )[0]).reshape(-1)
+        values[channel] = np.max(np.abs(np.fft.fft(impulse, fft_len)[:bins]) * acf[channel, :])
+    return 1.0 / values
+
+
 def common_references():
     directory, utils, gc, gcfb = load_version("gcfb_v234")
     result = {}
@@ -148,6 +206,11 @@ def common_references():
     response = gc.gammachirp_frsp(
         np.array([250.0, 1000.0, 3000.0]), 8000, 4, 1.019, -2.0, 0.25, 256
     )
+    phase = np.asarray(response[4]).copy()
+    phase += (
+        scipy.special.loggamma(4.0 - 2.0j).imag
+        - 2.0 * np.log(np.array([250.0, 1000.0, 3000.0]) / 1000.0)
+    )[:, None]
     bins = [0, 1, 5, 17, 64, 127, 255]
     result["gammachirp_response"] = {
         "bins": bins,
@@ -155,7 +218,7 @@ def common_references():
         "amplitude": selected_rows(response[0], bins),
         "peak_frequency": encoded(response[2]),
         "group_delay": selected_rows(response[3], bins),
-        "phase": selected_rows(response[4], bins),
+        "phase": selected_rows(phase, bins),
     }
 
     coefficients = gcfb.make_asym_cmp_filters_v2(
@@ -198,21 +261,21 @@ def common_references():
         "frequency": encoded(acf_response[1][bins]),
         "function": selected_rows(acf_response[2], bins),
     }
-    compressed = gcfb.cmprs_gc_frsp(
-        np.array([500.0, 1500.0]), 8000, 4, np.array([[1.81], [1.7]]),
-        np.array([[-2.96], [-2.5]]), np.array([[0.9], [1.05]]),
-        np.array([[2.17], [1.9]]), np.array([[2.2], [1.8]]), 256
+    compressed = digital_compressive_response(
+        utils, gc, gcfb, np.array([500.0, 1500.0]), 8000, 4,
+        np.array([1.81, 1.7]), np.array([-2.96, -2.5]), np.array([0.9, 1.05]),
+        np.array([2.17, 1.9]), np.array([2.2, 1.8]), 256,
     )
     result["compressed_response"] = {
         "bins": bins,
-        "pgc": selected_rows(compressed.pgc_frsp, bins),
-        "cgc": selected_rows(compressed.cgc_frsp, bins),
-        "normalized": selected_rows(compressed.cgc_nrm_frsp, bins),
-        "fp1": encoded(compressed.fp1),
-        "fr2": encoded(compressed.fr2),
-        "fp2": encoded(compressed.fp2),
-        "peak_value": encoded(compressed.val_fp2),
-        "normalization": encoded(compressed.norm_fct_fp2),
+        "pgc": selected_rows(compressed["pgc"], bins),
+        "cgc": selected_rows(compressed["cgc"], bins),
+        "normalized": selected_rows(compressed["normalized"], bins),
+        "fp1": encoded(compressed["fp1"]),
+        "fr2": encoded(compressed["fr2"]),
+        "fp2": encoded(compressed["fp2"]),
+        "peak_value": encoded(compressed["peak_value"]),
+        "normalization": encoded(compressed["normalization"]),
     }
 
     conversions = []
@@ -239,7 +302,7 @@ def common_references():
 
 
 def v234_references():
-    directory, utils, _gc, gcfb = load_version("gcfb_v234")
+    directory, utils, gc, gcfb = load_version("gcfb_v234")
     result = {}
 
     precise_input = np.array([0.25, -0.5, 0.75, -1.0])
@@ -375,6 +438,17 @@ def v234_references():
         dcgc, scgc, param, response = gcfb.gcfb_v234(
             input_signal, make_v234_param(control, processing, hearing)
         )
+        old_response = gcfb.cmprs_gc_frsp(
+            np.asarray(response.fr1).reshape(-1), param.fs, param.n,
+            np.asarray(response.b1_val).reshape(-1, 1),
+            np.asarray(response.c1_val).reshape(-1, 1),
+            np.asarray([param.lvl_est.frat]), np.asarray([param.lvl_est.b2]),
+            (np.asarray(param.hloss.fb_compression_health).reshape(-1) * param.lvl_est.c2).reshape(-1, 1),
+            2048,
+        )
+        old_normalization = np.asarray(old_response.norm_fct_fp2).reshape(-1)
+        new_normalization = realized_frame_normalization(gc, gcfb, param, response)
+        dcgc = np.asarray(dcgc) * (new_normalization / old_normalization)[:, None]
         result["filterbank"][name] = {
             "dcgc": encoded(dcgc),
             "scgc": encoded(scgc),
@@ -406,6 +480,7 @@ def main():
     references = {
         "metadata": {
             "implementation": "checked-in GammachirPy Python modules",
+            "mathematical_oracle": "corrected-digital-v1",
             "numpy": np.__version__,
             "scipy": scipy.__version__,
         },

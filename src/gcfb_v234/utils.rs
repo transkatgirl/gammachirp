@@ -4,6 +4,7 @@ use ndarray::{Array1, Array2};
 
 use crate::{Error, Result, dsp};
 
+use super::base_utils::frequency_sampling_linear_phase_fir;
 pub use super::base_utils::{
     FrequencyScale, audioread, erb2freq, fftfilt, freq2erb, freq2mel, iscolumn, isrow, mel2freq,
     nextpow2, out_mid_crct, out_mid_crct_filt, rceps, rms, set_frame4time_sequence, taper_window,
@@ -332,29 +333,19 @@ pub fn mk_filter_field2cochlea(
     let bins = transfer.freq.len();
     let fft_len = bins * 2;
     let count = super::base_utils::correction_filter_coefficient_count(fs, fft_len)?;
-    let mut spectrum = vec![num_complex::Complex64::new(0., 0.); fft_len];
     let mags: Vec<f64> = transfer
         .field2cochlea_db
         .iter()
-        .map(|db| 10_f64.powf(db / 20.))
+        .map(|db| {
+            let magnitude = 10_f64.powf(db / 20.);
+            if forward {
+                magnitude
+            } else {
+                1.0 / magnitude.max(0.1)
+            }
+        })
         .collect();
-    for i in 0..bins {
-        let m = if forward {
-            mags[i]
-        } else {
-            1.0 / mags[i].max(0.1)
-        };
-        spectrum[i].re = m;
-        if i > 0 {
-            spectrum[fft_len - i].re = m;
-        }
-    }
-    crate::dsp::fft(&mut spectrum, true);
-    let center = count / 2;
-    let win = crate::dsp::hanning(count);
-    let linear: Vec<f64> = (0..count)
-        .map(|i| spectrum[(fft_len + i - center) % fft_len].re * win[i])
-        .collect();
+    let linear = frequency_sampling_linear_phase_fir(&mags, fft_len, count)?;
     let (_, minimum) = rceps(&linear)?;
     param.name_filter = format!("[{kind}] minimum-phase FIR");
     Ok((minimum.slice(ndarray::s![..count / 2]).to_owned(), param))

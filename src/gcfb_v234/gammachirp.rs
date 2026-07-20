@@ -35,11 +35,40 @@ pub struct Gammachirp {
 
 #[derive(Clone, Debug)]
 pub struct FrequencyResponse {
+    /// Analytic continuous-time magnitude, normalized at the theoretical peak.
     pub amp_frsp: Array2<f64>,
     pub freq: Array1<f64>,
     pub f_peak: Array1<f64>,
     pub grp_dly: Array2<f64>,
+    /// Unwrapped analytic phase for the same carrier convention as
+    /// [`gammachirp`], including `arg Γ(n + jc)` and the 1 kHz phase reference.
     pub phs_frsp: Array2<f64>,
+}
+
+// Lanczos coefficients for g = 7.  GCFB only evaluates Γ(n + jc) with n > 0,
+// so the reflection branch (and its attendant phase-cut bookkeeping) is not
+// needed here.
+const LANCZOS_COEFFICIENTS: [f64; 9] = [
+    0.999_999_999_999_809_9,
+    676.520_368_121_885_1,
+    -1_259.139_216_722_402_8,
+    771.323_428_777_653_1,
+    -176.615_029_162_140_6,
+    12.507_343_278_686_905,
+    -0.138_571_095_265_720_12,
+    9.984_369_578_019_572e-6,
+    1.505_632_735_149_311_6e-7,
+];
+
+fn complex_log_gamma_positive_real(z: Complex64) -> Complex64 {
+    debug_assert!(z.re > 0.0);
+    let shifted = z - 1.0;
+    let mut series = Complex64::new(LANCZOS_COEFFICIENTS[0], 0.0);
+    for (index, &coefficient) in LANCZOS_COEFFICIENTS.iter().enumerate().skip(1) {
+        series += coefficient / (shifted + index as f64);
+    }
+    let t = shifted + 7.5;
+    Complex64::new(0.5 * (2.0 * PI).ln(), 0.0) + (shifted + 0.5) * t.ln() - t + series.ln()
 }
 
 /// Generate passive gammachirp impulse responses for `frs`.
@@ -134,7 +163,13 @@ pub fn gammachirp(
     })
 }
 
-/// Analytic frequency response of passive gammachirp filters.
+/// Analytic continuous-time frequency response of passive gammachirp filters.
+///
+/// Magnitude is normalized at the theoretical peak. Phase includes all
+/// frequency-independent constants used by [`gammachirp`], so it can be
+/// compared modulo 2π with the generated cosine filter's positive-frequency
+/// response. The finite sampled FIR can still differ slightly in magnitude and
+/// phase because it is truncated and discretized.
 pub fn gammachirp_frsp(
     frs: &[f64],
     sr: f64,
@@ -178,6 +213,9 @@ pub fn gammachirp_frsp(
     for ch in 0..frs.len() {
         let bh = b[ch] * erbw[ch];
         let cn = c[ch] / order_g;
+        let phase_constant = complex_log_gamma_positive_real(Complex64::new(order_g, c[ch])).im
+            + c[ch] * (frs[ch] / 1000.0).ln()
+            + phase;
         peaks[ch] = frs[ch] + b[ch] * erbw[ch] * c[ch] / order_g;
         for (bin, &frequency) in freq.iter().enumerate() {
             let fd = frequency - frs[ch];
@@ -186,7 +224,7 @@ pub fn gammachirp_frsp(
             delay[[ch, bin]] = (order_g * bh + c[ch] * fd) / (bh * bh + fd * fd) / (2.0 * PI);
             response_phase[[ch, bin]] = -order_g * (fd / bh).atan()
                 - c[ch] / 2.0 * ((2.0 * PI * bh).powi(2) + (2.0 * PI * fd).powi(2)).ln()
-                + phase;
+                + phase_constant;
         }
     }
     Ok(FrequencyResponse {
@@ -220,6 +258,81 @@ mod tests {
     use approx::assert_relative_eq;
 
     use super::*;
+
+    fn wrapped_phase_difference(left: f64, right: f64) -> f64 {
+        (left - right + PI).rem_euclid(2.0 * PI) - PI
+    }
+
+    #[test]
+    fn complex_log_gamma_matches_independent_quadrature_references() {
+        // Frozen from direct numerical integration of
+        // Γ(z) = integral_0^infinity t^(z-1) exp(-t) dt.  The integral fixes
+        // the phase modulo 2π; the Lanczos logarithm retains its continuous
+        // branch when that phase crosses the principal cut.
+        let cases = [
+            (
+                Complex64::new(4.0, -2.0),
+                1.250_835_619_356_806_6,
+                -2.610_195_801_048_895_3,
+            ),
+            (
+                Complex64::new(4.0, -2.96),
+                0.662_943_947_704_853_2,
+                2.273_624_343_701_705_6,
+            ),
+            (
+                Complex64::new(3.5, 1.25),
+                0.949_607_693_146_144_1,
+                1.412_559_376_552_109_6,
+            ),
+        ];
+        for (z, expected_real, expected_imag) in cases {
+            let actual = complex_log_gamma_positive_real(z);
+            assert_relative_eq!(actual.re, expected_real, epsilon = 2e-13);
+            assert!(wrapped_phase_difference(actual.im, expected_imag).abs() < 2e-13);
+        }
+    }
+
+    #[test]
+    fn analytic_phase_matches_generated_cosine_gammachirp_near_its_main_lobe() {
+        let fs = 48_000.0;
+        let fr = 1_000.0;
+        let b = 1.019;
+        let c = -2.0;
+        let generated = gammachirp(
+            &[fr],
+            fs,
+            4.0,
+            b,
+            c,
+            0.37,
+            Carrier::Cosine,
+            Normalization::None,
+        )
+        .unwrap();
+        let analytic = gammachirp_frsp(&[fr], fs, 4.0, &[b], &[c], 0.37, 4096).unwrap();
+        let peak_bin = analytic
+            .amp_frsp
+            .row(0)
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0;
+        let frequency = analytic.freq[peak_bin];
+        let discrete = generated
+            .gc
+            .row(0)
+            .iter()
+            .take(generated.len_gc[0])
+            .enumerate()
+            .fold(Complex64::new(0.0, 0.0), |sum, (sample, &value)| {
+                sum + Complex64::from_polar(value, -2.0 * PI * frequency * sample as f64 / fs)
+            });
+        assert!(
+            wrapped_phase_difference(discrete.arg(), analytic.phs_frsp[[0, peak_bin]]).abs() < 2e-3
+        );
+    }
 
     #[test]
     fn peak_frequency_matches_reference_formula() {

@@ -7,9 +7,9 @@ use ndarray::{Array1, Array2};
 
 use super::gcfb_v234::{
     AcfCoef, AcfStatus, BandwidthPeakGrid, BandwidthPeakLock, ControlMode, GcParam, GcResp, HLoss,
-    asym_func_in_out_scalar, cmprs_gc_frsp, initial_asymmetric_ratio_and_centers,
-    make_asym_cmp_filters_v2, prepare_bandwidth_peak_lock, prepare_input_correction_fir,
-    prepare_passive_impulses, prepare_time_invariant_response, set_param,
+    asym_func_in_out_scalar, initial_asymmetric_ratio_and_centers, make_asym_cmp_filters_v2,
+    prepare_bandwidth_peak_lock, prepare_input_correction_fir, prepare_passive_impulses,
+    prepare_time_invariant_response, realized_cascade_peaks, set_param,
     set_param_with_preserved_hearing_loss,
 };
 use crate::{Error, Result, dsp};
@@ -137,8 +137,9 @@ impl GcfbStream {
             ));
         }
         let correction = dsp::CausalFir::new(prepare_input_correction_fir(&param)?);
-        let passive = dsp::CausalFirBank::new(prepare_passive_impulses(&param, &response)?);
-        let fixed_coefficients = prepare_time_invariant_response(&param, &mut response)?;
+        let passive_impulses = prepare_passive_impulses(&param, &response)?;
+        let fixed_coefficients =
+            prepare_time_invariant_response(&param, &mut response, &passive_impulses)?;
         let fixed_status = AcfStatus::new(&fixed_coefficients);
 
         let sample_dynamic =
@@ -164,22 +165,20 @@ impl GcfbStream {
         let frame_normalization = if param.ctrl == ControlMode::Dynamic && frame_mode {
             let c2 = &param.hloss.fb_compression_health * param.lvl_est.c2;
             Some(
-                cmprs_gc_frsp(
-                    response.fr1.as_slice().unwrap(),
-                    param.fs,
-                    param.n,
-                    response.b1_val.as_slice().unwrap(),
-                    response.c1_val.as_slice().unwrap(),
-                    &[param.lvl_est.frat],
-                    &[param.lvl_est.b2],
-                    c2.as_slice().unwrap(),
-                    2048,
+                realized_cascade_peaks(
+                    &param,
+                    &response,
+                    &passive_impulses,
+                    &Array1::from_elem(param.num_ch, param.lvl_est.frat),
+                    &Array1::from_elem(param.num_ch, param.lvl_est.b2),
+                    &c2,
                 )?
-                .norm_fct_fp2,
+                .normalization,
             )
         } else {
             None
         };
+        let passive = dsp::CausalFirBank::new(passive_impulses);
         let channels = param.num_ch;
         Ok(Self {
             param,

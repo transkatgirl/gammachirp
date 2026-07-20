@@ -199,6 +199,79 @@ struct PassiveSpectrum {
     power: Vec<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct RealizedCascadePeaks {
+    pub(super) frequency_hz: Array1<f64>,
+    pub(super) value: Array1<f64>,
+    pub(super) normalization: Array1<f64>,
+}
+
+pub(super) fn realized_cascade_peaks(
+    param: &GcParam,
+    response: &GcResp,
+    passive_impulses: &[Vec<f64>],
+    ratios: &Array1<f64>,
+    b2: &Array1<f64>,
+    c2: &Array1<f64>,
+) -> Result<RealizedCascadePeaks> {
+    let channels = param.num_ch;
+    if passive_impulses.len() != channels
+        || ratios.len() != channels
+        || b2.len() != channels
+        || c2.len() != channels
+        || response.fr1.len() != channels
+        || response.fp1.len() != channels
+        || response.b1_val.len() != channels
+        || response.c1_val.len() != channels
+    {
+        return Err(Error::InvalidParameter(
+            "realized cascade normalization requires one passive impulse and parameter set per channel"
+                .into(),
+        ));
+    }
+    let fft_len = MINIMUM_PEAK_GRID_FFT_LEN;
+    let mut frequency_hz = Array1::zeros(channels);
+    let mut value = Array1::zeros(channels);
+    for ch in 0..channels {
+        let center = ratios[ch] * response.fp1[ch];
+        let coefficients = make_asym_cmp_filters_v2(param.fs, &[center], &[b2[ch]], &[c2[ch]])?;
+        let analytic_peak = fr1_to_fp2(
+            param.n,
+            response.b1_val[ch],
+            response.c1_val[ch],
+            b2[ch],
+            c2[ch],
+            ratios[ch],
+            response.fr1[ch],
+        )?
+        .0;
+        let peak_bin = peak_bin_from_impulse(
+            &passive_impulses[ch],
+            &coefficients,
+            analytic_peak,
+            None,
+            param.fs,
+            fft_len,
+        )?;
+        let passive_power = passive_power_at_bin(&passive_impulses[ch], peak_bin, fft_len);
+        let peak_value =
+            (passive_power * hpaf_power_at_bin(&coefficients, peak_bin, fft_len)).sqrt();
+        if !peak_value.is_finite() || peak_value <= 0.0 {
+            return Err(Error::Numerical(
+                "implemented compressive-gammachirp peak is not finite and positive".into(),
+            ));
+        }
+        frequency_hz[ch] = peak_bin as f64 * param.fs / fft_len as f64;
+        value[ch] = peak_value;
+    }
+    let normalization = value.mapv(|peak| 1.0 / peak);
+    Ok(RealizedCascadePeaks {
+        frequency_hz,
+        value,
+        normalization,
+    })
+}
+
 /// Shared discrete-frequency definition and baseline pGC spectra for one
 /// bandwidth-consensus ensemble.
 #[derive(Clone, Debug)]
@@ -1055,20 +1128,24 @@ fn peak_bin_from_impulse(
             let passive_power = if let Some(&power) = passive_cache.get(&bin) {
                 power
             } else {
-                let omega = 2.0 * std::f64::consts::PI * bin as f64 / fft_len as f64;
-                let response = impulse.iter().enumerate().fold(
-                    Complex64::new(0.0, 0.0),
-                    |sum, (sample, &value)| {
-                        sum + Complex64::from_polar(value, -omega * sample as f64)
-                    },
-                );
-                let power = response.norm_sqr();
+                let power = passive_power_at_bin(impulse, bin, fft_len);
                 passive_cache.insert(bin, power);
                 power
             };
             Ok(passive_power * hpaf_power_at_bin(coefficients, bin, fft_len))
         },
     )
+}
+
+fn passive_power_at_bin(impulse: &[f64], bin: usize, fft_len: usize) -> f64 {
+    let omega = 2.0 * std::f64::consts::PI * bin as f64 / fft_len as f64;
+    impulse
+        .iter()
+        .enumerate()
+        .fold(Complex64::new(0.0, 0.0), |sum, (sample, &value)| {
+            sum + Complex64::from_polar(value, -omega * sample as f64)
+        })
+        .norm_sqr()
 }
 
 fn hpaf_power_at_bin(coefficients: &AcfCoef, bin: usize, fft_len: usize) -> f64 {
@@ -1299,6 +1376,7 @@ pub(super) fn prepare_passive_impulses(
 pub(super) fn prepare_time_invariant_response(
     param: &GcParam,
     response: &mut GcResp,
+    passive_impulses: &[Vec<f64>],
 ) -> Result<AcfCoef> {
     let channels = param.num_ch;
     let (initial_ratios, fixed_centers) = initial_asymmetric_ratio_and_centers(param, response);
@@ -1348,7 +1426,7 @@ pub(super) fn prepare_time_invariant_response(
             let ratios = Array1::from_iter((0..channels).map(|ch| {
                 response.frat0_pc[ch] + response.frat1_val[ch] * (db - response.pc_hpaf[ch])
             }));
-            let reference = cmprs_gc_frsp(
+            let mut reference = cmprs_gc_frsp(
                 response.fr1.as_slice().unwrap(),
                 param.fs,
                 param.n,
@@ -1359,6 +1437,24 @@ pub(super) fn prepare_time_invariant_response(
                 response.c2_val.as_slice().unwrap(),
                 1024,
             )?;
+            let peaks = realized_cascade_peaks(
+                param,
+                response,
+                passive_impulses,
+                &ratios,
+                &response.b2_val,
+                &response.c2_val,
+            )?;
+            reference.fp2 = peaks.frequency_hz;
+            reference.val_fp2 = peaks.value;
+            reference.norm_fct_fp2 = peaks.normalization;
+            for ch in 0..channels {
+                let peak = reference.val_fp2[ch];
+                reference
+                    .cgc_nrm_frsp
+                    .row_mut(ch)
+                    .assign(&reference.cgc_frsp.row(ch).mapv(|value| value / peak));
+            }
             response.gain_factor = reference
                 .norm_fct_fp2
                 .mapv(|value| 10_f64.powf(param.gain_cmpnst_db / 20.0) * value);
@@ -1714,6 +1810,16 @@ pub fn gcfb_v23_frame_base(
     param: &GcParam,
     response: &mut GcResp,
 ) -> Result<Array2<f64>> {
+    gcfb_v23_frame_base_internal(pgc, scgc, param, response, None)
+}
+
+fn gcfb_v23_frame_base_internal(
+    pgc: &Array2<f64>,
+    scgc: &Array2<f64>,
+    param: &GcParam,
+    response: &mut GcResp,
+    prepared_passive_impulses: Option<&[Vec<f64>]>,
+) -> Result<Array2<f64>> {
     let (channels, samples) = pgc.dim();
     let channel_vectors_match = [
         param.fr1.len(),
@@ -1752,16 +1858,20 @@ pub fn gcfb_v23_frame_base(
         .exp_decay_val
         .powf(param.dyn_hpaf.len_shift as f64);
     let c2: Array1<f64> = &param.hloss.fb_compression_health * param.lvl_est.c2;
-    let static_response = cmprs_gc_frsp(
-        response.fr1.as_slice().unwrap(),
-        param.fs,
-        param.n,
-        response.b1_val.as_slice().unwrap(),
-        response.c1_val.as_slice().unwrap(),
-        &[param.lvl_est.frat],
-        &[param.lvl_est.b2],
-        c2.as_slice().unwrap(),
-        2048,
+    let owned_passive_impulses;
+    let passive_impulses = if let Some(impulses) = prepared_passive_impulses {
+        impulses
+    } else {
+        owned_passive_impulses = prepare_passive_impulses(param, response)?;
+        &owned_passive_impulses
+    };
+    let static_peaks = realized_cascade_peaks(
+        param,
+        response,
+        passive_impulses,
+        &Array1::from_elem(channels, param.lvl_est.frat),
+        &Array1::from_elem(channels, param.lvl_est.b2),
+        &c2,
     )?;
     let first_frames = dsp::frame_sequence(
         pgc.row(0).as_slice().unwrap(),
@@ -1836,7 +1946,7 @@ pub fn gcfb_v23_frame_base(
             let gain = 10_f64.powf(af / 20.);
             response.asym_func_gain[[ch, frame]] = gain;
             out[[ch, frame]] =
-                gain * static_response.norm_fct_fp2[ch] * response.scgc_frame[[ch, frame]];
+                gain * static_peaks.normalization[ch] * response.scgc_frame[[ch, frame]];
         }
     }
     Ok(out)
@@ -2006,8 +2116,8 @@ fn gcfb_v234_internal(
     let samples = snd.len();
     let mut pgc = Array2::zeros((channels, samples));
     let mut scgc = Array2::zeros((channels, samples));
-    let fixed_coef = prepare_time_invariant_response(&param, &mut response)?;
     let passive_impulses = prepare_passive_impulses(&param, &response)?;
+    let fixed_coef = prepare_time_invariant_response(&param, &mut response, &passive_impulses)?;
     for (ch, impulse) in passive_impulses.iter().enumerate() {
         let filtered = utils::fftfilt(impulse, &snd);
         pgc.row_mut(ch).assign(&filtered);
@@ -2024,7 +2134,13 @@ fn gcfb_v234_internal(
     let mut dcgc = match param.ctrl {
         ControlMode::Static => scgc.clone(),
         ControlMode::Dynamic if param.dyn_hpaf.str_prc.contains("frame") => {
-            gcfb_v23_frame_base(&pgc, &scgc, &param, &mut response)?
+            gcfb_v23_frame_base_internal(
+                &pgc,
+                &scgc,
+                &param,
+                &mut response,
+                Some(&passive_impulses),
+            )?
         }
         ControlMode::Dynamic if param.dyn_hpaf.str_prc.contains("sample") => {
             gcfb_v23_sample_base_internal(&pgc, &scgc, &param, &mut response, peak_lock.as_mut())?
