@@ -1402,7 +1402,11 @@ fn deposit_energy(
     Ok(())
 }
 
-fn linear_weights(axis: &[f64], value: f64) -> Option<Vec<(usize, f64)>> {
+/// Linear interpolation weights of `value` on an increasing `axis`.
+///
+/// Returns the one or two `(index, weight)` pairs that represent `value` on
+/// `axis`, or `None` when `value` is non-finite or outside the axis range.
+pub fn linear_weights(axis: &[f64], value: f64) -> Option<Vec<(usize, f64)>> {
     if axis.is_empty() || !value.is_finite() || value < axis[0] || value > axis[axis.len() - 1] {
         return None;
     }

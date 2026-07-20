@@ -17,7 +17,7 @@ pub use reassignment::{
     BandwidthScaleMetadata, PhaseReassignmentResult, ReassignmentConfig, ReassignmentMode,
     ReassignmentResult, ReassignmentStream, ReassignmentStreamStep, SparsityComparison,
     SparsityMetrics, gcfb_v234_with_bandwidth_consensus, gcfb_v234_with_phase_reassignment,
-    gcfb_v234_with_reassignment, phase_reassign_gcfb_v234, phase_reassign_gcfb_v234_with_config,
-    reassign_gcfb_v234, reassign_gcfb_v234_with_config,
+    gcfb_v234_with_reassignment, linear_weights, phase_reassign_gcfb_v234,
+    phase_reassign_gcfb_v234_with_config, reassign_gcfb_v234, reassign_gcfb_v234_with_config,
 };
 pub use stream::{DcgcEvent, GcfbStream, StreamStep};
