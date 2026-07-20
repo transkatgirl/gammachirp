@@ -3,6 +3,87 @@ use num_complex::Complex64;
 
 use crate::{Error, Result};
 
+/// Fixed-memory state for a causal FIR filter.
+#[derive(Clone, Debug)]
+pub(crate) struct CausalFir {
+    coefficients: Vec<f64>,
+    history: Vec<f64>,
+    next: usize,
+}
+
+impl CausalFir {
+    pub(crate) fn new(coefficients: Vec<f64>) -> Self {
+        debug_assert!(!coefficients.is_empty());
+        Self {
+            history: vec![0.0; coefficients.len()],
+            coefficients,
+            next: 0,
+        }
+    }
+
+    pub(crate) fn process_sample(&mut self, sample: f64) -> f64 {
+        self.history[self.next] = sample;
+        let mut history_index = self.next;
+        let mut output = 0.0;
+        for &coefficient in &self.coefficients {
+            output += coefficient * self.history[history_index];
+            history_index = if history_index == 0 {
+                self.history.len() - 1
+            } else {
+                history_index - 1
+            };
+        }
+        self.next = (self.next + 1) % self.history.len();
+        output
+    }
+}
+
+/// A bank of causal FIR filters driven by the same scalar input.
+#[derive(Clone, Debug)]
+pub(crate) struct CausalFirBank {
+    coefficients: Vec<Vec<f64>>,
+    history: Vec<f64>,
+    next: usize,
+}
+
+impl CausalFirBank {
+    pub(crate) fn new(mut coefficients: Vec<Vec<f64>>) -> Self {
+        debug_assert!(!coefficients.is_empty());
+        // An empty FIR is the zero operator in the batch convolution path.
+        // Retain that meaning while giving the circular buffer one addressable
+        // slot for sample-by-sample processing.
+        for row in &mut coefficients {
+            if row.is_empty() {
+                row.push(0.0);
+            }
+        }
+        let history_len = coefficients.iter().map(Vec::len).max().unwrap();
+        Self {
+            coefficients,
+            history: vec![0.0; history_len],
+            next: 0,
+        }
+    }
+
+    pub(crate) fn process_sample(&mut self, sample: f64) -> Array1<f64> {
+        self.history[self.next] = sample;
+        let mut output = Array1::zeros(self.coefficients.len());
+        for (channel, coefficients) in self.coefficients.iter().enumerate() {
+            let mut history_index = self.next;
+            for &coefficient in coefficients {
+                output[channel] += coefficient * self.history[history_index];
+                history_index = if history_index == 0 {
+                    self.history.len() - 1
+                } else {
+                    history_index - 1
+                };
+            }
+        }
+        self.next = (self.next + 1) % self.history.len();
+        output
+    }
+}
+
 pub(crate) fn fft(values: &mut [Complex64], inverse: bool) {
     let n = values.len();
     debug_assert!(n.is_power_of_two());

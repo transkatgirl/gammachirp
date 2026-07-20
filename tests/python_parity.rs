@@ -18,7 +18,9 @@ use gammachirp_rs::gcfb_v234::{
     utils::{self as utils234, Floor, ParamTransFunc},
 };
 use ndarray::{Array2, ArrayView2};
+use num_complex::Complex64;
 use serde_json::Value;
+use std::f64::consts::PI;
 
 const REFERENCE_JSON: &str = include_str!("fixtures/python_reference.json");
 
@@ -452,6 +454,82 @@ fn gammachirp_analytic_response_matches_python() {
         &expected["phase"],
         2e-13,
         2e-13,
+    );
+}
+
+#[test]
+fn discrete_pgc_fir_and_digital_acf_responses_match_python() {
+    let fixture = references();
+    let expected = &fixture["v211"]["discrete_component_response"];
+    let fft_len = expected["fft_len"].as_u64().unwrap() as usize;
+    let bins: Vec<usize> = expected["bins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as usize)
+        .collect();
+
+    let impulse = gc::gammachirp(
+        &[1000.0],
+        8_000.0,
+        4.0,
+        1.019,
+        -2.0,
+        0.0,
+        Carrier::Cosine,
+        Normalization::Peak,
+    )
+    .unwrap();
+    let pgc_power: Vec<f64> = bins
+        .iter()
+        .map(|&bin| {
+            let omega = -2.0 * PI * bin as f64 / fft_len as f64;
+            impulse
+                .gc
+                .row(0)
+                .iter()
+                .enumerate()
+                .fold(Complex64::new(0.0, 0.0), |sum, (sample, &value)| {
+                    sum + Complex64::from_polar(value, omega * sample as f64)
+                })
+                .norm_sqr()
+        })
+        .collect();
+    assert_values(
+        "discrete cosine-pGC FIR power",
+        &pgc_power,
+        &expected["pgc_power"],
+        2e-11,
+        2e-11,
+    );
+
+    let coefficients =
+        fb211::make_asym_cmp_filters_v2(8_000.0, &[500.0, 1500.0], &[2.17, 1.8], &[2.2, 1.5])
+            .unwrap();
+    let mut acf_power = Vec::with_capacity(2 * bins.len());
+    for channel in 0..2 {
+        for &bin in &bins {
+            let z1 = Complex64::from_polar(1.0, -2.0 * PI * bin as f64 / fft_len as f64);
+            let z2 = z1 * z1;
+            let mut response = Complex64::new(1.0, 0.0);
+            for section in 0..4 {
+                let numerator = coefficients.bz[[channel, 0, section]]
+                    + coefficients.bz[[channel, 1, section]] * z1
+                    + coefficients.bz[[channel, 2, section]] * z2;
+                let denominator = coefficients.ap[[channel, 0, section]]
+                    + coefficients.ap[[channel, 1, section]] * z1
+                    + coefficients.ap[[channel, 2, section]] * z2;
+                response *= numerator / denominator;
+            }
+            acf_power.push(response.norm_sqr());
+        }
+    }
+    assert_values(
+        "digital four-section ACF power",
+        &acf_power,
+        &expected["acf_power"],
+        2e-10,
+        2e-10,
     );
 }
 

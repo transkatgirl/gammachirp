@@ -178,6 +178,27 @@ def v211_references():
         "ap": encoded(coefficients.ap),
         "bz": encoded(coefficients.bz),
     }
+    # Discrete component responses used by the exact peak-lock model.  These
+    # intentionally sample the implemented cosine FIR and digital biquads,
+    # rather than either analytic gammachirp response surrogate.
+    peak_fft_len = 65536
+    peak_bins = np.array([0, 1, 257, 4096, 8192, 16000, 32768])
+    pgc_spectrum = np.fft.rfft(np.asarray(peak_normalized[0]).reshape(-1), peak_fft_len)
+    z = np.exp(-2j * np.pi * peak_bins / peak_fft_len)
+    acf_power = np.empty((2, len(peak_bins)))
+    for channel in range(2):
+        response_values = np.ones(len(peak_bins), dtype=complex)
+        for section in range(4):
+            numerator = sum(coefficients.bz[channel, tap, section] * z**tap for tap in range(3))
+            denominator = sum(coefficients.ap[channel, tap, section] * z**tap for tap in range(3))
+            response_values *= numerator / denominator
+        acf_power[channel, :] = np.abs(response_values) ** 2
+    result["discrete_component_response"] = {
+        "fft_len": peak_fft_len,
+        "bins": peak_bins.tolist(),
+        "pgc_power": encoded(np.abs(pgc_spectrum[peak_bins]) ** 2),
+        "acf_power": encoded(acf_power),
+    }
     acf_response = gcfb.asym_cmp_frsp_v2(
         np.array([500.0, 1500.0]), 8000, np.array([2.17, 1.8]), np.array([2.2, 1.5]), 256, 4
     )

@@ -1,6 +1,10 @@
 //! Frame-based GCFB v2.34 with hearing-loss characteristics.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ndarray::{Array1, Array2, Array3, Axis, s};
+use num_complex::Complex64;
 
 use super::utils::{self, FrequencyScale};
 use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
@@ -186,6 +190,184 @@ pub struct GcfbOutput {
     pub gc_resp: GcResp,
 }
 
+const MINIMUM_PEAK_GRID_FFT_LEN: usize = 65_536;
+const MAXIMUM_PEAK_LOCK_ITERATIONS: usize = 64;
+
+#[derive(Clone, Debug)]
+struct PassiveSpectrum {
+    power: Vec<f64>,
+}
+
+/// Shared discrete-frequency definition and baseline pGC spectra for one
+/// bandwidth-consensus ensemble.
+#[derive(Clone, Debug)]
+pub(crate) struct BandwidthPeakGrid {
+    sample_rate: f64,
+    fft_len: usize,
+    reference_carriers: Array1<f64>,
+    reference_fp1: Array1<f64>,
+    reference_b1: Array1<f64>,
+    reference_c1: Array1<f64>,
+    reference_b2: Array1<f64>,
+    reference_c2: Array1<f64>,
+    reference_passive: Arc<Vec<PassiveSpectrum>>,
+    order: f64,
+}
+
+impl BandwidthPeakGrid {
+    pub(crate) fn fft_len(&self) -> usize {
+        self.fft_len
+    }
+
+    pub(crate) fn spacing_hz(&self) -> f64 {
+        self.sample_rate / self.fft_len as f64
+    }
+
+    pub(crate) fn nominal_peak_frequencies_hz(&self, ratios: &Array1<f64>) -> Result<Array1<f64>> {
+        let bins = self.reference_peak_bins_at_ratios(ratios, None)?;
+        Ok(bins.mapv(|bin| bin as f64 * self.spacing_hz()))
+    }
+
+    /// Measure the unscaled reference cascade at the supplied ratio vector.
+    ///
+    /// For sample-dynamic consensus, callers deliberately supply each scale's
+    /// independently realized ratios. This is a conditional reference curve,
+    /// not the realized baseline scale's ratio history at the same sample.
+    fn reference_peak_bins_at_ratios(
+        &self,
+        ratios: &Array1<f64>,
+        previous: Option<&Array1<usize>>,
+    ) -> Result<Array1<usize>> {
+        if ratios.len() != self.reference_carriers.len()
+            || previous.is_some_and(|bins| bins.len() != ratios.len())
+        {
+            return Err(Error::InvalidParameter(
+                "bandwidth peak grid received a mismatched ratio vector".into(),
+            ));
+        }
+        let mut bins = Array1::zeros(ratios.len());
+        for ch in 0..ratios.len() {
+            let center = ratios[ch] * self.reference_fp1[ch];
+            validate_lock_frequency(center, self.sample_rate, "baseline HP-AF center")?;
+            let coefficients = make_asym_cmp_filters_v2(
+                self.sample_rate,
+                &[center],
+                &[self.reference_b2[ch]],
+                &[self.reference_c2[ch]],
+            )?;
+            let analytic_peak = fr1_to_fp2(
+                self.order,
+                self.reference_b1[ch],
+                self.reference_c1[ch],
+                self.reference_b2[ch],
+                self.reference_c2[ch],
+                ratios[ch],
+                self.reference_carriers[ch],
+            )?
+            .0;
+            bins[ch] = peak_bin_from_spectrum(
+                &self.reference_passive[ch],
+                &coefficients,
+                analytic_peak,
+                previous.map(|values| values[ch]),
+                self.sample_rate,
+                self.fft_len,
+            )?;
+        }
+        Ok(bins)
+    }
+}
+
+/// Internal state that removes implemented-cascade peak drift introduced by a
+/// bandwidth scale while retaining that scale's independent level controller.
+#[derive(Clone, Debug)]
+pub(crate) struct BandwidthPeakLock {
+    grid: Arc<BandwidthPeakGrid>,
+    scaled_passive: Arc<Vec<PassiveSpectrum>>,
+    scaled_carriers: Array1<f64>,
+    scaled_fp1: Array1<f64>,
+    scaled_b1: Array1<f64>,
+    scaled_c1: Array1<f64>,
+    scaled_b2: Array1<f64>,
+    scaled_c2: Array1<f64>,
+    previous_centers: Array1<f64>,
+    previous_reference_peak_bins: Array1<usize>,
+    previous_scaled_peak_bins: Array1<usize>,
+}
+
+impl BandwidthPeakLock {
+    /// Retune the scaled HP-AF centers to the unscaled reference peaks
+    /// evaluated at `ratios`.
+    ///
+    /// The ratios belong to the scale being processed. In sample-dynamic mode
+    /// they need not equal the simultaneously realized baseline ratios.
+    pub(crate) fn centers_for_reference_peaks_at_ratios(
+        &mut self,
+        ratios: &Array1<f64>,
+    ) -> Result<Array1<f64>> {
+        if ratios.len() != self.previous_centers.len() {
+            return Err(Error::InvalidParameter(
+                "bandwidth peak lock received a mismatched ratio vector".into(),
+            ));
+        }
+        let target_bins = self
+            .grid
+            .reference_peak_bins_at_ratios(ratios, Some(&self.previous_reference_peak_bins))?;
+        let mut centers = Array1::zeros(ratios.len());
+        let mut actual_bins = Array1::zeros(ratios.len());
+        for ch in 0..ratios.len() {
+            let analytic_target = fr1_to_fp2(
+                self.grid.order,
+                self.grid.reference_b1[ch],
+                self.grid.reference_c1[ch],
+                self.grid.reference_b2[ch],
+                self.grid.reference_c2[ch],
+                ratios[ch],
+                self.grid.reference_carriers[ch],
+            )?
+            .0;
+            let analytic_seed = center_for_composite_peak(
+                self.grid.order,
+                self.scaled_b1[ch],
+                self.scaled_c1[ch],
+                self.scaled_b2[ch],
+                self.scaled_c2[ch],
+                self.scaled_carriers[ch],
+                self.scaled_fp1[ch],
+                analytic_target,
+                self.grid.sample_rate,
+                self.previous_centers[ch],
+            )
+            .unwrap_or(self.previous_centers[ch]);
+            let (center, bin) = center_for_discrete_peak(
+                &self.scaled_passive[ch],
+                self.scaled_b2[ch],
+                self.scaled_c2[ch],
+                self.scaled_b1[ch],
+                self.scaled_c1[ch],
+                self.scaled_carriers[ch],
+                self.grid.order,
+                analytic_seed,
+                analytic_target,
+                target_bins[ch],
+                self.previous_scaled_peak_bins[ch],
+                self.grid.sample_rate,
+                self.grid.fft_len,
+            )?;
+            centers[ch] = center;
+            actual_bins[ch] = bin;
+        }
+        self.previous_centers.assign(&centers);
+        self.previous_reference_peak_bins.assign(&target_bins);
+        self.previous_scaled_peak_bins.assign(&actual_bins);
+        Ok(centers)
+    }
+
+    pub(crate) fn current_centers(&self) -> &Array1<f64> {
+        &self.previous_centers
+    }
+}
+
 fn validate_prepared_frequencies(fs: f64, frequencies: &[f64], name: &str) -> Result<()> {
     if frequencies
         .iter()
@@ -241,7 +423,7 @@ fn validate_user_controlled_parameters(param: &GcParam) -> Result<()> {
     Ok(())
 }
 
-fn initial_asymmetric_ratio_and_centers(
+pub(super) fn initial_asymmetric_ratio_and_centers(
     param: &GcParam,
     response: &GcResp,
 ) -> (Array1<f64>, Array1<f64>) {
@@ -257,11 +439,939 @@ fn initial_asymmetric_ratio_and_centers(
     (ratios, centers)
 }
 
+fn peak_path_coefficients(param: &GcParam, response: &GcResp) -> (Array1<f64>, Array1<f64>) {
+    match param.ctrl {
+        ControlMode::Static => (response.b2_val.clone(), response.c2_val.clone()),
+        ControlMode::Dynamic if param.dyn_hpaf.str_prc.contains("sample") => {
+            (response.b2_val.clone(), response.c2_val.clone())
+        }
+        ControlMode::Level | ControlMode::Dynamic => (
+            Array1::from_elem(param.num_ch, param.lvl_est.b2),
+            &param.hloss.fb_compression_health * param.lvl_est.c2,
+        ),
+    }
+}
+
+pub(crate) fn scale_bandwidths(mut parameters: GcParam, scale: f64) -> GcParam {
+    for coefficient in &mut parameters.b1 {
+        *coefficient *= scale;
+    }
+    for row in &mut parameters.b2 {
+        for coefficient in row {
+            *coefficient *= scale;
+        }
+    }
+    parameters.lvl_est.b2 *= scale;
+    parameters
+}
+
+/// Prepare the common DFT grid and baseline passive spectra used by every
+/// scale in one consensus analysis. If a numerically locked scaled impulse is
+/// longer than the current grid, all locks are recomputed on the next power of
+/// two so no scale is measured on a different frequency grid.
+pub(crate) fn prepare_bandwidth_peak_grid(
+    unprepared_reference: &GcParam,
+    scales: &[f64],
+    reference_param: &GcParam,
+    reference_response: &GcResp,
+) -> Result<Arc<BandwidthPeakGrid>> {
+    let reference_impulses = prepare_passive_impulses(reference_param, reference_response)?;
+    let maximum_reference_len = reference_impulses.iter().map(Vec::len).max().unwrap_or(0);
+    let mut fft_len = MINIMUM_PEAK_GRID_FFT_LEN.max(
+        maximum_reference_len
+            .checked_next_power_of_two()
+            .ok_or_else(|| Error::Unsupported("bandwidth peak grid is too large".into()))?,
+    );
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        let grid = Arc::new(build_peak_grid(
+            reference_param,
+            reference_response,
+            &reference_impulses,
+            fft_len,
+        )?);
+        let mut maximum_len = maximum_reference_len;
+        for &scale in scales {
+            if scale == 1.0 {
+                continue;
+            }
+            let (scaled_param, scaled_response) = set_param_with_preserved_hearing_loss(
+                scale_bandwidths(unprepared_reference.clone(), scale),
+                Some(&reference_param.hloss),
+            )
+            .map_err(|error| {
+                Error::Unsupported(format!(
+                    "bandwidth scale {scale} has no valid discrete peak-lock preparation: {error}"
+                ))
+            })?;
+            let solutions = solve_scaled_passive_channels(&scaled_param, &scaled_response, &grid)?;
+            maximum_len = maximum_len.max(
+                solutions
+                    .iter()
+                    .map(|solution| solution.impulse.len())
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
+        if maximum_len <= fft_len {
+            return Ok(grid);
+        }
+        fft_len = MINIMUM_PEAK_GRID_FFT_LEN.max(
+            maximum_len
+                .checked_next_power_of_two()
+                .ok_or_else(|| Error::Unsupported("bandwidth peak grid is too large".into()))?,
+        );
+    }
+    Err(Error::Unsupported(
+        "bandwidth peak grid did not stabilize within 64 iterations".into(),
+    ))
+}
+
+pub(crate) fn prepare_bandwidth_peak_lock(
+    param: &GcParam,
+    response: &mut GcResp,
+    grid: Arc<BandwidthPeakGrid>,
+) -> Result<BandwidthPeakLock> {
+    if param.num_ch != grid.reference_carriers.len()
+        || param.fs != grid.sample_rate
+        || param.fr1.len() != grid.reference_carriers.len()
+    {
+        return Err(Error::InvalidParameter(
+            "bandwidth peak lock requires matching baseline and scaled target grids".into(),
+        ));
+    }
+    let (ratios, _) = initial_asymmetric_ratio_and_centers(param, response);
+    let (scaled_b2, scaled_c2) = peak_path_coefficients(param, response);
+    let target_bins = grid.reference_peak_bins_at_ratios(&ratios, None)?;
+    let solutions = solve_scaled_passive_channels(param, response, &grid)?;
+    let scaled_carriers = Array1::from_iter(solutions.iter().map(|solution| solution.carrier));
+    let scaled_fp1 = Array1::from_iter(solutions.iter().map(|solution| solution.fp1));
+    validate_prepared_frequencies(
+        param.fs,
+        scaled_carriers.as_slice().unwrap(),
+        "peak-locked passive carriers",
+    )?;
+    validate_prepared_frequencies(
+        param.fs,
+        scaled_fp1.as_slice().unwrap(),
+        "peak-locked passive peaks",
+    )?;
+    if scaled_carriers
+        .windows(2)
+        .into_iter()
+        .any(|window| window[0] >= window[1])
+    {
+        return Err(Error::Unsupported(
+            "bandwidth scale cannot preserve ordered composite-filter peaks".into(),
+        ));
+    }
+    response.fr1.assign(&scaled_carriers);
+    response.fp1.assign(&scaled_fp1);
+    let previous_centers = &scaled_fp1 * &ratios;
+    let scaled_passive = Arc::new(
+        solutions
+            .iter()
+            .map(|solution| passive_spectrum(&solution.impulse, grid.fft_len))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let mut actual_bins = Array1::zeros(param.num_ch);
+    for ch in 0..param.num_ch {
+        let coefficients = make_asym_cmp_filters_v2(
+            param.fs,
+            &[previous_centers[ch]],
+            &[scaled_b2[ch]],
+            &[scaled_c2[ch]],
+        )?;
+        let analytic_peak = fr1_to_fp2(
+            param.n,
+            response.b1_val[ch],
+            response.c1_val[ch],
+            scaled_b2[ch],
+            scaled_c2[ch],
+            ratios[ch],
+            scaled_carriers[ch],
+        )?
+        .0;
+        actual_bins[ch] = peak_bin_from_spectrum(
+            &scaled_passive[ch],
+            &coefficients,
+            analytic_peak,
+            None,
+            param.fs,
+            grid.fft_len,
+        )?;
+        verify_peak_bin(actual_bins[ch], target_bins[ch])?;
+    }
+    Ok(BandwidthPeakLock {
+        grid,
+        scaled_passive,
+        scaled_carriers,
+        scaled_fp1,
+        scaled_b1: response.b1_val.clone(),
+        scaled_c1: response.c1_val.clone(),
+        scaled_b2,
+        scaled_c2,
+        previous_centers,
+        previous_reference_peak_bins: target_bins,
+        previous_scaled_peak_bins: actual_bins,
+    })
+}
+
+#[derive(Debug)]
+struct PassiveCarrierSolution {
+    carrier: f64,
+    fp1: f64,
+    impulse: Vec<f64>,
+}
+
+fn build_peak_grid(
+    param: &GcParam,
+    response: &GcResp,
+    impulses: &[Vec<f64>],
+    fft_len: usize,
+) -> Result<BandwidthPeakGrid> {
+    if fft_len < MINIMUM_PEAK_GRID_FFT_LEN
+        || !fft_len.is_power_of_two()
+        || impulses.len() != param.num_ch
+    {
+        return Err(Error::InvalidParameter(
+            "bandwidth peak grid requires a shared power-of-two DFT of at least 65,536 points"
+                .into(),
+        ));
+    }
+    let (reference_b2, reference_c2) = peak_path_coefficients(param, response);
+    let reference_passive = impulses
+        .iter()
+        .map(|impulse| passive_spectrum(impulse, fft_len))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BandwidthPeakGrid {
+        sample_rate: param.fs,
+        fft_len,
+        reference_carriers: response.fr1.clone(),
+        reference_fp1: response.fp1.clone(),
+        reference_b1: response.b1_val.clone(),
+        reference_c1: response.c1_val.clone(),
+        reference_b2,
+        reference_c2,
+        reference_passive: Arc::new(reference_passive),
+        order: param.n,
+    })
+}
+
+fn passive_spectrum(impulse: &[f64], fft_len: usize) -> Result<PassiveSpectrum> {
+    if impulse.len() > fft_len {
+        return Err(Error::Unsupported(format!(
+            "a {}-sample passive impulse does not fit the {fft_len}-point bandwidth peak grid",
+            impulse.len()
+        )));
+    }
+    let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
+    for (destination, &source) in spectrum.iter_mut().zip(impulse) {
+        destination.re = source;
+    }
+    dsp::fft(&mut spectrum, false);
+    Ok(PassiveSpectrum {
+        power: spectrum[..=fft_len / 2]
+            .iter()
+            .map(Complex64::norm_sqr)
+            .collect(),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn discrete_cascade_peak_bins(
+    param: &GcParam,
+    response: &GcResp,
+    centers: &Array1<f64>,
+    b2: &Array1<f64>,
+    c2: &Array1<f64>,
+    fft_len: usize,
+) -> Result<Array1<usize>> {
+    if centers.len() != param.num_ch || b2.len() != param.num_ch || c2.len() != param.num_ch {
+        return Err(Error::InvalidParameter(
+            "discrete cascade measurement requires one center and HP-AF parameter per channel"
+                .into(),
+        ));
+    }
+    let impulses = prepare_passive_impulses(param, response)?;
+    let mut bins = Array1::zeros(param.num_ch);
+    for ch in 0..param.num_ch {
+        let coefficients =
+            make_asym_cmp_filters_v2(param.fs, &[centers[ch]], &[b2[ch]], &[c2[ch]])?;
+        let ratio = centers[ch] / response.fp1[ch];
+        let analytic_peak = fr1_to_fp2(
+            param.n,
+            response.b1_val[ch],
+            response.c1_val[ch],
+            b2[ch],
+            c2[ch],
+            ratio,
+            response.fr1[ch],
+        )?
+        .0;
+        bins[ch] = peak_bin_from_impulse(
+            &impulses[ch],
+            &coefficients,
+            analytic_peak,
+            None,
+            param.fs,
+            fft_len,
+        )?;
+    }
+    Ok(bins)
+}
+
+fn passive_impulse(
+    carrier: f64,
+    sample_rate: f64,
+    order: f64,
+    b1: f64,
+    c1: f64,
+) -> Result<Vec<f64>> {
+    Ok(gammachirp::gammachirp(
+        &[carrier],
+        sample_rate,
+        order,
+        b1,
+        c1,
+        0.0,
+        Carrier::Cosine,
+        Normalization::Peak,
+    )?
+    .gc
+    .row(0)
+    .to_vec())
+}
+
+fn passive_peak_frequency(carrier: f64, order: f64, b1: f64, c1: f64) -> f64 {
+    let (_, width) = utils::freq2erb(&[carrier]);
+    carrier + c1 * width[0] * b1 / order
+}
+
+fn solve_scaled_passive_channels(
+    param: &GcParam,
+    response: &GcResp,
+    grid: &BandwidthPeakGrid,
+) -> Result<Vec<PassiveCarrierSolution>> {
+    let (ratios, _) = initial_asymmetric_ratio_and_centers(param, response);
+    let (scaled_b2, scaled_c2) = peak_path_coefficients(param, response);
+    let target_bins = grid.reference_peak_bins_at_ratios(&ratios, None)?;
+    let mut solutions = Vec::with_capacity(param.num_ch);
+    for ch in 0..param.num_ch {
+        let analytic_target = fr1_to_fp2(
+            grid.order,
+            grid.reference_b1[ch],
+            grid.reference_c1[ch],
+            grid.reference_b2[ch],
+            grid.reference_c2[ch],
+            ratios[ch],
+            grid.reference_carriers[ch],
+        )?
+        .0;
+        let analytic_seed = fp2_to_fr1(
+            param.n,
+            response.b1_val[ch],
+            response.c1_val[ch],
+            scaled_b2[ch],
+            scaled_c2[ch],
+            ratios[ch],
+            analytic_target,
+        )
+        .map(|solution| solution.0)
+        .unwrap_or(grid.reference_carriers[ch]);
+        let evaluate = |carrier: f64| -> Result<usize> {
+            validate_lock_frequency(carrier, param.fs, "peak-locked passive carrier")?;
+            let fp1 =
+                passive_peak_frequency(carrier, param.n, response.b1_val[ch], response.c1_val[ch]);
+            validate_lock_frequency(fp1, param.fs, "peak-locked passive peak")?;
+            let center = ratios[ch] * fp1;
+            validate_lock_frequency(center, param.fs, "peak-locked HP-AF center")?;
+            let impulse = passive_impulse(
+                carrier,
+                param.fs,
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+            )?;
+            let coefficients =
+                make_asym_cmp_filters_v2(param.fs, &[center], &[scaled_b2[ch]], &[scaled_c2[ch]])?;
+            let analytic_peak = fr1_to_fp2(
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                scaled_b2[ch],
+                scaled_c2[ch],
+                ratios[ch],
+                carrier,
+            )?
+            .0;
+            peak_bin_from_impulse(
+                &impulse,
+                &coefficients,
+                analytic_peak,
+                None,
+                param.fs,
+                grid.fft_len,
+            )
+        };
+        let (carrier, bin) = exact_bin_root(
+            analytic_seed,
+            target_bins[ch],
+            param.fs,
+            "passive carrier",
+            evaluate,
+        )?;
+        verify_peak_bin(bin, target_bins[ch])?;
+        let fp1 =
+            passive_peak_frequency(carrier, param.n, response.b1_val[ch], response.c1_val[ch]);
+        validate_lock_frequency(fp1, param.fs, "peak-locked passive peak")?;
+        let impulse = passive_impulse(
+            carrier,
+            param.fs,
+            param.n,
+            response.b1_val[ch],
+            response.c1_val[ch],
+        )?;
+        solutions.push(PassiveCarrierSolution {
+            carrier,
+            fp1,
+            impulse,
+        });
+    }
+    Ok(solutions)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn center_for_discrete_peak(
+    passive: &PassiveSpectrum,
+    b2: f64,
+    c2: f64,
+    b1: f64,
+    c1: f64,
+    carrier: f64,
+    order: f64,
+    analytic_seed: f64,
+    analytic_target: f64,
+    target_bin: usize,
+    previous_peak_bin: usize,
+    sample_rate: f64,
+    fft_len: usize,
+) -> Result<(f64, usize)> {
+    let evaluate = |center: f64| -> Result<usize> {
+        validate_lock_frequency(center, sample_rate, "peak-locked HP-AF center")?;
+        let coefficients = make_asym_cmp_filters_v2(sample_rate, &[center], &[b2], &[c2])?;
+        let fp1 = passive_peak_frequency(carrier, order, b1, c1);
+        let analytic_peak = fr1_to_fp2(order, b1, c1, b2, c2, center / fp1, carrier)
+            .map(|value| value.0)
+            .unwrap_or(analytic_target);
+        peak_bin_from_spectrum(
+            passive,
+            &coefficients,
+            analytic_peak,
+            Some(previous_peak_bin),
+            sample_rate,
+            fft_len,
+        )
+    };
+    exact_bin_root(
+        analytic_seed,
+        target_bin,
+        sample_rate,
+        "HP-AF center",
+        evaluate,
+    )
+}
+
+fn validate_lock_frequency(frequency: f64, sample_rate: f64, name: &str) -> Result<()> {
+    if !frequency.is_finite() || frequency <= 0.0 || frequency >= sample_rate / 2.0 {
+        return Err(Error::Unsupported(format!(
+            "no finite, positive, sub-Nyquist {name} realizes the requested discrete peak"
+        )));
+    }
+    Ok(())
+}
+
+fn exact_bin_root(
+    seed: f64,
+    target_bin: usize,
+    sample_rate: f64,
+    name: &str,
+    mut evaluate: impl FnMut(f64) -> Result<usize>,
+) -> Result<(f64, usize)> {
+    let minimum = (sample_rate * 1e-12).max(f64::MIN_POSITIVE);
+    let maximum = sample_rate / 2.0 * (1.0 - 1e-12);
+    let analytic_seed = seed.clamp(minimum, maximum);
+    let (seed, seed_bin) = if let Some(bin) = optional_lock_evaluation(evaluate(analytic_seed))? {
+        (analytic_seed, bin)
+    } else {
+        let mut step =
+            (analytic_seed.abs() * 0.02).max(sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64);
+        let mut valid = None;
+        for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+            let lower = (analytic_seed - step).max(minimum);
+            let upper = (analytic_seed + step).min(maximum);
+            let lower_bin = optional_lock_evaluation(evaluate(lower))?;
+            let upper_bin = if upper == lower {
+                None
+            } else {
+                optional_lock_evaluation(evaluate(upper))?
+            };
+            valid = lower_bin
+                .map(|bin| (lower, bin))
+                .or_else(|| upper_bin.map(|bin| (upper, bin)));
+            if valid.is_some() || (lower == minimum && upper == maximum) {
+                break;
+            }
+            step *= 2.0;
+        }
+        valid.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "no finite, positive, sub-Nyquist {name} can be evaluated for bandwidth peak-grid bin {target_bin}"
+            ))
+        })?
+    };
+    if seed_bin == target_bin {
+        return Ok((seed, seed_bin));
+    }
+
+    let mut lower = (seed, seed_bin);
+    let mut upper = (seed, seed_bin);
+    let mut can_expand_lower = true;
+    let mut can_expand_upper = true;
+    let mut step = (seed.abs() * 0.02).max(sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64);
+    let mut bracket = None;
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        let next_lower = (seed - step).max(minimum);
+        if can_expand_lower && next_lower < lower.0 {
+            if let Some(bin) = optional_lock_evaluation(evaluate(next_lower))? {
+                lower = (next_lower, bin);
+                if lower.1 == target_bin {
+                    return Ok(lower);
+                }
+            } else {
+                can_expand_lower = false;
+            }
+        }
+        let next_upper = (seed + step).min(maximum);
+        if can_expand_upper && next_upper > upper.0 {
+            if let Some(bin) = optional_lock_evaluation(evaluate(next_upper))? {
+                upper = (next_upper, bin);
+                if upper.1 == target_bin {
+                    return Ok(upper);
+                }
+            } else {
+                can_expand_upper = false;
+            }
+        }
+        for pair in [
+            (lower, (seed, seed_bin)),
+            ((seed, seed_bin), upper),
+            (lower, upper),
+        ] {
+            if bin_is_between(target_bin, pair.0.1, pair.1.1) {
+                bracket = Some(pair);
+                break;
+            }
+        }
+        if bracket.is_some()
+            || ((!can_expand_lower || lower.0 == minimum)
+                && (!can_expand_upper || upper.0 == maximum))
+        {
+            break;
+        }
+        step *= 2.0;
+    }
+    let Some((mut lower, mut upper)) = bracket else {
+        return Err(Error::Unsupported(format!(
+            "no finite, positive, sub-Nyquist {name} reaches bandwidth peak-grid bin {target_bin}"
+        )));
+    };
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        let midpoint = lower.0 + (upper.0 - lower.0) / 2.0;
+        if midpoint == lower.0 || midpoint == upper.0 {
+            break;
+        }
+        let middle = (midpoint, evaluate(midpoint)?);
+        if middle.1 == target_bin {
+            return Ok(middle);
+        }
+        if bin_is_between(target_bin, lower.1, middle.1) {
+            upper = middle;
+        } else if bin_is_between(target_bin, middle.1, upper.1) {
+            lower = middle;
+        } else {
+            break;
+        }
+    }
+    Err(Error::Unsupported(format!(
+        "no finite, positive, sub-Nyquist {name} reaches bandwidth peak-grid bin {target_bin}"
+    )))
+}
+
+fn optional_lock_evaluation(result: Result<usize>) -> Result<Option<usize>> {
+    match result {
+        Ok(bin) => Ok(Some(bin)),
+        Err(Error::Unsupported(_)) | Err(Error::InvalidParameter(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn bin_is_between(target: usize, left: usize, right: usize) -> bool {
+    (left <= target && target <= right) || (right <= target && target <= left)
+}
+
+fn peak_bin_from_spectrum(
+    passive: &PassiveSpectrum,
+    coefficients: &AcfCoef,
+    analytic_peak_hz: f64,
+    previous_peak_bin: Option<usize>,
+    sample_rate: f64,
+    fft_len: usize,
+) -> Result<usize> {
+    local_main_lobe_peak_bin(
+        analytic_peak_hz,
+        previous_peak_bin,
+        fft_len,
+        sample_rate,
+        |bin| Ok(passive.power[bin] * hpaf_power_at_bin(coefficients, bin, fft_len)),
+    )
+}
+
+fn peak_bin_from_impulse(
+    impulse: &[f64],
+    coefficients: &AcfCoef,
+    analytic_peak_hz: f64,
+    previous_peak_bin: Option<usize>,
+    sample_rate: f64,
+    fft_len: usize,
+) -> Result<usize> {
+    let mut passive_cache = HashMap::new();
+    local_main_lobe_peak_bin(
+        analytic_peak_hz,
+        previous_peak_bin,
+        fft_len,
+        sample_rate,
+        |bin| {
+            let passive_power = if let Some(&power) = passive_cache.get(&bin) {
+                power
+            } else {
+                let omega = 2.0 * std::f64::consts::PI * bin as f64 / fft_len as f64;
+                let response = impulse.iter().enumerate().fold(
+                    Complex64::new(0.0, 0.0),
+                    |sum, (sample, &value)| {
+                        sum + Complex64::from_polar(value, -omega * sample as f64)
+                    },
+                );
+                let power = response.norm_sqr();
+                passive_cache.insert(bin, power);
+                power
+            };
+            Ok(passive_power * hpaf_power_at_bin(coefficients, bin, fft_len))
+        },
+    )
+}
+
+fn hpaf_power_at_bin(coefficients: &AcfCoef, bin: usize, fft_len: usize) -> f64 {
+    let omega = -2.0 * std::f64::consts::PI * bin as f64 / fft_len as f64;
+    let z1 = Complex64::from_polar(1.0, omega);
+    let z2 = z1 * z1;
+    let mut power = 1.0;
+    for section in 0..4 {
+        let numerator = coefficients.bz[[0, 0, section]]
+            + coefficients.bz[[0, 1, section]] * z1
+            + coefficients.bz[[0, 2, section]] * z2;
+        let denominator = coefficients.ap[[0, 0, section]]
+            + coefficients.ap[[0, 1, section]] * z1
+            + coefficients.ap[[0, 2, section]] * z2;
+        power *= numerator.norm_sqr() / denominator.norm_sqr();
+    }
+    power
+}
+
+fn local_main_lobe_peak_bin(
+    analytic_peak_hz: f64,
+    previous_peak_bin: Option<usize>,
+    fft_len: usize,
+    sample_rate: f64,
+    mut power_at_bin: impl FnMut(usize) -> Result<f64>,
+) -> Result<usize> {
+    if !analytic_peak_hz.is_finite() {
+        return Err(Error::Unsupported(
+            "the analytic seed for the discrete main-lobe search is not finite".into(),
+        ));
+    }
+    let last_bin = fft_len / 2;
+    let analytic_bin = analytic_peak_hz / sample_rate * fft_len as f64;
+    let mut current = analytic_bin.round().clamp(0.0, last_bin as f64) as usize;
+    for _ in 0..=last_bin {
+        let current_power = power_at_bin(current)?;
+        if !current_power.is_finite() {
+            return Err(Error::Numerical(
+                "non-finite implemented-cascade response on the bandwidth peak grid".into(),
+            ));
+        }
+        let mut best = (current, current_power);
+        for neighbor in [
+            current.checked_sub(1),
+            (current < last_bin).then_some(current + 1),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let power = power_at_bin(neighbor)?;
+            if !power.is_finite() {
+                return Err(Error::Numerical(
+                    "non-finite implemented-cascade response on the bandwidth peak grid".into(),
+                ));
+            }
+            let preferred = |bin: usize| {
+                (
+                    (bin as f64 - analytic_bin).abs(),
+                    previous_peak_bin.map_or(0, |previous| bin.abs_diff(previous)),
+                    bin,
+                )
+            };
+            if power > best.1 || (power == best.1 && preferred(neighbor) < preferred(best.0)) {
+                best = (neighbor, power);
+            }
+        }
+        if best.0 == current {
+            return Ok(current);
+        }
+        current = best.0;
+    }
+    Err(Error::Numerical(
+        "discrete main-lobe peak search did not converge".into(),
+    ))
+}
+
+fn verify_peak_bin(actual: usize, target: usize) -> Result<()> {
+    if actual != target {
+        return Err(Error::Numerical(format!(
+            "bandwidth peak lock missed its DFT bin: {actual} versus {target}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn center_for_composite_peak(
+    n: f64,
+    b1: f64,
+    c1: f64,
+    b2: f64,
+    c2: f64,
+    fr1: f64,
+    fp1: f64,
+    target_peak: f64,
+    sample_rate: f64,
+    preferred_center: f64,
+) -> Result<f64> {
+    if !target_peak.is_finite()
+        || target_peak <= 0.0
+        || target_peak >= sample_rate / 2.0
+        || !fp1.is_finite()
+        || fp1 <= 0.0
+    {
+        return Err(Error::Unsupported(format!(
+            "no valid HP-AF center realizes the requested composite peak {target_peak} Hz"
+        )));
+    }
+    let (_, width1) = utils::freq2erb(&[fr1]);
+    let (_, width_at_zero) = utils::freq2erb(&[0.0]);
+    let (_, width_at_one) = utils::freq2erb(&[1.0]);
+    let width_slope = width_at_one[0] - width_at_zero[0];
+    let u = b2 * width_slope;
+    let v = b2 * width_at_zero[0];
+    let bw1 = b1 * width1[0];
+    let k = c1 * bw1 + n * fr1;
+    let l = bw1 * bw1 + fr1 * fr1;
+    let p = target_peak;
+    let quadratic = (u * u + 1.0) * (k - n * p);
+    let linear = (c2 * u + 2.0 * n) * p * p
+        + (-2.0 * k - 2.0 * n * u * v - 2.0 * c2 * u * fr1) * p
+        + c2 * u * l
+        + 2.0 * k * u * v;
+    let constant = -n * p.powi(3)
+        + (c1 * bw1 + c2 * v + n * fr1) * p * p
+        + (-n * v * v - 2.0 * c2 * v * fr1) * p
+        + c2 * v * l
+        + k * v * v;
+    let coefficient_scale = quadratic
+        .abs()
+        .max(linear.abs())
+        .max(constant.abs())
+        .max(1.0);
+    let roots = if quadratic.abs() <= 64.0 * f64::EPSILON * coefficient_scale {
+        if linear.abs() <= 64.0 * f64::EPSILON * coefficient_scale {
+            Vec::new()
+        } else {
+            vec![-constant / linear]
+        }
+    } else {
+        let discriminant = linear * linear - 4.0 * quadratic * constant;
+        let tolerance = 128.0
+            * f64::EPSILON
+            * (linear * linear)
+                .abs()
+                .max((4.0 * quadratic * constant).abs());
+        if discriminant < -tolerance {
+            Vec::new()
+        } else {
+            let square_root = discriminant.max(0.0).sqrt();
+            let stable_numerator = -0.5 * (linear + square_root.copysign(linear));
+            if stable_numerator == 0.0 {
+                vec![-linear / (2.0 * quadratic)]
+            } else {
+                vec![stable_numerator / quadratic, constant / stable_numerator]
+            }
+        }
+    };
+    let mut candidates = Vec::new();
+    for center in roots {
+        if !center.is_finite() || center <= 0.0 || center >= sample_rate / 2.0 {
+            continue;
+        }
+        let ratio = center / fp1;
+        let actual = fr1_to_fp2(n, b1, c1, b2, c2, ratio, fr1)?.0;
+        if verify_peak_lock(actual, target_peak).is_ok() {
+            candidates.push(center);
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by(|left, right| {
+            (left - preferred_center)
+                .abs()
+                .total_cmp(&(right - preferred_center).abs())
+        })
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "no valid HP-AF center realizes the requested composite peak {target_peak} Hz"
+            ))
+        })
+}
+
+fn verify_peak_lock(actual: f64, target: f64) -> Result<()> {
+    let tolerance = 1e-7 * target.abs().max(1.0);
+    if !actual.is_finite() || !target.is_finite() || (actual - target).abs() > tolerance {
+        return Err(Error::Numerical(format!(
+            "bandwidth peak lock missed its target: {actual} Hz versus {target} Hz"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn prepare_input_correction_fir(param: &GcParam) -> Result<Vec<f64>> {
+    if param.out_mid_crct.eq_ignore_ascii_case("no") {
+        Ok(vec![1.0])
+    } else {
+        Ok(
+            utils::mk_filter_field2cochlea(&param.out_mid_crct, param.fs, true)?
+                .0
+                .to_vec(),
+        )
+    }
+}
+
+pub(super) fn prepare_passive_impulses(
+    param: &GcParam,
+    response: &GcResp,
+) -> Result<Vec<Vec<f64>>> {
+    (0..param.num_ch)
+        .map(|ch| {
+            let impulse = gammachirp::gammachirp(
+                &[response.fr1[ch]],
+                param.fs,
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                0.0,
+                Carrier::Cosine,
+                Normalization::Peak,
+            )?;
+            Ok(impulse.gc.row(0).to_vec())
+        })
+        .collect()
+}
+
+/// Prepare the fixed asymmetric path and all time-invariant response metadata.
+pub(super) fn prepare_time_invariant_response(
+    param: &GcParam,
+    response: &mut GcResp,
+) -> Result<AcfCoef> {
+    let channels = param.num_ch;
+    let (initial_ratios, fixed_centers) = initial_asymmetric_ratio_and_centers(param, response);
+    let fixed_c2 = if param.ctrl == ControlMode::Static {
+        let level = param.level_db_scgcfb;
+        response.fr2 = Array2::zeros((channels, 1));
+        response.fr2.column_mut(0).assign(&fixed_centers);
+        response.frat_val = Array2::zeros((channels, 1));
+        response.frat_val.column_mut(0).assign(&initial_ratios);
+        response.lvl_db = Array2::from_elem((channels, 1), level);
+        for ch in 0..channels {
+            response.fp2[ch] = fr1_to_fp2(
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                response.b2_val[ch],
+                response.c2_val[ch],
+                initial_ratios[ch],
+                response.fr1[ch],
+            )?
+            .0;
+        }
+        response.c2_val.clone()
+    } else {
+        &param.hloss.fb_compression_health * param.lvl_est.c2
+    };
+    let level_b2 = [param.lvl_est.b2];
+    let fixed_b2 = if param.ctrl == ControlMode::Static {
+        response.b2_val.as_slice().unwrap()
+    } else {
+        &level_b2
+    };
+    let coefficients = make_asym_cmp_filters_v2(
+        param.fs,
+        fixed_centers.as_slice().unwrap(),
+        fixed_b2,
+        fixed_c2.as_slice().unwrap(),
+    )?;
+    match param.gain_ref {
+        GainReference::NormalizeIoFunction => {
+            for ch in 0..channels {
+                response.gain_factor[ch] =
+                    10_f64.powf(-param.hloss.fb_af_gain_cmpnst_db[ch] / 20.0);
+            }
+        }
+        GainReference::Db(db) => {
+            let ratios = Array1::from_iter((0..channels).map(|ch| {
+                response.frat0_pc[ch] + response.frat1_val[ch] * (db - response.pc_hpaf[ch])
+            }));
+            let reference = cmprs_gc_frsp(
+                response.fr1.as_slice().unwrap(),
+                param.fs,
+                param.n,
+                response.b1_val.as_slice().unwrap(),
+                response.c1_val.as_slice().unwrap(),
+                ratios.as_slice().unwrap(),
+                response.b2_val.as_slice().unwrap(),
+                response.c2_val.as_slice().unwrap(),
+                1024,
+            )?;
+            response.gain_factor = reference
+                .norm_fct_fp2
+                .mapv(|value| 10_f64.powf(param.gain_cmpnst_db / 20.0) * value);
+            response.cgc_ref = Some(reference);
+        }
+    }
+    Ok(coefficients)
+}
+
 pub fn set_param(param: GcParam) -> Result<(GcParam, GcResp)> {
     set_param_with_preserved_hearing_loss(param, None)
 }
 
-fn set_param_with_preserved_hearing_loss(
+pub(crate) fn set_param_with_preserved_hearing_loss(
     mut param: GcParam,
     preserved_hearing_loss: Option<&HLoss>,
 ) -> Result<(GcParam, GcResp)> {
@@ -556,7 +1666,7 @@ pub fn cal_asym_func(
     .exp()
 }
 
-fn asym_func_in_out_scalar(
+pub(super) fn asym_func_in_out_scalar(
     param: &GcParam,
     response: &GcResp,
     fr1query: f64,
@@ -642,7 +1752,7 @@ pub fn gcfb_v23_frame_base(
         .powf(param.dyn_hpaf.len_shift as f64);
     let c2: Array1<f64> = &param.hloss.fb_compression_health * param.lvl_est.c2;
     let static_response = cmprs_gc_frsp(
-        param.fr1.as_slice().unwrap(),
+        response.fr1.as_slice().unwrap(),
         param.fs,
         param.n,
         response.b1_val.as_slice().unwrap(),
@@ -737,6 +1847,16 @@ pub fn gcfb_v23_sample_base(
     param: &GcParam,
     response: &mut GcResp,
 ) -> Result<Array2<f64>> {
+    gcfb_v23_sample_base_internal(pgc, scgc, param, response, None)
+}
+
+fn gcfb_v23_sample_base_internal(
+    pgc: &Array2<f64>,
+    scgc: &Array2<f64>,
+    param: &GcParam,
+    response: &mut GcResp,
+    mut peak_lock: Option<&mut BandwidthPeakLock>,
+) -> Result<Array2<f64>> {
     let (channels, samples) = pgc.dim();
     let channel_vectors_match = [
         param.fr1.len(),
@@ -774,7 +1894,12 @@ pub fn gcfb_v23_sample_base(
     response.fr2 = Array2::zeros((channels, samples));
     response.frat_val = Array2::zeros((channels, samples));
     response.lvl_db = Array2::zeros((channels, samples));
-    let (_, centers) = initial_asymmetric_ratio_and_centers(param, response);
+    let (initial_ratios, default_centers) = initial_asymmetric_ratio_and_centers(param, response);
+    let centers = if let Some(lock) = peak_lock.as_deref_mut() {
+        lock.centers_for_reference_peaks_at_ratios(&initial_ratios)?
+    } else {
+        default_centers
+    };
     let mut coef = make_asym_cmp_filters_v2(
         param.fs,
         centers.as_slice().unwrap(),
@@ -808,16 +1933,30 @@ pub fn gcfb_v23_sample_base(
                     * response.frat1_val[ch]
                     * (db - response.pc_hpaf[ch]);
             response.frat_val[[ch, sample]] = ratio;
-            response.fr2[[ch, sample]] = response.fp1[ch] * ratio;
+            if peak_lock.is_none() {
+                response.fr2[[ch, sample]] = response.fp1[ch] * ratio;
+            }
         }
         if sample % param.num_update_asym_cmp == 0 {
-            let centers = response.fr2.column(sample).to_vec();
+            let centers = if let Some(lock) = peak_lock.as_deref_mut() {
+                let ratios = response.frat_val.column(sample).to_owned();
+                let centers = lock.centers_for_reference_peaks_at_ratios(&ratios)?;
+                response.fr2.column_mut(sample).assign(&centers);
+                centers.to_vec()
+            } else {
+                response.fr2.column(sample).to_vec()
+            };
             coef = make_asym_cmp_filters_v2(
                 param.fs,
                 &centers,
                 response.b2_val.as_slice().unwrap(),
                 response.c2_val.as_slice().unwrap(),
             )?;
+        } else if let Some(lock) = peak_lock.as_deref() {
+            response
+                .fr2
+                .column_mut(sample)
+                .assign(lock.current_centers());
         }
         let value = status.process(&coef, &pgc.column(sample).to_vec(), false)?;
         out.column_mut(sample).assign(&value);
@@ -826,21 +1965,23 @@ pub fn gcfb_v23_sample_base(
 }
 
 pub fn gcfb_v234(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
-    gcfb_v234_internal(snd_in, gc_param, None)
+    gcfb_v234_internal(snd_in, gc_param, None, None)
 }
 
-pub(crate) fn gcfb_v234_with_preserved_hearing_loss(
+pub(crate) fn gcfb_v234_with_bandwidth_peak_lock(
     snd_in: &[f64],
     gc_param: GcParam,
     hearing_loss: &HLoss,
+    peak_grid: Arc<BandwidthPeakGrid>,
 ) -> Result<GcfbOutput> {
-    gcfb_v234_internal(snd_in, gc_param, Some(hearing_loss))
+    gcfb_v234_internal(snd_in, gc_param, Some(hearing_loss), Some(peak_grid))
 }
 
 fn gcfb_v234_internal(
     snd_in: &[f64],
     gc_param: GcParam,
     preserved_hearing_loss: Option<&HLoss>,
+    peak_grid: Option<Arc<BandwidthPeakGrid>>,
 ) -> Result<GcfbOutput> {
     if snd_in.is_empty() || snd_in.iter().any(|sample| !sample.is_finite()) {
         return Err(Error::InvalidParameter(
@@ -849,65 +1990,25 @@ fn gcfb_v234_internal(
     }
     let (param, mut response) =
         set_param_with_preserved_hearing_loss(gc_param, preserved_hearing_loss)?;
-    let snd = if param.out_mid_crct.eq_ignore_ascii_case("no") {
-        snd_in.to_vec()
+    let mut peak_lock = if let Some(peak_grid) = peak_grid {
+        Some(prepare_bandwidth_peak_lock(
+            &param,
+            &mut response,
+            peak_grid,
+        )?)
     } else {
-        let (fir, _) = utils::mk_filter_field2cochlea(&param.out_mid_crct, param.fs, true)?;
-        dsp::lfilter(fir.as_slice().unwrap(), &[1.], snd_in)?
+        None
     };
+    let correction_fir = prepare_input_correction_fir(&param)?;
+    let snd = dsp::lfilter(&correction_fir, &[1.0], snd_in)?;
     let channels = param.num_ch;
     let samples = snd.len();
     let mut pgc = Array2::zeros((channels, samples));
     let mut scgc = Array2::zeros((channels, samples));
-    let (initial_ratios, fixed_centers) = initial_asymmetric_ratio_and_centers(&param, &response);
-    let fixed_c2: Array1<f64>;
-    if param.ctrl == ControlMode::Static {
-        let level = param.level_db_scgcfb;
-        response.fr2 = Array2::zeros((channels, 1));
-        response.fr2.column_mut(0).assign(&fixed_centers);
-        response.frat_val = Array2::zeros((channels, 1));
-        response.frat_val.column_mut(0).assign(&initial_ratios);
-        response.lvl_db = Array2::from_elem((channels, 1), level);
-        for ch in 0..channels {
-            response.fp2[ch] = fr1_to_fp2(
-                param.n,
-                response.b1_val[ch],
-                response.c1_val[ch],
-                response.b2_val[ch],
-                response.c2_val[ch],
-                initial_ratios[ch],
-                response.fr1[ch],
-            )?
-            .0;
-        }
-        fixed_c2 = response.c2_val.clone();
-    } else {
-        fixed_c2 = &param.hloss.fb_compression_health * param.lvl_est.c2;
-    }
-    let level_b2 = [param.lvl_est.b2];
-    let fixed_b2 = if param.ctrl == ControlMode::Static {
-        response.b2_val.as_slice().unwrap()
-    } else {
-        &level_b2
-    };
-    let fixed_coef = make_asym_cmp_filters_v2(
-        param.fs,
-        fixed_centers.as_slice().unwrap(),
-        fixed_b2,
-        fixed_c2.as_slice().unwrap(),
-    )?;
-    for ch in 0..channels {
-        let impulse = gammachirp::gammachirp(
-            &[response.fr1[ch]],
-            param.fs,
-            param.n,
-            response.b1_val[ch],
-            response.c1_val[ch],
-            0.,
-            Carrier::Cosine,
-            Normalization::Peak,
-        )?;
-        let filtered = utils::fftfilt(impulse.gc.row(0).as_slice().unwrap(), &snd);
+    let fixed_coef = prepare_time_invariant_response(&param, &mut response)?;
+    let passive_impulses = prepare_passive_impulses(&param, &response)?;
+    for (ch, impulse) in passive_impulses.iter().enumerate() {
+        let filtered = utils::fftfilt(impulse, &snd);
         pgc.row_mut(ch).assign(&filtered);
         let mut value = filtered.to_vec();
         for section in 0..4 {
@@ -925,7 +2026,7 @@ fn gcfb_v234_internal(
             gcfb_v23_frame_base(&pgc, &scgc, &param, &mut response)?
         }
         ControlMode::Dynamic if param.dyn_hpaf.str_prc.contains("sample") => {
-            gcfb_v23_sample_base(&pgc, &scgc, &param, &mut response)?
+            gcfb_v23_sample_base_internal(&pgc, &scgc, &param, &mut response, peak_lock.as_mut())?
         }
         ControlMode::Dynamic => {
             return Err(Error::InvalidParameter(
@@ -934,38 +2035,9 @@ fn gcfb_v234_internal(
         }
         ControlMode::Level => scgc.clone(),
     };
-    match param.gain_ref {
-        GainReference::NormalizeIoFunction => {
-            for ch in 0..channels {
-                let gain = 10_f64.powf(-param.hloss.fb_af_gain_cmpnst_db[ch] / 20.);
-                dcgc.row_mut(ch).mapv_inplace(|v| v * gain);
-                response.gain_factor[ch] = gain;
-            }
-        }
-        GainReference::Db(db) => {
-            let ratios = Array1::from_iter((0..channels).map(|ch| {
-                response.frat0_pc[ch] + response.frat1_val[ch] * (db - response.pc_hpaf[ch])
-            }));
-            let reference = cmprs_gc_frsp(
-                response.fr1.as_slice().unwrap(),
-                param.fs,
-                param.n,
-                response.b1_val.as_slice().unwrap(),
-                response.c1_val.as_slice().unwrap(),
-                ratios.as_slice().unwrap(),
-                response.b2_val.as_slice().unwrap(),
-                response.c2_val.as_slice().unwrap(),
-                1024,
-            )?;
-            response.gain_factor = reference
-                .norm_fct_fp2
-                .mapv(|v| 10_f64.powf(param.gain_cmpnst_db / 20.) * v);
-            for ch in 0..channels {
-                dcgc.row_mut(ch)
-                    .mapv_inplace(|v| v * response.gain_factor[ch]);
-            }
-            response.cgc_ref = Some(reference);
-        }
+    for ch in 0..channels {
+        dcgc.row_mut(ch)
+            .mapv_inplace(|value| value * response.gain_factor[ch]);
     }
     Ok(GcfbOutput {
         dcgc_out: dcgc,
@@ -1177,6 +2249,7 @@ pub fn gcfb_v23_ana_env_mod(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gcfb_v234::stream::{DcgcEvent, GcfbStream};
     use approx::assert_relative_eq;
     #[test]
     fn nh_parameters_match_expected_health() {
@@ -1194,6 +2267,120 @@ mod tests {
         );
         assert_relative_eq!(r.fr1[0], 100., epsilon = 1e-9);
     }
+
+    #[test]
+    fn peak_lock_rejects_a_target_outside_the_physical_frequency_range() {
+        let error = center_for_composite_peak(
+            4.0, 1.81, -2.96, 2.17, 2.2, 1_000.0, 900.0, 4_000.0, 8_000.0, 900.0,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn peak_grid_expands_to_contain_long_passive_impulses() {
+        let parameters = GcParam {
+            num_ch: 2,
+            f_range: [100.0, 200.0],
+            out_mid_crct: "No".into(),
+            ctrl: ControlMode::Static,
+            b1: [0.02, 0.0],
+            ..GcParam::default()
+        };
+        let (reference_param, reference_response) = set_param(parameters.clone()).unwrap();
+        let grid = prepare_bandwidth_peak_grid(
+            &parameters,
+            &[0.8, 1.0],
+            &reference_param,
+            &reference_response,
+        )
+        .unwrap();
+        assert!(grid.fft_len() > MINIMUM_PEAK_GRID_FFT_LEN);
+        assert!(grid.fft_len().is_power_of_two());
+        let longest_reference = prepare_passive_impulses(&reference_param, &reference_response)
+            .unwrap()
+            .into_iter()
+            .map(|impulse| impulse.len())
+            .max()
+            .unwrap();
+        assert!(grid.fft_len() >= longest_reference);
+    }
+
+    #[test]
+    fn peak_locked_dynamic_batch_and_stream_outputs_match() {
+        let parameters = GcParam {
+            fs: 8_000.0,
+            num_ch: 4,
+            f_range: [300.0, 1_800.0],
+            out_mid_crct: "No".into(),
+            ctrl: ControlMode::Dynamic,
+            dyn_hpaf: DynHpaf {
+                str_prc: "sample-base".into(),
+                ..DynHpaf::default()
+            },
+            num_update_asym_cmp: 3,
+            ..GcParam::default()
+        };
+        let signal: Vec<f64> = (0..192)
+            .map(|sample| {
+                let amplitude = 0.02 + 0.48 * sample as f64 / 191.0;
+                amplitude * (2.0 * std::f64::consts::PI * 750.0 * sample as f64 / 8_000.0).cos()
+            })
+            .collect();
+        let baseline = gcfb_v234(&signal, parameters.clone()).unwrap();
+        let grid = prepare_bandwidth_peak_grid(
+            &parameters,
+            &[1.0, 1.2],
+            &baseline.gc_param,
+            &baseline.gc_resp,
+        )
+        .unwrap();
+        let scaled_parameters = scale_bandwidths(parameters, 1.2);
+        let batch = gcfb_v234_with_bandwidth_peak_lock(
+            &signal,
+            scaled_parameters.clone(),
+            &baseline.gc_param.hloss,
+            grid.clone(),
+        )
+        .unwrap();
+        let mut stream = GcfbStream::new_with_bandwidth_peak_lock(
+            scaled_parameters,
+            &baseline.gc_param.hloss,
+            grid,
+        )
+        .unwrap();
+        for (sample_index, &sample) in signal.iter().enumerate() {
+            let step = stream.process_sample(sample).unwrap();
+            for ch in 0..batch.gc_param.num_ch {
+                assert_relative_eq!(
+                    step.scgc_smpl[ch],
+                    batch.scgc_smpl[[ch, sample_index]],
+                    epsilon = 2e-11
+                );
+            }
+            let Some(DcgcEvent::Sample {
+                dcgc_out,
+                fr2: Some(centers),
+                ..
+            }) = step.event
+            else {
+                panic!("sample-dynamic peak-locked stream must emit a sample event");
+            };
+            for ch in 0..batch.gc_param.num_ch {
+                assert_relative_eq!(
+                    dcgc_out[ch],
+                    batch.dcgc_out[[ch, sample_index]],
+                    epsilon = 2e-11
+                );
+                assert_relative_eq!(
+                    centers[ch],
+                    batch.gc_resp.fr2[[ch, sample_index]],
+                    epsilon = 2e-10
+                );
+            }
+        }
+    }
+
     #[test]
     fn frame_output_shape() {
         let p = GcParam {

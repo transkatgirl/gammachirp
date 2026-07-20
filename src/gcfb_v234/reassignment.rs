@@ -10,11 +10,14 @@
 //! therefore offline and acausal even though the real GCFB remains causal and
 //! unchanged.
 //!
-//! For the conditioned linear operator `T`, the reported coordinates are
+//! For a fixed conditioned linear operator `T`, the reported coordinates are
 //! `Re(T(t*x) / T(x))` and `Im(T(D*x) / T(x)) / (2*pi)`, where `x` is the
 //! original public input, `T` includes the correction FIR, and `D` is the
-//! skew-adjoint derivative on that same finite DFT domain.  This is the
-//! auxiliary-atom construction of
+//! skew-adjoint derivative on that same finite DFT domain. In sample-dynamic
+//! mode, the frequency coordinate instead differentiates the realized complex
+//! coefficient history, so it includes the HP-AF's time variation without
+//! differentiating its nonlinear level estimator. This is the auxiliary-atom
+//! construction of
 //! [Holighaus et al.](https://ltfat.org/notes/ltfatnote041.pdf) written as
 //! operator applications.  Exactness refers to this implemented finite
 //! discrete operator, up to floating-point error.
@@ -32,10 +35,21 @@
 //!
 //! Bandwidth consensus is likewise a model-specific analogue: a scale changes
 //! all passive and asymmetric bandwidth coefficients (`b1`, `b2`, and
-//! `lvl_est.b2`) while leaving chirp, compression, level-control,
-//! hearing-loss, and frequency-grid parameters unchanged.  Every complex
-//! analysis remains offline/acausal.  Sample-mode coordinates and phase are
-//! conditional on the recorded nonlinear coefficient history.
+//! `lvl_est.b2`). The target channel grid, chirp, compression, level control,
+//! and hearing-loss parameters stay fixed, while each scaled filter's internal
+//! passive carrier is retuned so its implemented cosine-pGC FIR plus digital
+//! HP-AF cascade has the same nominal main-lobe peak bin as the baseline on one
+//! shared, high-resolution DFT grid. Sample-dynamic filters retain independent
+//! level histories: at each update, a scaled filter matches the unscaled
+//! reference response evaluated at that scaled filter's own realized ratio.
+//! It does not necessarily match the simultaneously realized baseline peak, so
+//! controller-induced drift remains part of the consensus stability test.
+//! Batch complex and consensus analyses remain offline/acausal.
+//! [`ReassignmentStream`] is a separate zero-latency causal approximation for
+//! indefinite sample-domain inputs, and
+//! [`BandwidthConsensusStream`] forms bounded rolling consensus from an
+//! ensemble of those causal analyses. Sample-mode coordinates and phase are
+//! conditional on the realized nonlinear coefficient history.
 
 use std::f64::consts::PI;
 
@@ -44,11 +58,19 @@ use num_complex::Complex64;
 
 use super::gcfb_v234::{
     AcfCoef, ControlMode, GcParam, GcfbOutput, cmprs_gc_frsp, gcfb_v234,
-    gcfb_v234_with_preserved_hearing_loss, make_asym_cmp_filters_v2,
+    gcfb_v234_with_bandwidth_peak_lock, make_asym_cmp_filters_v2, prepare_bandwidth_peak_grid,
+    scale_bandwidths,
 };
 use super::utils;
 use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
 use crate::{Error, Result, dsp};
+
+mod stream;
+
+pub use stream::{
+    BandwidthConsensusStream, BandwidthConsensusStreamConfig, BandwidthConsensusStreamFrame,
+    BandwidthConsensusStreamStep, ReassignmentStream, ReassignmentStreamStep,
+};
 
 /// Options for dcGC reassignment.
 #[derive(Clone, Debug)]
@@ -74,9 +96,10 @@ pub enum ReassignmentMode {
     /// Exact fixed-filter coordinates with positive frame-dependent energy
     /// gains applied only during transport.
     Frame,
-    /// Exact reassignment of the correction-plus-HP-AF operator conditioned on
-    /// the recorded coefficient history. This does not differentiate through
-    /// the nonlinear coefficient estimator that produced that history.
+    /// Reassignment using the finite-DFT temporal derivative of the realized
+    /// complex coefficient history. This includes the recorded HP-AF changes
+    /// but does not differentiate through the nonlinear estimator that
+    /// produced them.
     SampleConditional,
 }
 
@@ -265,7 +288,11 @@ impl SparsityComparison {
 /// [Irino (2023)](https://doi.org/10.1109/ACCESS.2023.3298673).
 #[derive(Clone, Debug)]
 pub struct BandwidthConsensusConfig {
-    /// Multipliers applied to `b1`, `b2`, and `lvl_est.b2`.
+    /// Multipliers applied to `b1`, `b2`, and `lvl_est.b2`. At the nominal
+    /// control ratio, each nonbaseline scale is rejected if retuning cannot
+    /// preserve the baseline discrete implemented-cascade peak bins on every
+    /// channel. Sample-dynamic locking is conditional on each scale's own
+    /// realized ratio.
     pub scales: Vec<f64>,
     /// A normalized scale map supports a bin only when it exceeds this value.
     pub relative_support_floor: f64,
@@ -274,6 +301,23 @@ pub struct BandwidthConsensusConfig {
     pub required_agreement: f64,
     /// Reassignment options shared by every bandwidth scale.
     pub reassignment_config: ReassignmentConfig,
+}
+
+/// Fixed frequency metadata for one peak-locked bandwidth analysis.
+#[derive(Clone, Debug)]
+pub struct BandwidthScaleMetadata {
+    /// Bandwidth multiplier used for this analysis.
+    pub scale: f64,
+    /// Passive-gammachirp carrier frequencies after discrete-peak retuning.
+    pub carrier_frequencies_hz: Array1<f64>,
+    /// Composite-filter peaks at the mode's nominal control ratio. These match
+    /// the baseline implemented-cascade peak bins across every successfully
+    /// prepared scale.
+    pub nominal_peak_frequencies_hz: Array1<f64>,
+    /// Shared DFT length on which implemented-cascade peak equality is exact.
+    pub peak_grid_fft_len: usize,
+    /// Frequency spacing of the shared peak grid.
+    pub peak_grid_spacing_hz: f64,
 }
 
 impl Default for BandwidthConsensusConfig {
@@ -296,6 +340,8 @@ pub struct BandwidthConsensusResult {
     pub analyses: Vec<PhaseReassignmentResult>,
     /// Index of the unique unscaled (`1.0`) analysis.
     pub baseline_index: usize,
+    /// Retuned carriers and nominal discrete peak-grid frequencies for every scale.
+    pub scale_metadata: Vec<BandwidthScaleMetadata>,
     /// Fraction of normalized scale maps above the support floor per bin.
     pub agreement_map: Array2<f64>,
     /// Bins meeting `required_agreement`.
@@ -401,7 +447,13 @@ pub fn phase_reassign_gcfb_v234_with_config(
 ///
 /// Exactly one scale must be `1.0`; its phase analysis is computed from the
 /// returned, unscaled [`GcfbOutput`]. Other scales uniformly multiply `b1`,
-/// `b2`, and `lvl_est.b2` before running independent GCFB analyses.
+/// `b2`, and `lvl_est.b2`, then retune their internal passive carriers to keep
+/// the nominal baseline implemented-cascade peak bins on a shared DFT grid. In
+/// sample-dynamic mode, every scale derives its ratio from its own level
+/// history and locks to the unscaled reference response evaluated at that same
+/// ratio. The realized baseline can have a different ratio and peak at the same
+/// sample. The call fails if any requested conditional bin has no finite,
+/// positive, below-Nyquist solution.
 pub fn gcfb_v234_with_bandwidth_consensus(
     snd_in: &[f64],
     gc_param: GcParam,
@@ -409,22 +461,36 @@ pub fn gcfb_v234_with_bandwidth_consensus(
 ) -> Result<(GcfbOutput, BandwidthConsensusResult)> {
     let baseline_index = validate_consensus_config(config)?;
     let output = gcfb_v234(snd_in, gc_param.clone())?;
+    let peak_grid =
+        prepare_bandwidth_peak_grid(&gc_param, &config.scales, &output.gc_param, &output.gc_resp)?;
+    let (nominal_ratios, _) =
+        super::gcfb_v234::initial_asymmetric_ratio_and_centers(&output.gc_param, &output.gc_resp);
+    let nominal_peaks = peak_grid.nominal_peak_frequencies_hz(&nominal_ratios)?;
     let mut analyses = Vec::with_capacity(config.scales.len());
+    let mut scale_metadata = Vec::with_capacity(config.scales.len());
     for (index, &scale) in config.scales.iter().enumerate() {
-        let analysis = if index == baseline_index {
-            phase_reassign_gcfb_v234_with_config(snd_in, &output, &config.reassignment_config)?
+        let (analysis, metadata) = if index == baseline_index {
+            (
+                phase_reassign_gcfb_v234_with_config(snd_in, &output, &config.reassignment_config)?,
+                bandwidth_scale_metadata(scale, &output, &nominal_peaks, &peak_grid),
+            )
         } else {
-            let scaled_output = gcfb_v234_with_preserved_hearing_loss(
+            let scaled_output = gcfb_v234_with_bandwidth_peak_lock(
                 snd_in,
                 scale_bandwidths(gc_param.clone(), scale),
                 &output.gc_param.hloss,
+                peak_grid.clone(),
             )?;
-            phase_reassign_gcfb_v234_with_config(
-                snd_in,
-                &scaled_output,
-                &config.reassignment_config,
-            )?
+            (
+                phase_reassign_gcfb_v234_with_config(
+                    snd_in,
+                    &scaled_output,
+                    &config.reassignment_config,
+                )?,
+                bandwidth_scale_metadata(scale, &scaled_output, &nominal_peaks, &peak_grid),
+            )
         };
+        scale_metadata.push(metadata);
         analyses.push(analysis);
     }
     let (agreement_map, consensus_mask, salience_map) = consensus_maps(
@@ -438,11 +504,27 @@ pub fn gcfb_v234_with_bandwidth_consensus(
             scales: config.scales.clone(),
             analyses,
             baseline_index,
+            scale_metadata,
             agreement_map,
             consensus_mask,
             salience_map,
         },
     ))
+}
+
+fn bandwidth_scale_metadata(
+    scale: f64,
+    output: &GcfbOutput,
+    nominal_peaks: &Array1<f64>,
+    peak_grid: &super::gcfb_v234::BandwidthPeakGrid,
+) -> BandwidthScaleMetadata {
+    BandwidthScaleMetadata {
+        scale,
+        carrier_frequencies_hz: output.gc_resp.fr1.clone(),
+        nominal_peak_frequencies_hz: nominal_peaks.clone(),
+        peak_grid_fft_len: peak_grid.fft_len(),
+        peak_grid_spacing_hz: peak_grid.spacing_hz(),
+    }
 }
 
 fn reassignment_products(
@@ -453,7 +535,7 @@ fn reassignment_products(
 ) -> Result<(ReassignmentResult, Option<PhaseAccounting>)> {
     validate_analysis_input(snd_in, output, config)?;
     let operator = conditioned_operator_outputs(snd_in, output)?;
-    let analysis = analyze_coefficients(operator, config.coefficient_floor)?;
+    let analysis = analyze_coefficients(operator, config.coefficient_floor, output.gc_param.fs)?;
     let frame_mode = output.gc_param.ctrl == ControlMode::Dynamic
         && output.gc_param.dyn_hpaf.str_prc.contains("frame");
     let (time_axis, mut transported) = if frame_mode {
@@ -484,21 +566,34 @@ fn reassignment_products(
 }
 
 fn validate_consensus_config(config: &BandwidthConsensusConfig) -> Result<usize> {
-    if config.scales.len() < 2
-        || !config.relative_support_floor.is_finite()
-        || config.relative_support_floor <= 0.0
-        || config.relative_support_floor >= 1.0
-        || !config.required_agreement.is_finite()
-        || config.required_agreement <= 0.0
-        || config.required_agreement > 1.0
+    let baseline_index = validate_consensus_parameters(
+        &config.scales,
+        config.relative_support_floor,
+        config.required_agreement,
+    )?;
+    validate_reassignment_config(&config.reassignment_config)?;
+    Ok(baseline_index)
+}
+
+fn validate_consensus_parameters(
+    scales: &[f64],
+    relative_support_floor: f64,
+    required_agreement: f64,
+) -> Result<usize> {
+    if scales.len() < 2
+        || !relative_support_floor.is_finite()
+        || relative_support_floor <= 0.0
+        || relative_support_floor >= 1.0
+        || !required_agreement.is_finite()
+        || required_agreement <= 0.0
+        || required_agreement > 1.0
     {
         return Err(Error::InvalidParameter(
             "bandwidth consensus requires at least two scales, a support floor in (0, 1), and required agreement in (0, 1]"
                 .into(),
         ));
     }
-    if config
-        .scales
+    if scales
         .iter()
         .any(|scale| !scale.is_finite() || *scale <= 0.0)
     {
@@ -506,15 +601,14 @@ fn validate_consensus_config(config: &BandwidthConsensusConfig) -> Result<usize>
             "bandwidth consensus scales must be positive and finite".into(),
         ));
     }
-    for (index, scale) in config.scales.iter().enumerate() {
-        if config.scales[..index].contains(scale) {
+    for (index, scale) in scales.iter().enumerate() {
+        if scales[..index].contains(scale) {
             return Err(Error::InvalidParameter(
                 "bandwidth consensus scales must be unique".into(),
             ));
         }
     }
-    let baselines: Vec<usize> = config
-        .scales
+    let baselines: Vec<usize> = scales
         .iter()
         .enumerate()
         .filter_map(|(index, &scale)| (scale == 1.0).then_some(index))
@@ -524,7 +618,6 @@ fn validate_consensus_config(config: &BandwidthConsensusConfig) -> Result<usize>
             "bandwidth consensus requires exactly one 1.0 baseline scale".into(),
         ));
     }
-    validate_reassignment_config(&config.reassignment_config)?;
     Ok(baselines[0])
 }
 
@@ -538,19 +631,6 @@ fn validate_reassignment_config(config: &ReassignmentConfig) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn scale_bandwidths(mut parameters: GcParam, scale: f64) -> GcParam {
-    for coefficient in &mut parameters.b1 {
-        *coefficient *= scale;
-    }
-    for row in &mut parameters.b2 {
-        for coefficient in row {
-            *coefficient *= scale;
-        }
-    }
-    parameters.lvl_est.b2 *= scale;
-    parameters
 }
 
 fn consensus_maps(
@@ -938,7 +1018,7 @@ fn assign_operator_row(result: &mut OperatorOutputs, ch: usize, values: &[Vec<Co
         .assign(&Array1::from(values[2].clone()));
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct BiquadState {
     input_previous: Complex64,
     input_before_previous: Complex64,
@@ -946,7 +1026,7 @@ struct BiquadState {
     output_before_previous: Complex64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct ComplexCascadeState {
     sections: [BiquadState; 4],
 }
@@ -993,8 +1073,18 @@ fn verify_real_branch(actual: f64, expected: f64) -> Result<()> {
 fn analyze_coefficients(
     operator: OperatorOutputs,
     relative_floor: f64,
+    sample_rate: f64,
 ) -> Result<CoefficientAnalysis> {
     let dimensions = operator.coefficient.dim();
+    let realized_derivative = if operator.mode == ReassignmentMode::SampleConditional {
+        Some(differentiate_realized_coefficients(
+            &operator.coefficient,
+            sample_rate,
+            operator.analysis_fft_len,
+        ))
+    } else {
+        None
+    };
     let mut power = Array2::zeros(dimensions);
     let mut t_hat = Array2::from_elem(dimensions, f64::NAN);
     let mut f_hat = Array2::from_elem(dimensions, f64::NAN);
@@ -1005,8 +1095,12 @@ fn analyze_coefficients(
             power[[ch, sample]] = norm / 2.0;
             if norm > 0.0 && norm.is_finite() {
                 t_hat[[ch, sample]] = (operator.time_weighted[[ch, sample]] / coefficient).re;
-                f_hat[[ch, sample]] =
-                    (operator.derivative[[ch, sample]] / coefficient).im / (2.0 * PI);
+                let derivative = realized_derivative
+                    .as_ref()
+                    .map_or(operator.derivative[[ch, sample]], |values| {
+                        values[[ch, sample]]
+                    });
+                f_hat[[ch, sample]] = (derivative / coefficient).im / (2.0 * PI);
             }
         }
     }
@@ -1020,6 +1114,40 @@ fn analyze_coefficients(
         mode: operator.mode,
         analysis_fft_len: operator.analysis_fft_len,
     })
+}
+
+fn differentiate_realized_coefficients(
+    coefficients: &Array2<Complex64>,
+    sample_rate: f64,
+    fft_len: usize,
+) -> Array2<Complex64> {
+    debug_assert!(fft_len.is_power_of_two());
+    debug_assert!(fft_len >= coefficients.ncols());
+    let mut derivative = Array2::from_elem(coefficients.dim(), Complex64::new(0.0, 0.0));
+    for ch in 0..coefficients.nrows() {
+        let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
+        for (destination, &source) in spectrum.iter_mut().zip(coefficients.row(ch)) {
+            *destination = source;
+        }
+        dsp::fft(&mut spectrum, false);
+        for (bin, value) in spectrum.iter_mut().enumerate() {
+            if bin == 0 || bin == fft_len / 2 {
+                *value = Complex64::new(0.0, 0.0);
+                continue;
+            }
+            let frequency_hz = if bin < fft_len / 2 {
+                bin as f64 * sample_rate / fft_len as f64
+            } else {
+                (bin as f64 - fft_len as f64) * sample_rate / fft_len as f64
+            };
+            *value *= Complex64::new(0.0, 2.0 * PI * frequency_hz);
+        }
+        dsp::fft(&mut spectrum, true);
+        for (sample, &value) in spectrum.iter().take(coefficients.ncols()).enumerate() {
+            derivative[[ch, sample]] = value;
+        }
+    }
+    derivative
 }
 
 fn apply_floor(
@@ -1124,7 +1252,7 @@ fn transport_frame_energy(
     );
     let (frequency_axis, _) = utils::freq2erb(param.fr1.as_slice().unwrap());
     let static_response = cmprs_gc_frsp(
-        param.fr1.as_slice().unwrap(),
+        response.fr1.as_slice().unwrap(),
         param.fs,
         param.n,
         response.b1_val.as_slice().unwrap(),
@@ -1161,7 +1289,7 @@ fn transport_frame_energy(
                     ch,
                     frame,
                     sample as f64 / param.fs,
-                    param.fr1[ch],
+                    response.fr1[ch],
                     analysis.coefficient[[ch, sample]],
                     time_axis.as_slice().unwrap(),
                     frequency_axis.as_slice().unwrap(),
@@ -1195,7 +1323,7 @@ fn transport_sample_energy(
                 ch,
                 sample,
                 sample as f64 / param.fs,
-                param.fr1[ch],
+                output.gc_resp.fr1[ch],
                 analysis.coefficient[[ch, sample]],
                 time_axis.as_slice().unwrap(),
                 frequency_axis.as_slice().unwrap(),
@@ -1303,6 +1431,9 @@ mod tests {
     use ndarray::array;
 
     use super::*;
+    use crate::gcfb_v234::gcfb_v234::{
+        discrete_cascade_peak_bins, fp2_to_fr1, fr1_to_fp2, initial_asymmetric_ratio_and_centers,
+    };
     use crate::gcfb_v234::{DynHpaf, GainReference, GcParam};
 
     fn compact_frame_parameters() -> GcParam {
@@ -1414,6 +1545,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sample_frequency_uses_the_realized_coefficient_derivative() {
+        let mut parameters = compact_frame_parameters();
+        parameters.num_ch = 3;
+        parameters.f_range = [300.0, 1_400.0];
+        parameters.dyn_hpaf.str_prc = "sample-base".into();
+        parameters.num_update_asym_cmp = 1;
+        let signal: Vec<f64> = (0..192)
+            .map(|sample| {
+                let amplitude = if sample < 64 {
+                    0.01
+                } else if sample < 128 {
+                    0.8
+                } else {
+                    0.08
+                };
+                amplitude * (2.0 * PI * 650.0 * sample as f64 / 8_000.0).sin()
+            })
+            .collect();
+        let output = gcfb_v234(&signal, parameters).unwrap();
+        let operator = conditioned_operator_outputs(&signal, &output).unwrap();
+        let old_auxiliary_derivative = operator.derivative.clone();
+        let coefficients = operator.coefficient.clone();
+        let realized_derivative = differentiate_realized_coefficients(
+            &coefficients,
+            output.gc_param.fs,
+            operator.analysis_fft_len,
+        );
+        let analysis = analyze_coefficients(operator, 1e-10, output.gc_param.fs).unwrap();
+        let mut differs_from_the_fixed_operator_formula = false;
+        for ch in 0..coefficients.nrows() {
+            for sample in 0..coefficients.ncols() {
+                if !analysis.validity_mask[[ch, sample]] {
+                    continue;
+                }
+                let expected = (realized_derivative[[ch, sample]] / coefficients[[ch, sample]]).im
+                    / (2.0 * PI);
+                assert_relative_eq!(
+                    analysis.f_hat[[ch, sample]],
+                    expected,
+                    epsilon = 1e-10,
+                    max_relative = 1e-10
+                );
+                let old = (old_auxiliary_derivative[[ch, sample]] / coefficients[[ch, sample]]).im
+                    / (2.0 * PI);
+                differs_from_the_fixed_operator_formula |= (expected - old).abs() > 1e-3;
+            }
+        }
+        assert!(differs_from_the_fixed_operator_formula);
     }
 
     #[test]
@@ -1950,16 +2132,39 @@ mod tests {
     }
 
     fn composite_erb_at_1khz(scale: f64) -> f64 {
+        let baseline = GcParam::default();
+        let level = baseline.level_db_scgcfb;
+        let ratio = baseline.frat[0][0] + baseline.frat[1][0] * level;
+        let target_peak = fr1_to_fp2(
+            baseline.n,
+            baseline.b1[0],
+            baseline.c1[0],
+            baseline.b2[0][0],
+            baseline.c2[0][0],
+            ratio,
+            1_000.0,
+        )
+        .unwrap()
+        .0;
         let parameters = scale_bandwidths(GcParam::default(), scale);
-        let level = parameters.level_db_scgcfb;
-        let frat = parameters.frat[0][0] + parameters.frat[1][0] * level;
+        let carrier = fp2_to_fr1(
+            parameters.n,
+            parameters.b1[0],
+            parameters.c1[0],
+            parameters.b2[0][0],
+            parameters.c2[0][0],
+            ratio,
+            target_peak,
+        )
+        .unwrap()
+        .0;
         let response = cmprs_gc_frsp(
-            &[1000.0],
+            &[carrier],
             parameters.fs,
             parameters.n,
             &[parameters.b1[0]],
             &[parameters.c1[0]],
-            &[frat],
+            &[ratio],
             &[parameters.b2[0][0]],
             &[parameters.c2[0][0]],
             4096,
@@ -2039,6 +2244,29 @@ mod tests {
         assert_eq!(baseline_output.scgc_smpl, ordinary_output.scgc_smpl);
         assert_eq!(consensus.baseline_index, 1);
         assert_eq!(consensus.analyses.len(), 3);
+        assert_eq!(consensus.scale_metadata.len(), 3);
+        let baseline_peaks =
+            &consensus.scale_metadata[consensus.baseline_index].nominal_peak_frequencies_hz;
+        let peak_fft_len = consensus.scale_metadata[consensus.baseline_index].peak_grid_fft_len;
+        let peak_spacing = consensus.scale_metadata[consensus.baseline_index].peak_grid_spacing_hz;
+        assert!(peak_fft_len >= 65_536);
+        assert!(peak_fft_len.is_power_of_two());
+        assert_eq!(peak_spacing, sample_rate / peak_fft_len as f64);
+        for (scale, metadata) in config.scales.iter().zip(&consensus.scale_metadata) {
+            assert_eq!(*scale, metadata.scale);
+            assert_eq!(metadata.nominal_peak_frequencies_hz, *baseline_peaks);
+            assert_eq!(metadata.peak_grid_fft_len, peak_fft_len);
+            assert_eq!(metadata.peak_grid_spacing_hz, peak_spacing);
+            assert!(
+                metadata
+                    .nominal_peak_frequencies_hz
+                    .iter()
+                    .all(|frequency| {
+                        let bin = frequency / peak_spacing;
+                        (bin - bin.round()).abs() <= f64::EPSILON * bin.abs().max(1.0)
+                    })
+            );
+        }
         assert_eq!(
             consensus.analyses[consensus.baseline_index]
                 .reassignment
@@ -2100,5 +2328,205 @@ mod tests {
             .count();
         assert!(consensus_bins > 0);
         assert!(consensus_bins < consensus.consensus_mask.len());
+    }
+
+    fn assert_fixed_mode_discrete_locks(parameters: GcParam, scales: &[f64]) {
+        let signal = [1.0, 0.0, 0.0, 0.0];
+        let baseline = gcfb_v234(&signal, parameters.clone()).unwrap();
+        let peak_grid =
+            prepare_bandwidth_peak_grid(&parameters, scales, &baseline.gc_param, &baseline.gc_resp)
+                .unwrap();
+        for &scale in scales {
+            if scale == 1.0 {
+                continue;
+            }
+            let scaled = gcfb_v234_with_bandwidth_peak_lock(
+                &signal,
+                scale_bandwidths(parameters.clone(), scale),
+                &baseline.gc_param.hloss,
+                peak_grid.clone(),
+            )
+            .unwrap();
+            let (ratios, scaled_centers) =
+                initial_asymmetric_ratio_and_centers(&scaled.gc_param, &scaled.gc_resp);
+            let baseline_centers = &ratios * &baseline.gc_resp.fp1;
+            let (baseline_b2, baseline_c2) = match baseline.gc_param.ctrl {
+                ControlMode::Static => (
+                    baseline.gc_resp.b2_val.clone(),
+                    baseline.gc_resp.c2_val.clone(),
+                ),
+                ControlMode::Level => (
+                    Array1::from_elem(baseline.gc_param.num_ch, baseline.gc_param.lvl_est.b2),
+                    &baseline.gc_param.hloss.fb_compression_health * baseline.gc_param.lvl_est.c2,
+                ),
+                _ => unreachable!(),
+            };
+            let (scaled_b2, scaled_c2) = match scaled.gc_param.ctrl {
+                ControlMode::Static => {
+                    (scaled.gc_resp.b2_val.clone(), scaled.gc_resp.c2_val.clone())
+                }
+                ControlMode::Level => (
+                    Array1::from_elem(scaled.gc_param.num_ch, scaled.gc_param.lvl_est.b2),
+                    &scaled.gc_param.hloss.fb_compression_health * scaled.gc_param.lvl_est.c2,
+                ),
+                _ => unreachable!(),
+            };
+            let target_bins = discrete_cascade_peak_bins(
+                &baseline.gc_param,
+                &baseline.gc_resp,
+                &baseline_centers,
+                &baseline_b2,
+                &baseline_c2,
+                peak_grid.fft_len(),
+            )
+            .unwrap();
+            let actual_bins = discrete_cascade_peak_bins(
+                &scaled.gc_param,
+                &scaled.gc_resp,
+                &scaled_centers,
+                &scaled_b2,
+                &scaled_c2,
+                peak_grid.fft_len(),
+            )
+            .unwrap();
+            assert_eq!(actual_bins, target_bins);
+        }
+    }
+
+    #[test]
+    fn static_and_level_consensus_lock_the_discrete_cascade() {
+        for ctrl in [ControlMode::Static, ControlMode::Level] {
+            assert_fixed_mode_discrete_locks(
+                GcParam {
+                    num_ch: 6,
+                    out_mid_crct: "No".into(),
+                    ctrl,
+                    ..GcParam::default()
+                },
+                &[0.8, 1.0, 1.2],
+            );
+        }
+    }
+
+    #[test]
+    fn valid_near_nyquist_consensus_has_no_discrete_peak_drift() {
+        assert_fixed_mode_discrete_locks(
+            GcParam {
+                fs: 8_000.0,
+                num_ch: 5,
+                f_range: [2_800.0, 3_900.0],
+                out_mid_crct: "No".into(),
+                ctrl: ControlMode::Static,
+                ..GcParam::default()
+            },
+            &[0.8, 1.0],
+        );
+    }
+
+    #[test]
+    fn impossible_near_nyquist_lock_is_rejected_without_drift() {
+        let parameters = GcParam {
+            fs: 8_000.0,
+            num_ch: 5,
+            f_range: [2_800.0, 3_900.0],
+            out_mid_crct: "No".into(),
+            ctrl: ControlMode::Static,
+            ..GcParam::default()
+        };
+        let error = gcfb_v234_with_bandwidth_consensus(
+            &[1.0, 0.0],
+            parameters,
+            &BandwidthConsensusConfig {
+                scales: vec![1.0, 3.0],
+                ..BandwidthConsensusConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn dynamic_bandwidth_scale_locks_to_reference_at_its_own_ratio() {
+        let mut parameters = compact_frame_parameters();
+        parameters.num_ch = 4;
+        parameters.f_range = [300.0, 1_800.0];
+        parameters.dyn_hpaf.str_prc = "sample-base".into();
+        parameters.num_update_asym_cmp = 3;
+        let signal: Vec<f64> = (0..240)
+            .map(|sample| {
+                let amplitude = 0.02 + 0.48 * sample as f64 / 239.0;
+                amplitude * (2.0 * PI * 750.0 * sample as f64 / 8_000.0).cos()
+            })
+            .collect();
+        let baseline = gcfb_v234(&signal, parameters.clone()).unwrap();
+        let scales = [1.0, 1.2];
+        let peak_grid = prepare_bandwidth_peak_grid(
+            &parameters,
+            &scales,
+            &baseline.gc_param,
+            &baseline.gc_resp,
+        )
+        .unwrap();
+        let fft_len = peak_grid.fft_len();
+        let scaled = gcfb_v234_with_bandwidth_peak_lock(
+            &signal,
+            scale_bandwidths(parameters, 1.2),
+            &baseline.gc_param.hloss,
+            peak_grid,
+        )
+        .unwrap();
+        let mut ratio_histories_diverged = false;
+        let mut realized_peak_bins_diverged = false;
+        for sample in (0..signal.len()).step_by(scaled.gc_param.num_update_asym_cmp) {
+            let scaled_ratios = scaled.gc_resp.frat_val.column(sample).to_owned();
+            let realized_baseline_ratios = baseline.gc_resp.frat_val.column(sample);
+            ratio_histories_diverged |= scaled_ratios
+                .iter()
+                .zip(realized_baseline_ratios)
+                .any(|(&scaled, &baseline)| (scaled - baseline).abs() > 1e-9);
+
+            // The conditional target is the unscaled reference cascade
+            // evaluated at this scale's ratio, not the simultaneously realized
+            // baseline cascade at its independently derived ratio.
+            let conditional_reference_centers = &scaled_ratios * &baseline.gc_resp.fp1;
+            let scaled_centers = scaled.gc_resp.fr2.column(sample).to_owned();
+            let conditional_target_bins = discrete_cascade_peak_bins(
+                &baseline.gc_param,
+                &baseline.gc_resp,
+                &conditional_reference_centers,
+                &baseline.gc_resp.b2_val,
+                &baseline.gc_resp.c2_val,
+                fft_len,
+            )
+            .unwrap();
+            let actual_bins = discrete_cascade_peak_bins(
+                &scaled.gc_param,
+                &scaled.gc_resp,
+                &scaled_centers,
+                &scaled.gc_resp.b2_val,
+                &scaled.gc_resp.c2_val,
+                fft_len,
+            )
+            .unwrap();
+            assert_eq!(actual_bins, conditional_target_bins);
+
+            let realized_baseline_centers = baseline.gc_resp.fr2.column(sample).to_owned();
+            let realized_baseline_bins = discrete_cascade_peak_bins(
+                &baseline.gc_param,
+                &baseline.gc_resp,
+                &realized_baseline_centers,
+                &baseline.gc_resp.b2_val,
+                &baseline.gc_resp.c2_val,
+                fft_len,
+            )
+            .unwrap();
+            realized_peak_bins_diverged |= actual_bins != realized_baseline_bins;
+            for held in sample + 1..(sample + scaled.gc_param.num_update_asym_cmp).min(signal.len())
+            {
+                assert_eq!(scaled.gc_resp.fr2.column(held), scaled_centers.view());
+            }
+        }
+        assert!(ratio_histories_diverged);
+        assert!(realized_peak_bins_diverged);
     }
 }

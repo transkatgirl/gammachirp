@@ -276,7 +276,7 @@ fn validate_user_controlled_parameters(param: &GcParam) -> Result<()> {
     Ok(())
 }
 
-fn initial_asymmetric_ratio_and_centers(
+pub(super) fn initial_asymmetric_ratio_and_centers(
     param: &GcParam,
     response: &GcResp,
 ) -> (Array1<f64>, Array1<f64>) {
@@ -291,6 +291,95 @@ fn initial_asymmetric_ratio_and_centers(
     };
     let centers = &ratios * &response.fp1;
     (ratios, centers)
+}
+
+pub(super) fn prepare_input_correction_fir(param: &GcParam) -> Result<Vec<f64>> {
+    if param.out_mid_crct.eq_ignore_ascii_case("no") {
+        Ok(vec![1.0])
+    } else {
+        Ok(utils::out_mid_crct_filt(&param.out_mid_crct, param.fs, 2)?.to_vec())
+    }
+}
+
+pub(super) fn prepare_passive_impulses(
+    param: &GcParam,
+    response: &GcResp,
+) -> Result<Vec<Vec<f64>>> {
+    (0..param.num_ch)
+        .map(|ch| {
+            let impulse = gammachirp::gammachirp(
+                &[response.fr1[ch]],
+                param.fs,
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                0.0,
+                Carrier::Cosine,
+                Normalization::Peak,
+            )?;
+            Ok(impulse.gc.row(0).to_vec())
+        })
+        .collect()
+}
+
+/// Prepare the fixed asymmetric path and all time-invariant response metadata.
+pub(super) fn prepare_time_invariant_response(
+    param: &GcParam,
+    response: &mut GcResp,
+) -> Result<AcfCoef> {
+    let channels = param.num_ch;
+    let (initial_ratios, initial_centers) = initial_asymmetric_ratio_and_centers(param, response);
+    let coefficients = if param.ctrl == ControlMode::Static {
+        response.fr2 = Array2::from_shape_vec((channels, 1), initial_centers.to_vec()).unwrap();
+        for ch in 0..channels {
+            response.fp2[ch] = fr1_to_fp2(
+                param.n,
+                response.b1_val[ch],
+                response.c1_val[ch],
+                response.b2_val[ch],
+                response.c2_val[ch],
+                initial_ratios[ch],
+                response.fr1[ch],
+            )?
+            .0;
+        }
+        make_asym_cmp_filters_v2(
+            param.fs,
+            initial_centers.as_slice().unwrap(),
+            response.b2_val.as_slice().unwrap(),
+            response.c2_val.as_slice().unwrap(),
+        )?
+    } else {
+        make_asym_cmp_filters_v2(
+            param.fs,
+            initial_centers.as_slice().unwrap(),
+            &[param.lvl_est.b2],
+            &[param.lvl_est.c2],
+        )?
+    };
+    if param.ctrl == ControlMode::Dynamic {
+        let reference_ratio = Array1::from_iter((0..channels).map(|ch| {
+            param.frat[0][0]
+                + param.frat[0][1] * response.ef[ch]
+                + (param.frat[1][0] + param.frat[1][1] * response.ef[ch]) * param.gain_ref_db
+        }));
+        let reference = cmprs_gc_frsp(
+            response.fr1.as_slice().unwrap(),
+            param.fs,
+            param.n,
+            response.b1_val.as_slice().unwrap(),
+            response.c1_val.as_slice().unwrap(),
+            reference_ratio.as_slice().unwrap(),
+            response.b2_val.as_slice().unwrap(),
+            response.c2_val.as_slice().unwrap(),
+            1024,
+        )?;
+        response.gain_factor = reference
+            .norm_fct_fp2
+            .mapv(|value| 10_f64.powf(param.gain_cmpnst_db / 20.0) * value);
+        response.cgc_ref = Some(reference);
+    }
+    Ok(coefficients)
 }
 
 /// Fill derived v2.11 parameters and channel responses.
@@ -669,59 +758,18 @@ pub fn gcfb_v211(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
         ));
     }
     let (param, mut response) = set_param(gc_param)?;
-    let snd = if param.out_mid_crct.eq_ignore_ascii_case("no") {
-        snd_in.to_vec()
-    } else {
-        // A frequency-table FIR approximation is exposed by the utility API.
-        let coefficients = utils::out_mid_crct_filt(&param.out_mid_crct, param.fs, 2)?;
-        dsp::lfilter(coefficients.as_slice().unwrap(), &[1.0], snd_in)?
-    };
+    let correction_fir = prepare_input_correction_fir(&param)?;
+    let snd = dsp::lfilter(&correction_fir, &[1.0], snd_in)?;
     let channels = param.num_ch;
     let samples = snd.len();
     let mut pgc_out = Array2::zeros((channels, samples));
     let mut level_out = Array2::zeros((channels, samples));
-    let (initial_ratios, initial_centers) = initial_asymmetric_ratio_and_centers(&param, &response);
-    let signal_coefficients = if param.ctrl == ControlMode::Static {
-        response.fr2 = Array2::from_shape_vec((channels, 1), initial_centers.to_vec()).unwrap();
-        for ch in 0..channels {
-            response.fp2[ch] = fr1_to_fp2(
-                param.n,
-                response.b1_val[ch],
-                response.c1_val[ch],
-                response.b2_val[ch],
-                response.c2_val[ch],
-                initial_ratios[ch],
-                response.fr1[ch],
-            )?
-            .0;
-        }
-        make_asym_cmp_filters_v2(
-            param.fs,
-            initial_centers.as_slice().unwrap(),
-            response.b2_val.as_slice().unwrap(),
-            response.c2_val.as_slice().unwrap(),
-        )?
-    } else {
-        make_asym_cmp_filters_v2(
-            param.fs,
-            initial_centers.as_slice().unwrap(),
-            &[param.lvl_est.b2],
-            &[param.lvl_est.c2],
-        )?
-    };
+    let (_, initial_centers) = initial_asymmetric_ratio_and_centers(&param, &response);
+    let signal_coefficients = prepare_time_invariant_response(&param, &mut response)?;
+    let passive_impulses = prepare_passive_impulses(&param, &response)?;
     let mut cgc_out = Array2::zeros((channels, samples));
-    for ch in 0..channels {
-        let impulse = gammachirp::gammachirp(
-            &[response.fr1[ch]],
-            param.fs,
-            param.n,
-            response.b1_val[ch],
-            response.c1_val[ch],
-            0.0,
-            Carrier::Cosine,
-            Normalization::Peak,
-        )?;
-        let filtered = utils::fftfilt(impulse.gc.row(0).as_slice().unwrap(), &snd);
+    for (ch, impulse) in passive_impulses.iter().enumerate() {
+        let filtered = utils::fftfilt(impulse, &snd);
         pgc_out.row_mut(ch).assign(&filtered);
         let mut section_out = filtered.to_vec();
         for section in 0..4 {
@@ -790,31 +838,11 @@ pub fn gcfb_v211(snd_in: &[f64], gc_param: GcParam) -> Result<GcfbOutput> {
             let output = status.process(&coefficients, &input, false)?;
             cgc_out.column_mut(sample).assign(&output);
         }
-        let reference_ratio = Array1::from_iter((0..channels).map(|ch| {
-            param.frat[0][0]
-                + param.frat[0][1] * response.ef[ch]
-                + (param.frat[1][0] + param.frat[1][1] * response.ef[ch]) * param.gain_ref_db
-        }));
-        let reference = cmprs_gc_frsp(
-            response.fr1.as_slice().unwrap(),
-            param.fs,
-            param.n,
-            response.b1_val.as_slice().unwrap(),
-            response.c1_val.as_slice().unwrap(),
-            reference_ratio.as_slice().unwrap(),
-            response.b2_val.as_slice().unwrap(),
-            response.c2_val.as_slice().unwrap(),
-            1024,
-        )?;
-        response.gain_factor = reference
-            .norm_fct_fp2
-            .mapv(|v| 10_f64.powf(param.gain_cmpnst_db / 20.0) * v);
         for ch in 0..channels {
             cgc_out
                 .row_mut(ch)
                 .mapv_inplace(|v| v * response.gain_factor[ch]);
         }
-        response.cgc_ref = Some(reference);
     }
     Ok(GcfbOutput {
         cgc_out,

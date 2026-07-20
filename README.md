@@ -31,6 +31,74 @@ assert_eq!(output.dcgc_out.nrows(), 32);
 # Ok::<(), gammachirp_rs::Error>(())
 ```
 
+### Sample streaming
+
+Both filterbank versions also provide bounded-memory `GcfbStream` processors.
+The v2.11 stream returns one channel vector per accepted sample; dynamic level,
+frequency-ratio, and filter-center histories travel with that sample instead of
+being retained by the processor.
+
+```rust
+use gammachirp_rs::gcfb_v211::{ControlMode, GcParam, GcfbStream};
+
+let mut filterbank = GcfbStream::new(GcParam {
+    num_ch: 32,
+    out_mid_crct: "No".into(),
+    ctrl: ControlMode::Dynamic,
+    ..GcParam::default()
+})?;
+
+for sample in [1.0, 0.0, 0.0, 0.0] {
+    let output = filterbank.process_sample(sample)?;
+    assert_eq!(output.pgc_out.len(), 32);
+    assert_eq!(output.cgc_out.len(), 32);
+    assert!(output.lvl_db.is_some());
+}
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+The v2.34 stream always returns the immediate sample-domain `scgc_smpl`.
+Static, level, and dynamic sample-base modes also return a `DcgcEvent::Sample`
+immediately. Dynamic frame mode delays `DcgcEvent::Frame` until the centered
+window's right-hand samples are available. After the input ends, `finish()` is
+required to emit the remaining zero-padded frames. For `N` samples it brings
+the complete event count to `N / len_shift + 1`, matching the batch API.
+
+```rust
+use gammachirp_rs::gcfb_v234::{
+    ControlMode, DcgcEvent, DynHpaf, GcParam, GcfbStream,
+};
+
+let mut filterbank = GcfbStream::new(GcParam {
+    num_ch: 32,
+    out_mid_crct: "No".into(),
+    ctrl: ControlMode::Dynamic,
+    dyn_hpaf: DynHpaf {
+        str_prc: "frame-base".into(),
+        ..DynHpaf::default()
+    },
+    ..GcParam::default()
+})?;
+
+let mut frames = Vec::new();
+for sample in [1.0, 0.0, 0.0, 0.0] {
+    if let Some(event) = filterbank.process_sample(sample)?.event {
+        frames.push(event);
+    }
+}
+frames.extend(filterbank.finish()?);
+assert!(frames.iter().all(|event| matches!(event, DcgcEvent::Frame { .. })));
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+Every emitted `dcgc_out` already includes the selected dcGC gain
+normalization. The parameter and response accessors expose prepared,
+time-invariant metadata such as `gain_factor` and `cgc_ref`; time-varying
+histories remain attached to their sample or frame events. Streaming uses
+direct causal FIR convolution while the optimized batch path uses FFT
+convolution, so their finite outputs agree to ordinary floating-point
+roundoff rather than being guaranteed bit-for-bit identical.
+
 ### Breebaart 2001 binaural processing
 
 The `breebaart2001` module combines the dynamic compressive gammachirp
@@ -70,6 +138,49 @@ let activity = breebaart2001_ei(&left, &right, 48_000.0, &units, &config)?;
 assert_eq!(activity.dim(), (3, 32, 256));
 # Ok::<(), gammachirp_rs::Error>(())
 ```
+
+#### Breebaart sample streaming
+
+The monaural, EI-only, and end-to-end hybrid stages also have bounded-memory
+`MonauralStream`, `EiStream`, and `HybridBinauralStream` processors. The
+paper's double-sided exponential and AMT's forward-backward EI filter are
+acausal, so streaming is selected explicitly with `MonauralConfig::streaming()`,
+`EiConfig::streaming()`, or `HybridBinauralConfig::streaming()`. Existing
+defaults remain unchanged for offline work.
+
+Each accepted waveform pair immediately returns GCFB and peripheral channel
+vectors. EI activity is an optional indexed event because paper-symmetric
+fractional delays require a fixed amount of future input. For a finite signal,
+`finish()` emits that bounded zero-extended tail. For an indefinite signal,
+continue calling `process_sample()` and do not call `finish()`.
+
+```rust
+use gammachirp_rs::breebaart2001::{
+    EiUnit, HybridBinauralConfig, HybridBinauralStream,
+};
+
+let mut config = HybridBinauralConfig::streaming();
+config.filterbank.num_ch = 16;
+config.filterbank.out_mid_crct = "No".into();
+let units = [EiUnit::default(), EiUnit::new(0.5e-3, 3.0)];
+let mut processor = HybridBinauralStream::new(&units, config)?;
+
+let mut ei_samples = Vec::new();
+for (left, right) in [(1.0, 0.8), (0.0, 0.0), (0.0, 0.0)] {
+    let step = processor.process_sample(left, right)?;
+    if let Some(event) = step.ei_event {
+        ei_samples.push(event);
+    }
+}
+ei_samples.extend(processor.finish()?);
+assert_eq!(ei_samples.len(), 3);
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+Both seeded noise sources are traversed in sample-major order so noisy batch
+and streaming calls reproduce the same values. This changes the exact seeded
+sequence produced by earlier batch-only code while preserving deterministic
+replay, trial-seed derivation, and the model's sharing/independence rules.
 
 `hybrid_binaural` accepts equal-length left and right waveforms. It runs each
 ear through the same configured GCFB and peripheral stages, then evaluates the
@@ -181,11 +292,110 @@ The imaginary analysis branch is offline and acausal; the ordinary real GCFB
 branch remains causal and unchanged. In frame mode, dynamic compression is a
 positive real gain, so it affects transported energy but not coordinates. In
 sample mode, all three operator applications replay the recorded HP-AF
-coefficient history. Its exactness is conditional on that history: the
-analysis does not differentiate through the nonlinear level estimator that
-created the coefficients. In all modes, exactness refers to the implemented
-zero-padded finite discrete operator up to floating-point error. The selected
-DFT length is exposed as `ReassignmentResult::analysis_fft_len`.
+coefficient history. The frequency coordinate then differentiates the realized
+complex coefficient history itself, so it includes the HP-AF's temporal
+variation without taking a derivative of the nonlinear estimator as a mapping
+from input to coefficients. Fixed and frame modes are exact for their
+implemented conditioned linear operator; sample mode is conditional on the
+recorded history and exact for its zero-padded finite-DFT interpolant up to
+floating-point error. The selected DFT length is exposed as
+`ReassignmentResult::analysis_fft_len`.
+
+For indefinite inputs, `ReassignmentStream` provides a bounded-memory,
+zero-latency causal approximation. It owns the ordinary v2.34 stream and
+returns that filterbank step together with per-channel source energy,
+reassigned coordinates, and phase-transported complex contributions. Static,
+level, and dynamic sample-base control are supported; dynamic frame-base
+control remains batch-only.
+
+```rust
+use gammachirp_rs::gcfb_v234::{
+    ControlMode, DynHpaf, GcParam, ReassignmentStream,
+};
+
+let mut analysis = ReassignmentStream::new(GcParam {
+    num_ch: 32,
+    out_mid_crct: "No".into(),
+    ctrl: ControlMode::Dynamic,
+    dyn_hpaf: DynHpaf {
+        str_prc: "sample-base".into(),
+        ..DynHpaf::default()
+    },
+    ..GcParam::default()
+})?;
+
+for sample in [1.0, 0.0, 0.0, 0.0] {
+    let step = analysis.process_sample(sample)?;
+    assert_eq!(step.source_energy.len(), 32);
+    assert_eq!(step.phase_contribution.len(), 32);
+    assert_eq!(step.filterbank.sample_index + 1, analysis.samples_processed());
+}
+assert_eq!(analysis.latency_samples(), 0);
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+The stream uses a cosine-plus-sine causal gammachirp atom instead of the batch
+path's whole-signal DFT projection. Fixed filters use its causal derivative;
+sample-dynamic filters use the wrapped backward phase increment of the realized
+complex coefficient, which includes changes in the HP-AF. Consequently, the
+first nonzero dynamic coefficient has no frequency coordinate. Its real branch
+follows the ordinary GCFB, while complex coordinates and phase are expected to
+be similar rather than identical to batch reassignment away from finite-signal
+boundaries. No relative coefficient floor is applied online:
+`coordinate_mask` only reports nonzero coefficients with finite coordinates,
+and callers can threshold `source_energy` for their own finite or rolling
+target maps. The stream emits immediately and therefore has no `finish()`
+tail.
+
+`BandwidthConsensusStream` extends that causal analysis to an indefinite input
+without retaining the signal. It runs one reassignment stream for every
+bandwidth scale and keeps a bounded rolling target map. Once its normalization
+window is full, each input finalizes one oldest agreement, mask, and salience
+column. The individual scale steps remain immediate; consensus latency is one
+less than the resolved window length. `scale_metadata()` reports each scale's
+retuned passive carriers, measured nominal composite peaks, and the shared
+peak-grid FFT length and spacing.
+
+```rust
+use gammachirp_rs::gcfb_v234::{
+    BandwidthConsensusStream, BandwidthConsensusStreamConfig, ControlMode,
+    GcParam,
+};
+
+let mut consensus = BandwidthConsensusStream::new(
+    GcParam {
+        num_ch: 32,
+        out_mid_crct: "No".into(),
+        ctrl: ControlMode::Static,
+        ..GcParam::default()
+    },
+    BandwidthConsensusStreamConfig {
+        // None derives the horizon from the longest configured causal atom.
+        window_samples: None,
+        ..BandwidthConsensusStreamConfig::default()
+    },
+)?;
+
+for sample in [1.0, 0.0, 0.0, 0.0] {
+    let step = consensus.process_sample(sample)?;
+    assert_eq!(step.scale_steps.len(), 3);
+    if let Some(frame) = step.consensus {
+        assert_eq!(frame.salience.len(), 32);
+    }
+}
+// Finite callers flush delayed target columns; indefinite callers keep going.
+let tail = consensus.finish()?;
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+The streaming configuration deliberately omits `ReassignmentConfig`'s
+coefficient floor because that threshold depends on a future whole-input
+channel maximum. Each rolling scale is instead normalized by its maximum over
+the active target window. The default window adapts to the prepared sample rate
+and bandwidths; callers can set `window_samples` to a nonzero value for a fixed
+horizon. Coordinates outside the live rolling time range or common ERB grid
+are discarded. Memory is proportional to the fixed scales, channels, atom
+support, and window size rather than elapsed input length.
 
 Energy rejected by the relative coefficient floor and by target-map boundaries
 is reported separately. Reassignment sharpens resolved ridges but cannot split
@@ -202,7 +412,10 @@ so its squared magnitude is the transported energy, then applies
 \exp\!\left(i\pi(f_{r1,k}+\hat f)(\hat t-t)\right)
 \]
 
-before bilinear deposition. `PhaseReassignmentResult::complex_map` retains
+Here `f_{r1,k}` is the analysis filter's actual passive carrier; for a scaled
+consensus analysis this is the retuned carrier reported by `scale_metadata`,
+while deposition still uses the shared target-frequency grid. After this
+rotation and bilinear deposition, `PhaseReassignmentResult::complex_map` retains
 absolute phase for analysis, while `phase_coherence_map` is the magnitude of
 the complex sum divided by the sum of contribution magnitudes. The complex map
 is a linearly interpolated amplitude histogram, not an energy map: a single
@@ -225,8 +438,28 @@ of this implementation, not the paper's Gaussian-STFT white-noise theorem.
 `gcfb_v234_with_bandwidth_consensus` runs phase-aware analysis at several
 complete-filter bandwidths. Its default scales are `0.8`, `1.0`, and `1.2`.
 Each scale multiplies both coefficients of `b1`, every coefficient of `b2`, and
-`lvl_est.b2`; chirp, compression, level-control, hearing-loss, and frequency-
-grid parameters remain fixed. At 1 kHz and 50 dB, the endpoint scales produce
+`lvl_est.b2`; chirp, compression, level-control, hearing-loss, and target-grid
+parameters remain fixed. Each scaled analysis retunes its internal passive
+carriers so the implemented cosine-pGC FIR plus four-section digital HP-AF
+cascade has the same nominal main-lobe peak bin as the baseline. The peak is
+the grid-local maximum selected nearest the Python analytic peak, measured on
+one shared DFT grid of at least 65,536 points; `scale_metadata` reports that
+grid's FFT length and hertz spacing as well as the nominal measured bin
+frequencies. If any prepared passive impulse is too long, the whole ensemble
+moves to the next power-of-two grid. Thus "exact" means identical reported DFT
+bins at the stated control ratio, not identical continuous-DTFT maxima between
+bins.
+
+In sample-dynamic mode, every scale keeps its own level history. At each
+coefficient update, a scaled filter solves for the peak of the unscaled
+reference response evaluated at that scaled filter's realized ratio. This
+conditional lock removes direct bandwidth-induced peak drift at a fixed ratio,
+but it does not force equality with the simultaneously realized baseline peak:
+the baseline may have a different level-derived ratio. Consensus therefore
+treats controller-induced drift as bandwidth instability, and the analysis
+fails only when no positive sub-Nyquist center reaches the conditional target
+bin. This nonlinear behavior is a GCFB-specific extension of the paper's
+fixed-bandwidth-window consensus. At 1 kHz and 50 dB, the endpoint scales produce
 composite-filter ERBs of approximately `0.81` and `1.19` times the baseline,
 bracketing the roughly 10% to 18% between-listener variation reported for normal
 hearing ([Moore et al., 1990](https://doi.org/10.1121/1.399960);
@@ -246,10 +479,12 @@ experiments. Its STFT-zero topology, unlimited localization precision, and
 reconstruction behavior do not automatically hold for the nonlinear GCFB.
 The complex output preserves phase for analysis and coherence measurement, but
 it is not an invertible GCFB representation and has no synthesis guarantee.
-All complex and consensus paths use the offline/acausal imaginary branch. In
-sample mode they replay the realized coefficient history, so their meaning is
-conditional on that history and does not include differentiation through the
-nonlinear estimator.
+The batch complex and consensus paths use the offline/acausal imaginary branch.
+The streaming paths use causal quadrature atoms and rolling normalization. In
+batch sample mode, frequency is the finite-DFT derivative of the realized
+coefficient history; in streaming sample mode, it is the wrapped backward phase
+increment. Both include the realized HP-AF variation without differentiating
+through the nonlinear level estimator.
 
 Render a self-contained, three-panel comparison of the matched energy map,
 its time-frequency reassignment, and the default bandwidth-consensus salience

@@ -17,12 +17,27 @@
 //!   monaural channels of the central detector.
 //! - [`CentralTemplate`] fits and applies the paper's Appendix-B ideal-observer
 //!   template to caller-supplied internal representations.
+//! - [`MonauralStream`], [`EiStream`], and [`HybridBinauralStream`] provide
+//!   bounded-memory causal processing for inputs whose final length is not
+//!   known in advance.
 //!
 //! The EI defaults follow the continuous-time equations in the 2001 paper.
 //! AMT 1.6 uses a different delay convention and finite-record integration
 //! boundary treatment; use [`EiConfig::amt_1_6`] when reproducing its
 //! `breebaart2001_eicell` output. This does not turn [`hybrid_binaural`] into
 //! AMT's end-to-end model because the hybrid intentionally retains the GCFB.
+//!
+//! # Streaming and causality
+//!
+//! The paper's double-sided exponential and AMT's forward-backward EI filter
+//! are acausal. Exact final samples from those modes require the complete
+//! finite record, so stream constructors reject them. Use the explicit
+//! [`MonauralConfig::streaming`], [`EiConfig::streaming`], and
+//! [`HybridBinauralConfig::streaming`] presets to select zero-state causal
+//! integration. The EI stream exactly reproduces the batch implementation's
+//! Lanczos-8 approximation to the paper-symmetric fractional delays: it retains
+//! a fixed interpolation window, returns an event once each output is final,
+//! and flushes the bounded zero-extended tail from [`EiStream::finish`].
 //!
 //! # Processing chain
 //!
@@ -77,9 +92,18 @@
 
 use ndarray::{Array1, Array2, Array3, Zip};
 
+mod stream;
+
+pub use stream::{
+    EiStream, EiStreamSample, HybridBinauralStream, HybridBinauralStreamStep, MonauralStream,
+    MonauralStreamSample,
+};
+
+#[cfg(test)]
+use crate::dsp;
 use crate::gcfb_v211::gcfb_v211::ControlMode;
 use crate::gcfb_v234::{GcParam, GcfbOutput, gcfb_v234};
-use crate::{Error, Result, dsp};
+use crate::{Error, Result};
 
 /// The characteristic interaural parameters of one EI unit.
 ///
@@ -133,7 +157,8 @@ pub enum EiDelayConvention {
     AmtOneSidedInteger,
 }
 
-/// Boundary treatment used by the EI temporal integrator.
+/// Temporal integration and finite-record boundary treatment used by the EI
+/// stage.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EiIntegrationBoundary {
     /// Treat samples outside the supplied representation as zero when applying
@@ -143,6 +168,12 @@ pub enum EiIntegrationBoundary {
     /// Reproduce the odd-reflection padding and steady-state initialization of
     /// the first-order forward-backward filter used by AMT 1.6.
     AmtFiltfilt,
+    /// Apply a causal, unity-gain first-order low-pass with zero initial state.
+    ///
+    /// This mode is suitable for [`EiStream`] and [`HybridBinauralStream`].
+    /// The two offline modes above are acausal and cannot produce final results
+    /// for an input of indefinite length.
+    CausalZeroState,
 }
 
 /// Temporal processing used to prepare a monaural central-detector channel.
@@ -191,13 +222,20 @@ impl MonauralConfig {
             ..Self::default()
         }
     }
+
+    /// Returns the causal configuration accepted by [`MonauralStream`].
+    ///
+    /// Its numerical settings are the same as [`Self::amt_1_6`]; the separate
+    /// constructor makes the streaming intent explicit at call sites.
+    pub fn streaming() -> Self {
+        Self::amt_1_6()
+    }
 }
 
 /// Parameters of the Breebaart EI stage.
 #[derive(Clone, Debug)]
 pub struct EiConfig {
-    /// Time constant of the normalized double-sided exponential integrator, in
-    /// seconds.
+    /// Time constant of the selected temporal integrator, in seconds.
     ///
     /// Must be finite and positive. The default is 30 ms.
     pub integration_time_constant_seconds: f64,
@@ -218,7 +256,7 @@ pub struct EiConfig {
     pub delay_weight_time_constant_seconds: f64,
     /// Convention used to apply each unit's characteristic delay.
     pub delay_convention: EiDelayConvention,
-    /// Boundary treatment used for offline temporal integration.
+    /// Temporal integration and finite-record boundary convention.
     pub integration_boundary: EiIntegrationBoundary,
     /// RMS of the additive Gaussian internal noise, in model units.
     ///
@@ -227,9 +265,10 @@ pub struct EiConfig {
     pub internal_noise_std_mu: f64,
     /// Seed used to make the internal-noise realization reproducible.
     ///
-    /// One independent realization is generated for each frequency and time
-    /// sample, then shared by every EI unit as specified by the model.  This
-    /// seed is independent of [`PeripheralConfig::absolute_threshold_noise_seed`].
+    /// One independent realization is generated in sample-major order for
+    /// each frequency and time sample, then shared by every EI unit as
+    /// specified by the model. This seed is independent of
+    /// [`PeripheralConfig::absolute_threshold_noise_seed`].
     pub noise_seed: u64,
     /// Largest allowed absolute characteristic delay, in seconds.
     ///
@@ -280,6 +319,15 @@ impl EiConfig {
             internal_noise_std_mu: 0.0,
             max_abs_delay_seconds: f64::INFINITY,
             max_abs_iid_db: f64::INFINITY,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the paper defaults with causal, zero-state temporal
+    /// integration for bounded-memory streaming.
+    pub fn streaming() -> Self {
+        Self {
+            integration_boundary: EiIntegrationBoundary::CausalZeroState,
             ..Self::default()
         }
     }
@@ -348,7 +396,8 @@ pub struct PeripheralConfig {
     ///
     /// This noise stream is independent of [`EiConfig::noise_seed`] and
     /// supplies a distinct Gaussian sample for every ear, frequency channel,
-    /// and time sample.
+    /// and time sample. Samples are drawn in time-major order, left channels
+    /// before right channels, so batch and streaming runs replay identically.
     pub absolute_threshold_noise_seed: u64,
 }
 
@@ -395,6 +444,14 @@ pub struct HybridBinauralConfig {
 }
 
 impl HybridBinauralConfig {
+    /// Returns the hybrid defaults with a streamable causal EI stage.
+    pub fn streaming() -> Self {
+        Self {
+            ei: EiConfig::streaming(),
+            ..Self::default()
+        }
+    }
+
     /// Returns a copy whose two noise sources are reproducible and independent
     /// for the specified trial.
     ///
@@ -507,6 +564,7 @@ fn validate_ei_inputs(
         )));
     }
     if config.delay_convention == EiDelayConvention::AmtOneSidedInteger
+        && config.integration_boundary != EiIntegrationBoundary::CausalZeroState
         && units.iter().any(|unit| {
             let delay_samples = (unit.delay_seconds.abs() * sample_rate_hz).round();
             !delay_samples.is_finite() || delay_samples > left.ncols() as f64
@@ -674,6 +732,18 @@ fn double_sided_exponential(
         EiIntegrationBoundary::AmtFiltfilt => {
             amt_forward_backward_exponential(values, sample_rate_hz, time_constant)
         }
+        EiIntegrationBoundary::CausalZeroState => {
+            let pole = (-1.0 / (sample_rate_hz * time_constant)).exp();
+            let feedforward = 1.0 - pole;
+            let mut previous = 0.0;
+            values
+                .iter()
+                .map(|value| {
+                    previous = feedforward * value + pole * previous;
+                    previous
+                })
+                .collect()
+        }
     }
 }
 
@@ -725,20 +795,25 @@ pub fn breebaart2001_monaural(
         ));
     }
 
+    if config.temporal_mode == MonauralTemporalMode::AmtCausal {
+        let mut stream = MonauralStream::new(input.nrows(), sample_rate_hz, config.clone())?;
+        let mut output = Array2::zeros(input.dim());
+        for sample in 0..input.ncols() {
+            let input_sample = input.column(sample).to_vec();
+            let event = stream.process_sample(&input_sample)?;
+            output.column_mut(sample).assign(&event.output);
+        }
+        return Ok(output);
+    }
+
     let mut output = Array2::zeros(input.dim());
-    let pole = (-1.0 / (sample_rate_hz * config.integration_time_constant_seconds)).exp();
-    let amt_b = [1.0 - pole];
-    let amt_a = [1.0, -pole];
     for channel in 0..input.nrows() {
         let values = input.row(channel).to_vec();
-        let mut integrated = match config.temporal_mode {
-            MonauralTemporalMode::PaperDoubleSided => zero_extended_double_sided_exponential(
-                &values,
-                sample_rate_hz,
-                config.integration_time_constant_seconds,
-            ),
-            MonauralTemporalMode::AmtCausal => dsp::lfilter(&amt_b, &amt_a, &values)?,
-        };
+        let mut integrated = zero_extended_double_sided_exponential(
+            &values,
+            sample_rate_hz,
+            config.integration_time_constant_seconds,
+        );
         for value in &mut integrated {
             *value *= config.sensitivity;
         }
@@ -758,6 +833,7 @@ fn derive_trial_seed(base_seed: u64, trial_index: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+#[derive(Clone, Debug)]
 struct GaussianNoise {
     state: u64,
     spare: Option<f64>,
@@ -803,9 +879,11 @@ impl GaussianNoise {
 /// `(unit, frequency channel, sample)`. The default characteristic-delay and
 /// integration-boundary behavior follows the continuous-time equations in the
 /// paper; [`EiConfig::amt_1_6`] selects the corresponding AMT EI-cell behavior.
-/// Temporal integration is offline and acausal. Additive internal noise is
-/// independent across frequency and time but uses the same realization for all
-/// EI units. Set [`EiConfig::internal_noise_std_mu`] to zero to disable it.
+/// The default and AMT temporal integrations are offline and acausal.
+/// [`EiIntegrationBoundary::CausalZeroState`] instead selects the same
+/// unity-gain one-pole recursion used by [`EiStream`]. Additive internal noise
+/// is independent across frequency and time but uses the same realization for
+/// all EI units. Set [`EiConfig::internal_noise_std_mu`] to zero to disable it.
 ///
 /// # Errors
 ///
@@ -824,11 +902,35 @@ pub fn breebaart2001_ei(
 ) -> Result<Array3<f64>> {
     validate_ei_inputs(left, right, sample_rate_hz, units, config)?;
     let (channels, samples) = left.dim();
+
+    if config.integration_boundary == EiIntegrationBoundary::CausalZeroState {
+        let mut stream = EiStream::new(channels, sample_rate_hz, units, config.clone())?;
+        let mut output = Array3::zeros((units.len(), channels, samples));
+        for sample in 0..samples {
+            let left_sample = left.column(sample).to_vec();
+            let right_sample = right.column(sample).to_vec();
+            if let Some(event) = stream.process_sample(&left_sample, &right_sample)? {
+                output
+                    .index_axis_mut(ndarray::Axis(2), event.sample_index)
+                    .assign(&event.activity);
+            }
+        }
+        for event in stream.finish()? {
+            output
+                .index_axis_mut(ndarray::Axis(2), event.sample_index)
+                .assign(&event.activity);
+        }
+        return Ok(output);
+    }
+
     let mut output = Array3::zeros((units.len(), channels, samples));
     let mut noise = GaussianNoise::new(config.noise_seed);
-    let internal_noise = Array2::from_shape_fn((channels, samples), |_| {
-        config.internal_noise_std_mu * noise.sample()
-    });
+    let mut internal_noise = Array2::zeros((channels, samples));
+    for sample in 0..samples {
+        for channel in 0..channels {
+            internal_noise[[channel, sample]] = config.internal_noise_std_mu * noise.sample();
+        }
+    }
 
     for (unit_index, unit) in units.iter().enumerate() {
         let (left_shift_samples, right_shift_samples) = match config.delay_convention {
@@ -892,6 +994,7 @@ fn ihc_section_cutoff_hz(aggregate_cutoff_hz: f64, sample_rate_hz: f64) -> f64 {
     sample_rate_hz / std::f64::consts::PI * (target / ratio).atan()
 }
 
+#[cfg(test)]
 fn inner_hair_cell(
     filterbank: &Array2<f64>,
     sample_rate_hz: f64,
@@ -937,6 +1040,7 @@ fn absolute_threshold_noise_std_amplitude(
     Ok(Some(noise_std))
 }
 
+#[cfg(test)]
 fn add_absolute_threshold_noise(
     left: &Array2<f64>,
     right: &Array2<f64>,
@@ -950,13 +1054,19 @@ fn add_absolute_threshold_noise(
         amplitude_one_db_spl,
     )? {
         let mut noise = GaussianNoise::new(config.absolute_threshold_noise_seed);
-        for value in left_noisy.iter_mut().chain(right_noisy.iter_mut()) {
-            *value += noise_std * noise.sample();
+        for sample in 0..left.ncols() {
+            for channel in 0..left.nrows() {
+                left_noisy[[channel, sample]] += noise_std * noise.sample();
+            }
+            for channel in 0..right.nrows() {
+                right_noisy[[channel, sample]] += noise_std * noise.sample();
+            }
         }
     }
     Ok((left_noisy, right_noisy))
 }
 
+#[cfg(test)]
 fn adaptation_loops(
     input: &Array2<f64>,
     sample_rate_hz: f64,
@@ -1167,34 +1277,23 @@ pub fn hybrid_binaural(
         ));
     }
     let sample_rate = left_filterbank.gc_param.fs;
-    let (left_peripheral, right_peripheral) = add_absolute_threshold_noise(
-        &left_filterbank.dcgc_out,
-        &right_filterbank.dcgc_out,
-        amplitude_one_db_spl,
-        &config.peripheral,
-    )?;
-    let left_ihc = inner_hair_cell(
-        &left_peripheral,
-        sample_rate,
-        config.peripheral.ihc_cutoff_hz,
-    )?;
-    let right_ihc = inner_hair_cell(
-        &right_peripheral,
-        sample_rate,
-        config.peripheral.ihc_cutoff_hz,
-    )?;
-    let left_internal = adaptation_loops(
-        &left_ihc,
+    let channels = left_filterbank.dcgc_out.nrows();
+    let samples = left_filterbank.dcgc_out.ncols();
+    let mut peripheral = stream::PeripheralPairStream::new(
+        channels,
         sample_rate,
         amplitude_one_db_spl,
         &config.peripheral,
     )?;
-    let right_internal = adaptation_loops(
-        &right_ihc,
-        sample_rate,
-        amplitude_one_db_spl,
-        &config.peripheral,
-    )?;
+    let mut left_internal = Array2::zeros((channels, samples));
+    let mut right_internal = Array2::zeros((channels, samples));
+    for sample in 0..samples {
+        let left_sample = left_filterbank.dcgc_out.column(sample).to_vec();
+        let right_sample = right_filterbank.dcgc_out.column(sample).to_vec();
+        let (left_output, right_output) = peripheral.process(&left_sample, &right_sample)?;
+        left_internal.column_mut(sample).assign(&left_output);
+        right_internal.column_mut(sample).assign(&right_output);
+    }
     let ei_map = breebaart2001_ei(
         &left_internal,
         &right_internal,
@@ -1610,6 +1709,10 @@ mod tests {
             first.index_axis(ndarray::Axis(0), 0),
             first.index_axis(ndarray::Axis(0), 1)
         );
+        let mut expected = GaussianNoise::new(config.noise_seed);
+        assert_eq!(first[[0, 0, 0]], expected.sample());
+        assert_eq!(first[[0, 1, 0]], expected.sample());
+        assert_eq!(first[[0, 0, 1]], expected.sample());
         assert_ne!(first[[0, 0, 0]], first[[0, 0, 1]]);
         assert_ne!(first[[0, 0, 0]], first[[0, 1, 0]]);
     }
@@ -1826,6 +1929,9 @@ mod tests {
                 .unwrap();
         let mut expected = GaussianNoise::new(peripheral.absolute_threshold_noise_seed);
         assert_abs_diff_eq!(left[[0, 0]], 60e-6 * expected.sample(), epsilon = 1e-18);
+        assert_abs_diff_eq!(left[[1, 0]], 60e-6 * expected.sample(), epsilon = 1e-18);
+        assert_abs_diff_eq!(right[[0, 0]], 60e-6 * expected.sample(), epsilon = 1e-18);
+        assert_abs_diff_eq!(right[[1, 0]], 60e-6 * expected.sample(), epsilon = 1e-18);
         assert_ne!(left.row(0), left.row(1));
         assert_ne!(left, right);
 
