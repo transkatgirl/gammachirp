@@ -9,7 +9,7 @@ use num_complex::Complex64;
 use super::{
     BandwidthScaleMetadata, ComplexCascadeState, scale_bandwidths, validate_consensus_parameters,
 };
-use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
+use crate::gcfb_v234::gammachirp::{self, Carrier, Normalization};
 use crate::gcfb_v234::gcfb_v234::{
     AcfCoef, BandwidthPeakGrid, ControlMode, GcParam, GcResp, HLoss,
     initial_asymmetric_ratio_and_centers, make_asym_cmp_filters_v2, prepare_bandwidth_peak_grid,

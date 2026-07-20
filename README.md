@@ -5,12 +5,9 @@ original GammachirPy Python implementation.
 
 ## Rust crate
 
-The Rust port keeps the original versioned structure:
-
-- `gcfb_v211::{gammachirp, utils, gcfb_v211}` implements sample-by-sample
-  processing.
-- `gcfb_v234::{gammachirp, utils, gcfb_v234}` implements frame processing,
-  audiograms, cochlear hearing loss, synthesis, and envelope-modulation tools.
+The Rust port provides `gcfb_v234::{gammachirp, utils, gcfb_v234}` for frame
+processing, audiograms, cochlear hearing loss, synthesis, and
+envelope-modulation tools.
 
 Filterbank matrices use the same channel-major orientation as Python: rows are
 channels and columns are samples or frames. Parameters are typed structs, and
@@ -33,31 +30,8 @@ assert_eq!(output.dcgc_out.nrows(), 32);
 
 ### Sample streaming
 
-Both filterbank versions also provide bounded-memory `GcfbStream` processors.
-The v2.11 stream returns one channel vector per accepted sample; dynamic level,
-frequency-ratio, and filter-center histories travel with that sample instead of
-being retained by the processor.
-
-```rust
-use gammachirp_rs::gcfb_v211::{ControlMode, GcParam, GcfbStream};
-
-let mut filterbank = GcfbStream::new(GcParam {
-    num_ch: 32,
-    out_mid_crct: "No".into(),
-    ctrl: ControlMode::Dynamic,
-    ..GcParam::default()
-})?;
-
-for sample in [1.0, 0.0, 0.0, 0.0] {
-    let output = filterbank.process_sample(sample)?;
-    assert_eq!(output.pgc_out.len(), 32);
-    assert_eq!(output.cgc_out.len(), 32);
-    assert!(output.lvl_db.is_some());
-}
-# Ok::<(), gammachirp_rs::Error>(())
-```
-
-The v2.34 stream always returns the immediate sample-domain `scgc_smpl`.
+The v2.34 bounded-memory `GcfbStream` always returns the immediate sample-domain
+`scgc_smpl`.
 Static, level, and dynamic sample-base modes also return a `DcgcEvent::Sample`
 immediately. Dynamic frame mode delays `DcgcEvent::Frame` until the centered
 window's right-hand samples are available. After the input ends, `finish()` is
@@ -527,11 +501,12 @@ cargo test --doc
 ### Rust/Python parity properties
 
 In addition to fixed Python-generated regression fixtures, the integration
-suite generates and shrinks live differential cases with Python as the oracle.
+suite generates and shrinks live differential cases with the Python v2.34
+implementation as the oracle.
 It covers auditory scales, level calibration, windows, convolution, cepstra,
 framing, gammachirp impulse/frequency responses, asymmetric and compressive
 filters, frequency conversion, field-to-cochlea transfer functions, hearing
-level utilities, and both end-to-end filterbanks.
+level utilities, and the end-to-end v2.34 filterbank.
 
 Activate a Python environment containing NumPy and SciPy, then run:
 
@@ -553,8 +528,10 @@ should always set `GAMMACHIRPY_REQUIRE_PYTHON=1` so a missing reference runtime
 is reported as a failure. `PROPTEST_CASES` can raise the generated case count
 for longer stress runs.
 
-The original Python modules, notebooks, reference MATLAB outputs, figures, and
-instructions remain in `gcfb_v211/` and `gcfb_v234/`.
+The Rust crate does not expose GCFB v2.11. The original Python modules,
+notebooks, reference MATLAB outputs, figures, and instructions remain in
+`gcfb_v211/` and `gcfb_v234/`; the sections below document that bundled Python
+reference project, including its historical v2.11 implementation.
 
 <div style="text-align: center">
     <img src="./figs/gammachirpy_pulse.jpg" width="425px">

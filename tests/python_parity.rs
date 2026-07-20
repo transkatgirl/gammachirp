@@ -5,18 +5,15 @@
 //! not invoked by these tests, so downstream Rust builds do not need NumPy,
 //! SciPy, or Matplotlib installed.
 
-use gammachirp_rs::gcfb_v211::{
-    gammachirp::{self as gc, Carrier, Normalization},
-    gcfb_v211::{self as fb211, AcfStatus, ControlMode as Control211, GcParam as Param211},
-    utils as utils211,
-};
 use gammachirp_rs::gcfb_v234::{
+    gammachirp::{self as gc, Carrier, Normalization},
     gcfb_v234::{
-        self as fb234, ControlMode as Control234, DynHpaf, EmParam, GainReference,
+        self as fb234, AcfStatus, ControlMode as Control234, DynHpaf, EmParam, GainReference,
         GcParam as Param234,
     },
     utils::{self as utils234, Floor, ParamTransFunc},
 };
+
 use ndarray::{Array2, ArrayView2};
 use num_complex::Complex64;
 use serde_json::Value;
@@ -88,17 +85,6 @@ fn selected_rows(values: ArrayView2<'_, f64>, bins: &[usize]) -> Vec<f64> {
     selected
 }
 
-fn v211_param(control: Control211) -> Param211 {
-    Param211 {
-        fs: 8_000.0,
-        num_ch: 4,
-        f_range: [200.0, 1_500.0],
-        out_mid_crct: "No".into(),
-        ctrl: control,
-        ..Param211::default()
-    }
-}
-
 fn v234_param(control: Control234, processing: &str, hearing_loss: &str) -> Param234 {
     Param234 {
         fs: 8_000.0,
@@ -124,20 +110,20 @@ fn parity_input() -> Vec<f64> {
 }
 
 #[test]
-fn v211_scalar_scales_and_level_calibration_match_python() {
+fn common_scalar_scales_and_level_calibration_match_python() {
     let fixture = references();
-    let scalar = &fixture["v211"]["utility_scalars"];
+    let scalar = &fixture["common"]["utility_scalars"];
     let input = [-3.0, -1.0, 2.0, 4.0];
     assert_scalar(
         "rms",
-        utils211::rms(&input),
+        utils234::rms(&input),
         scalar["rms"].as_f64().unwrap(),
         1e-14,
         1e-14,
     );
 
     let powers: Vec<u64> = [1, 2, 3, 15, 16, 17, 1000]
-        .map(|value| utils211::nextpow2(value) as u64)
+        .map(|value| utils234::nextpow2(value) as u64)
         .to_vec();
     let expected_powers: Vec<u64> = scalar["nextpow2"]
         .as_array()
@@ -148,16 +134,16 @@ fn v211_scalar_scales_and_level_calibration_match_python() {
     assert_eq!(powers, expected_powers);
 
     let mel: Vec<f64> = [50.0, 100.0, 1000.0, 6000.0]
-        .map(utils211::freq2mel)
+        .map(utils234::freq2mel)
         .to_vec();
     assert_values("freq2mel", &mel, &scalar["freq2mel"], 1e-12, 1e-13);
     let frequency: Vec<f64> = [75.0, 500.0, 1000.0, 2500.0]
-        .map(utils211::mel2freq)
+        .map(utils234::mel2freq)
         .to_vec();
     assert_values("mel2freq", &frequency, &scalar["mel2freq"], 1e-11, 1e-13);
 
-    let erb_fixture = &fixture["v211"]["erb"];
-    let (erb, width) = utils211::freq2erb(&[0.0, 50.0, 100.0, 1000.0, 6000.0]);
+    let erb_fixture = &fixture["common"]["erb"];
+    let (erb, width) = utils234::freq2erb(&[0.0, 50.0, 100.0, 1000.0, 6000.0]);
     assert_values(
         "ERB rate",
         erb.as_slice().unwrap(),
@@ -172,7 +158,7 @@ fn v211_scalar_scales_and_level_calibration_match_python() {
         1e-12,
         1e-13,
     );
-    let (inverse, inverse_width) = utils211::erb2freq(erb.as_slice().unwrap());
+    let (inverse, inverse_width) = utils234::erb2freq(erb.as_slice().unwrap());
     assert_values(
         "ERB inverse",
         inverse.as_slice().unwrap(),
@@ -188,9 +174,9 @@ fn v211_scalar_scales_and_level_calibration_match_python() {
         1e-13,
     );
 
-    let equal_fixture = &fixture["v211"]["equal_erb"];
+    let equal_fixture = &fixture["common"]["equal_erb"];
     let (equal_frequency, equal_erb) =
-        utils211::equal_freq_scale(utils211::FrequencyScale::Erb, 6, [100.0, 6000.0]).unwrap();
+        utils234::equal_freq_scale(utils234::FrequencyScale::Erb, 6, [100.0, 6000.0]).unwrap();
     assert_values(
         "equal ERB frequency",
         equal_frequency.as_slice().unwrap(),
@@ -206,17 +192,17 @@ fn v211_scalar_scales_and_level_calibration_match_python() {
         1e-13,
     );
 
-    let (equalized, levels) = utils211::eqlz2meddis_hc_level(&input, 63.0).unwrap();
-    let level_fixture = &fixture["v211"]["level_equalization"];
+    let (equalized, levels) = utils234::eqlz2meddis_hc_level(&input, Some(63.0), None).unwrap();
+    let level_fixture = &fixture["common"]["level_equalization"];
     assert_values(
-        "v211 calibrated signal",
+        "common calibrated signal",
         equalized.as_slice().unwrap(),
         &level_fixture["signal"],
         1e-12,
         1e-13,
     );
     assert_values(
-        "v211 calibration metadata",
+        "common calibration metadata",
         &levels,
         &level_fixture["level"],
         1e-12,
@@ -225,16 +211,16 @@ fn v211_scalar_scales_and_level_calibration_match_python() {
 }
 
 #[test]
-fn v211_windows_filtering_and_framing_match_python() {
+fn common_windows_filtering_and_framing_match_python() {
     let fixture = references();
-    let windows = &fixture["v211"]["windows"];
+    let windows = &fixture["common"]["windows"];
     for (key, expected_name) in [
         ("HAM", "Hamming"),
         ("HAN", "Hanning/Cosine"),
         ("BLA", "Blackman"),
         ("LINE", "Line"),
     ] {
-        let (window, name) = utils211::taper_window(12, key, Some(4), 3.0).unwrap();
+        let (window, name) = utils234::taper_window(12, key, Some(4), 3.0).unwrap();
         assert_eq!(name, expected_name);
         assert_eq!(windows[key]["name"].as_str().unwrap(), expected_name);
         assert_values(
@@ -246,18 +232,18 @@ fn v211_windows_filtering_and_framing_match_python() {
         );
     }
 
-    let filtered = utils211::fftfilt(&[0.25, -0.5, 1.5, 0.75], &[1.0, -2.0, 0.5, 3.0, -1.0]);
+    let filtered = utils234::fftfilt(&[0.25, -0.5, 1.5, 0.75], &[1.0, -2.0, 0.5, 3.0, -1.0]);
     assert_values(
         "fftfilt",
         filtered.as_slice().unwrap(),
-        &fixture["v211"]["fftfilt"],
+        &fixture["common"]["fftfilt"],
         1e-13,
         1e-13,
     );
 
     let signal: Vec<f64> = (1..10).map(|value| value as f64).collect();
-    let (frames, centers) = fb211::set_frame4time_sequence(&signal, 6, Some(3)).unwrap();
-    let frame_fixture = &fixture["v211"]["frames"];
+    let (frames, centers) = fb234::set_frame4time_sequence(&signal, 6, Some(3)).unwrap();
+    let frame_fixture = &fixture["common"]["frames"];
     assert_eq!(
         vec![frames.nrows(), frames.ncols()],
         expected_shape(&frame_fixture["values"])
@@ -280,11 +266,11 @@ fn v211_windows_filtering_and_framing_match_python() {
 }
 
 #[test]
-fn v211_real_cepstrum_matches_python() {
+fn common_real_cepstrum_matches_python() {
     let fixture = references();
     let source = [1.0, 0.5, -0.25, 0.125, 0.75, -0.4, 0.2];
-    let (cepstrum, minimum) = utils211::rceps(&source).unwrap();
-    let expected = &fixture["v211"]["rceps"]["odd"];
+    let (cepstrum, minimum) = utils234::rceps(&source).unwrap();
+    let expected = &fixture["common"]["rceps"]["odd"];
     assert_values(
         "real cepstrum",
         cepstrum.as_slice().unwrap(),
@@ -302,11 +288,11 @@ fn v211_real_cepstrum_matches_python() {
 }
 
 #[test]
-fn v211_outer_middle_ear_tables_match_python() {
+fn common_outer_middle_ear_tables_match_python() {
     let fixture = references();
     for kind in ["ELC", "MAF"] {
-        let (power, frequency, db) = utils211::out_mid_crct(kind, 0, 48_000.0).unwrap();
-        let expected = &fixture["v211"]["outer_middle_ear_tables"][kind];
+        let (power, frequency, db) = utils234::out_mid_crct(kind, 0, 48_000.0).unwrap();
+        let expected = &fixture["common"]["outer_middle_ear_tables"][kind];
         assert_values(
             &format!("{kind} power"),
             power.as_slice().unwrap(),
@@ -346,7 +332,7 @@ fn gammachirp_impulses_and_carriers_match_python() {
             Normalization::None,
         )
         .unwrap();
-        let expected = &fixture["v211"]["gammachirp_impulse"][format!("{}", frequency as usize)];
+        let expected = &fixture["common"]["gammachirp_impulse"][format!("{}", frequency as usize)];
         assert_values(
             "gammachirp impulse",
             &flattened(output.gc.view()),
@@ -372,7 +358,7 @@ fn gammachirp_impulses_and_carriers_match_python() {
         );
     }
 
-    let carriers = &fixture["v211"]["gammachirp_carriers"];
+    let carriers = &fixture["common"]["gammachirp_carriers"];
     for (name, carrier, normalization) in [
         ("peak_normalized", Carrier::Cosine, Normalization::Peak),
         ("envelope", Carrier::Envelope, Normalization::None),
@@ -402,7 +388,7 @@ fn gammachirp_impulses_and_carriers_match_python() {
 #[test]
 fn gammachirp_analytic_response_matches_python() {
     let fixture = references();
-    let expected = &fixture["v211"]["gammachirp_response"];
+    let expected = &fixture["common"]["gammachirp_response"];
     let bins: Vec<usize> = expected["bins"]
         .as_array()
         .unwrap()
@@ -460,7 +446,7 @@ fn gammachirp_analytic_response_matches_python() {
 #[test]
 fn discrete_pgc_fir_and_digital_acf_responses_match_python() {
     let fixture = references();
-    let expected = &fixture["v211"]["discrete_component_response"];
+    let expected = &fixture["common"]["discrete_component_response"];
     let fft_len = expected["fft_len"].as_u64().unwrap() as usize;
     let bins: Vec<usize> = expected["bins"]
         .as_array()
@@ -504,7 +490,7 @@ fn discrete_pgc_fir_and_digital_acf_responses_match_python() {
     );
 
     let coefficients =
-        fb211::make_asym_cmp_filters_v2(8_000.0, &[500.0, 1500.0], &[2.17, 1.8], &[2.2, 1.5])
+        fb234::make_asym_cmp_filters_v2(8_000.0, &[500.0, 1500.0], &[2.17, 1.8], &[2.2, 1.5])
             .unwrap();
     let mut acf_power = Vec::with_capacity(2 * bins.len());
     for channel in 0..2 {
@@ -537,9 +523,9 @@ fn discrete_pgc_fir_and_digital_acf_responses_match_python() {
 fn asymmetric_coefficients_and_stateful_filtering_match_python() {
     let fixture = references();
     let coefficients =
-        fb211::make_asym_cmp_filters_v2(8_000.0, &[500.0, 1500.0], &[2.17, 1.8], &[2.2, 1.5])
+        fb234::make_asym_cmp_filters_v2(8_000.0, &[500.0, 1500.0], &[2.17, 1.8], &[2.2, 1.5])
             .unwrap();
-    let expected = &fixture["v211"]["asymmetric_coefficients"];
+    let expected = &fixture["common"]["asymmetric_coefficients"];
     assert_values(
         "asymmetric poles",
         coefficients.ap.as_slice().unwrap(),
@@ -571,7 +557,7 @@ fn asymmetric_coefficients_and_stateful_filtering_match_python() {
     assert_values(
         "stateful asymmetric filter",
         &outputs,
-        &fixture["v211"]["asymmetric_filter_sequence"],
+        &fixture["common"]["asymmetric_filter_sequence"],
         2e-12,
         5e-12,
     );
@@ -580,7 +566,7 @@ fn asymmetric_coefficients_and_stateful_filtering_match_python() {
 #[test]
 fn asymmetric_and_compressive_frequency_responses_match_python() {
     let fixture = references();
-    let expected_asym = &fixture["v211"]["asymmetric_response"];
+    let expected_asym = &fixture["common"]["asymmetric_response"];
     let bins: Vec<usize> = expected_asym["bins"]
         .as_array()
         .unwrap()
@@ -588,7 +574,7 @@ fn asymmetric_and_compressive_frequency_responses_match_python() {
         .map(|value| value.as_u64().unwrap() as usize)
         .collect();
     let response =
-        fb211::asym_cmp_frsp_v2(&[500.0, 1500.0], 8_000.0, &[2.17, 1.8], &[2.2, 1.5], 256, 4)
+        fb234::asym_cmp_frsp_v2(&[500.0, 1500.0], 8_000.0, &[2.17, 1.8], &[2.2, 1.5], 256, 4)
             .unwrap();
     assert_values(
         "ACF response",
@@ -605,8 +591,8 @@ fn asymmetric_and_compressive_frequency_responses_match_python() {
         2e-13,
     );
 
-    let expected = &fixture["v211"]["compressed_response"];
-    let compressed = fb211::cmprs_gc_frsp(
+    let expected = &fixture["common"]["compressed_response"];
+    let compressed = fb234::cmprs_gc_frsp(
         &[500.0, 1500.0],
         8_000.0,
         4.0,
@@ -661,12 +647,12 @@ fn asymmetric_and_compressive_frequency_responses_match_python() {
 #[test]
 fn peak_frequency_conversions_match_python() {
     let fixture = references();
-    let expected = expected_values(&fixture["v211"]["frequency_conversions"]);
+    let expected = expected_values(&fixture["common"]["frequency_conversions"]);
     let mut actual = Vec::new();
     for fr1 in [250.0, 1000.0, 2500.0] {
-        let (fp2, fr2) = fb211::fr1_to_fp2(4.0, 1.81, -2.96, 2.17, 2.2, 0.95, fr1).unwrap();
+        let (fp2, fr2) = fb234::fr1_to_fp2(4.0, 1.81, -2.96, 2.17, 2.2, 0.95, fr1).unwrap();
         let (inverse_fr1, inverse_fp1) =
-            fb211::fp2_to_fr1(4.0, 1.81, -2.96, 2.17, 2.2, 0.95, fp2).unwrap();
+            fb234::fp2_to_fr1(4.0, 1.81, -2.96, 2.17, 2.2, 0.95, fp2).unwrap();
         actual.extend([fr1, fp2, fr2, inverse_fr1, inverse_fp1]);
     }
     assert_eq!(actual.len(), expected.len());
@@ -688,129 +674,6 @@ fn peak_frequency_conversions_match_python() {
             );
         }
     }
-}
-
-#[test]
-fn v211_derived_parameters_match_python() {
-    let fixture = references();
-    let expected = &fixture["v211"]["set_param"];
-    let (param, response) = fb211::set_param(v211_param(Control211::Dynamic)).unwrap();
-    for (label, actual, key) in [
-        ("fr1", response.fr1.as_slice().unwrap(), "fr1"),
-        ("ef", response.ef.as_slice().unwrap(), "ef"),
-        ("b1", response.b1_val.as_slice().unwrap(), "b1"),
-        ("c1", response.c1_val.as_slice().unwrap(), "c1"),
-        ("fp1", response.fp1.as_slice().unwrap(), "fp1"),
-        ("b2", response.b2_val.as_slice().unwrap(), "b2"),
-        ("c2", response.c2_val.as_slice().unwrap(), "c2"),
-    ] {
-        assert_values(label, actual, &expected[key], 2e-11, 2e-13);
-    }
-    assert_scalar(
-        "ERB spacing",
-        response.erb_space1,
-        expected["erb_space"].as_f64().unwrap(),
-        1e-13,
-        1e-13,
-    );
-    assert_scalar(
-        "decay",
-        param.lvl_est.exp_decay_val,
-        expected["exp_decay"].as_f64().unwrap(),
-        1e-14,
-        1e-14,
-    );
-    assert_eq!(
-        param.lvl_est.n_ch_shift as i64,
-        expected["channel_shift"].as_f64().unwrap() as i64
-    );
-    let level_channels: Vec<f64> = param
-        .lvl_est
-        .n_ch_lvl_est
-        .iter()
-        .map(|&value| value as f64)
-        .collect();
-    assert_values(
-        "level channels",
-        &level_channels,
-        &expected["level_channels"],
-        0.0,
-        0.0,
-    );
-    assert_scalar(
-        "minimum linear level",
-        param.lvl_est.lvl_lin_min_lim,
-        expected["linear_minimum"].as_f64().unwrap(),
-        1e-15,
-        1e-14,
-    );
-    assert_scalar(
-        "reference linear level",
-        param.lvl_est.lvl_lin_ref,
-        expected["linear_reference"].as_f64().unwrap(),
-        1e-14,
-        1e-14,
-    );
-}
-
-fn assert_v211_filterbank(control: Control211, key: &str) {
-    let fixture = references();
-    let expected = &fixture["v211"]["filterbank"][key];
-    let output = fb211::gcfb_v211(&parity_input(), v211_param(control)).unwrap();
-    assert_values(
-        "v211 CGC output",
-        &flattened(output.cgc_out.view()),
-        &expected["cgc"],
-        2e-10,
-        2e-9,
-    );
-    assert_values(
-        "v211 PGC output",
-        &flattened(output.pgc_out.view()),
-        &expected["pgc"],
-        2e-11,
-        2e-10,
-    );
-    assert_values(
-        "v211 fr2",
-        &flattened(output.gc_resp.fr2.view()),
-        &expected["fr2"],
-        2e-7,
-        2e-9,
-    );
-    assert_values(
-        "v211 frequency ratio",
-        &flattened(output.gc_resp.frat_val.view()),
-        &expected["frat"],
-        2e-10,
-        2e-9,
-    );
-    assert_values(
-        "v211 level",
-        &flattened(output.gc_resp.lvl_db.view()),
-        &expected["level_db"],
-        2e-9,
-        2e-9,
-    );
-    if !expected_values(&expected["gain"]).is_empty() {
-        assert_values(
-            "v211 gain",
-            output.gc_resp.gain_factor.as_slice().unwrap(),
-            &expected["gain"],
-            2e-10,
-            2e-9,
-        );
-    }
-}
-
-#[test]
-fn v211_static_filterbank_matches_python_end_to_end() {
-    assert_v211_filterbank(Control211::Static, "static");
-}
-
-#[test]
-fn v211_dynamic_filterbank_matches_python_end_to_end() {
-    assert_v211_filterbank(Control211::Dynamic, "dynamic");
 }
 
 #[test]

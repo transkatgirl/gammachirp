@@ -40,22 +40,12 @@ def load_version(name):
 
 def unload_version(directory):
     sys.path.remove(str(directory))
-    for name in ("utils", "gammachirp", "gcfb_v211", "gcfb_v234"):
+    for name in ("utils", "gammachirp", "gcfb_v234"):
         sys.modules.pop(name, None)
 
 
 class Param:
     pass
-
-
-def make_v211_param(control):
-    param = Param()
-    param.fs = 8000
-    param.num_ch = 4
-    param.f_range = np.array([200.0, 1500.0])
-    param.out_mid_crct = "No"
-    param.ctrl = control
-    return param
 
 
 def make_v234_param(control, processing="frame-base", hearing_loss="NH"):
@@ -81,8 +71,8 @@ def real_scalar(value):
     return float(np.real(np.asarray(value).reshape(-1)[0]))
 
 
-def v211_references():
-    directory, utils, gc, gcfb = load_version("gcfb_v211")
+def common_references():
+    directory, utils, gc, gcfb = load_version("gcfb_v234")
     result = {}
 
     signal = np.array([-3.0, -1.0, 2.0, 4.0])
@@ -243,36 +233,6 @@ def v211_references():
         output, status = gcfb.acfilterbank(coefficients, status, np.asarray(sample), 0)
         acf_outputs.append(output[:, 0])
     result["asymmetric_filter_sequence"] = encoded(acf_outputs)
-
-    set_param, set_response = gcfb.set_param(make_v211_param("dynamic"))
-    result["set_param"] = {
-        "fr1": encoded(set_response.fr1),
-        "erb_space": float(set_response.erb_space1),
-        "ef": encoded(set_response.ef),
-        "b1": encoded(set_response.b1_val),
-        "c1": encoded(set_response.c1_val),
-        "fp1": encoded(set_response.fp1),
-        "b2": encoded(set_response.b2_val),
-        "c2": encoded(set_response.c2_val),
-        "exp_decay": float(set_param.lvl_est.exp_decay_val),
-        "channel_shift": float(set_param.lvl_est.n_ch_shift),
-        "level_channels": encoded(set_param.lvl_est.n_ch_lvl_est - 1),
-        "linear_minimum": float(set_param.lvl_est.lvl_lin_min_lim),
-        "linear_reference": float(set_param.lvl_est.lvl_lin_ref),
-    }
-
-    input_signal = np.array([1.0, -0.25, 0.5, 0.0, -0.1, 0.2] + [0.0] * 26)
-    result["filterbank"] = {}
-    for control in ("static", "dynamic"):
-        cgc, pgc, param, response = gcfb.gcfb_v211(input_signal, make_v211_param(control))
-        result["filterbank"][control] = {
-            "cgc": encoded(cgc),
-            "pgc": encoded(pgc),
-            "fr2": encoded(getattr(response, "fr2", [])),
-            "frat": encoded(getattr(response, "frat_val", [])),
-            "level_db": encoded(getattr(response, "lvl_db", [])),
-            "gain": encoded(getattr(response, "gain_factor", [])),
-        }
 
     unload_version(directory)
     return result
@@ -449,7 +409,7 @@ def main():
             "numpy": np.__version__,
             "scipy": scipy.__version__,
         },
-        "v211": v211_references(),
+        "common": common_references(),
         "v234": v234_references(),
     }
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-//! Auditory scales, signal-level calibration, framing, and basic DSP utilities.
+//! Shared auditory scales, signal-level calibration, framing, and basic DSP utilities.
 
 use std::{
     fs::File,
@@ -337,9 +337,9 @@ pub fn set_frame4time_sequence(
         ));
     }
 
-    // GCFB v2.11 labels the first zero-padded frame at `-shift` and keeps a
-    // trailing frame whose label is at or before the input length.  This is
-    // intentionally distinct from the v2.34 framing convention.
+    // This legacy utility labels the first zero-padded frame at `-shift` and
+    // keeps a trailing frame whose label is at or before the input length.
+    // The v2.34 filterbank's frame routine uses its own zero-based convention.
     let division = len_frame / shift;
     let padded_blocks = (snd.len() + len_frame).div_ceil(len_frame);
     let available_frames = padded_blocks.saturating_sub(1) * division + 1;
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn v211_framing_includes_leading_and_trailing_frames() {
+    fn legacy_framing_includes_leading_and_trailing_frames() {
         let (frames, centers) = set_frame4time_sequence(&[1.0, 2.0, 3.0], 4, Some(2)).unwrap();
         assert_eq!(centers.as_slice().unwrap(), &[-2, 0, 2]);
         assert_eq!(frames.column(0).to_vec(), vec![0.0, 0.0, 1.0, 2.0]);

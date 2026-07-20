@@ -1,5 +1,7 @@
 //! GCFB v2.34: frame processing and hearing-loss characteristics.
 
+mod base_utils;
+mod common;
 pub mod gammachirp;
 pub mod gcfb_v234;
 pub mod reassignment;

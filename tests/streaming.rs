@@ -1,4 +1,4 @@
-use gammachirp_rs::{Error, gcfb_v211, gcfb_v234};
+use gammachirp_rs::{Error, gcfb_v234};
 use proptest::prelude::*;
 
 fn close(actual: f64, expected: f64) {
@@ -25,90 +25,6 @@ fn test_signal(values: &[i16]) -> Vec<f64> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
-
-    #[test]
-    fn v211_stream_matches_batch(
-        values in prop::collection::vec(any::<i16>(), 1..100),
-        channels in 2usize..7,
-        mode in 0u8..3,
-        update in 1usize..9,
-        corrected in any::<bool>(),
-        gain_ref in 35.0f64..75.0,
-        alternate_coefficients in any::<bool>(),
-    ) {
-        let signal = test_signal(&values);
-        let ctrl = match mode {
-            0 => gcfb_v211::ControlMode::Static,
-            1 => gcfb_v211::ControlMode::Level,
-            _ => gcfb_v211::ControlMode::Dynamic,
-        };
-        let param = gcfb_v211::GcParam {
-            fs: 8_000.0,
-            num_ch: channels,
-            f_range: [180.0, 1_800.0],
-            out_mid_crct: if corrected { "ELC" } else { "No" }.into(),
-            ctrl,
-            num_update_asym_cmp: update,
-            gain_ref_db: gain_ref,
-            b1: if alternate_coefficients { [1.70, 0.02] } else { [1.81, 0.0] },
-            c1: if alternate_coefficients { [-2.70, -0.02] } else { [-2.96, 0.0] },
-            frat: if alternate_coefficients {
-                [[0.48, 0.005], [0.01, 0.0002]]
-            } else {
-                [[0.4660, 0.0], [0.0109, 0.0]]
-            },
-            b2: if alternate_coefficients {
-                [[2.0, 0.05], [0.0, 0.0]]
-            } else {
-                [[2.17, 0.0], [0.0, 0.0]]
-            },
-            c2: if alternate_coefficients {
-                [[2.0, -0.05], [0.0, 0.0]]
-            } else {
-                [[2.2, 0.0], [0.0, 0.0]]
-            },
-            ..gcfb_v211::GcParam::default()
-        };
-        let batch = gcfb_v211::gcfb_v211(&signal, param.clone()).unwrap();
-        let mut stream = gcfb_v211::GcfbStream::new(param).unwrap();
-        assert_eq!(stream.samples_processed(), 0);
-        assert_eq!(stream.gc_param().num_ch, channels);
-        for (sample_index, &sample) in signal.iter().enumerate() {
-            let step = stream.process_sample(sample).unwrap();
-            assert_eq!(step.sample_index, sample_index);
-            close_slice(
-                step.pgc_out.as_slice().unwrap(),
-                &batch.pgc_out.column(sample_index).to_vec(),
-            );
-            close_slice(
-                step.cgc_out.as_slice().unwrap(),
-                &batch.cgc_out.column(sample_index).to_vec(),
-            );
-            if ctrl == gcfb_v211::ControlMode::Dynamic {
-                close_slice(
-                    step.lvl_db.as_ref().unwrap().as_slice().unwrap(),
-                    &batch.gc_resp.lvl_db.column(sample_index).to_vec(),
-                );
-                close_slice(
-                    step.frat_val.as_ref().unwrap().as_slice().unwrap(),
-                    &batch.gc_resp.frat_val.column(sample_index).to_vec(),
-                );
-                close_slice(
-                    step.fr2.as_ref().unwrap().as_slice().unwrap(),
-                    &batch.gc_resp.fr2.column(sample_index).to_vec(),
-                );
-            } else {
-                assert!(step.lvl_db.is_none());
-                assert!(step.frat_val.is_none());
-                assert!(step.fr2.is_none());
-            }
-        }
-        assert_eq!(stream.samples_processed(), signal.len());
-        close_slice(
-            stream.gc_resp().gain_factor.as_slice().unwrap(),
-            batch.gc_resp.gain_factor.as_slice().unwrap(),
-        );
-    }
 
     #[test]
     fn v234_sample_stream_matches_batch(
@@ -299,28 +215,7 @@ proptest! {
 }
 
 #[test]
-fn non_finite_samples_do_not_advance_either_stream() {
-    let mut v211 = gcfb_v211::GcfbStream::new(gcfb_v211::GcParam {
-        fs: 8_000.0,
-        num_ch: 4,
-        f_range: [200.0, 1_500.0],
-        out_mid_crct: "No".into(),
-        ..gcfb_v211::GcParam::default()
-    })
-    .unwrap();
-    assert!(matches!(
-        v211.process_sample(f64::NAN),
-        Err(Error::InvalidParameter(_))
-    ));
-    assert_eq!(v211.samples_processed(), 0);
-    let after_error = v211.process_sample(1.0).unwrap();
-    let mut fresh = gcfb_v211::GcfbStream::new(v211.gc_param().clone()).unwrap();
-    let expected = fresh.process_sample(1.0).unwrap();
-    close_slice(
-        after_error.cgc_out.as_slice().unwrap(),
-        expected.cgc_out.as_slice().unwrap(),
-    );
-
+fn non_finite_samples_do_not_advance_the_stream() {
     let mut v234 = gcfb_v234::GcfbStream::new(gcfb_v234::GcParam {
         fs: 8_000.0,
         num_ch: 4,
@@ -343,25 +238,6 @@ fn non_finite_samples_do_not_advance_either_stream() {
 
 #[test]
 fn zero_length_passive_impulses_match_the_batch_zero_operator() {
-    let v211_param = gcfb_v211::GcParam {
-        fs: 10.0,
-        num_ch: 2,
-        f_range: [1.0, 2.0],
-        out_mid_crct: "No".into(),
-        c1: [0.0, 0.0],
-        ctrl: gcfb_v211::ControlMode::Static,
-        ..gcfb_v211::GcParam::default()
-    };
-    let v211_batch = gcfb_v211::gcfb_v211(&[1.0], v211_param.clone()).unwrap();
-    let v211_stream = gcfb_v211::GcfbStream::new(v211_param)
-        .unwrap()
-        .process_sample(1.0)
-        .unwrap();
-    close_slice(
-        v211_stream.cgc_out.as_slice().unwrap(),
-        v211_batch.cgc_out.column(0).as_slice().unwrap(),
-    );
-
     let v234_param = gcfb_v234::GcParam {
         fs: 10.0,
         num_ch: 2,
@@ -392,28 +268,6 @@ fn zero_length_passive_impulses_match_the_batch_zero_operator() {
 
 #[test]
 fn dynamic_filter_update_errors_make_streams_terminal() {
-    let mut v211 = gcfb_v211::GcfbStream::new(gcfb_v211::GcParam {
-        fs: 8_000.0,
-        num_ch: 4,
-        f_range: [200.0, 1_500.0],
-        out_mid_crct: "No".into(),
-        ctrl: gcfb_v211::ControlMode::Dynamic,
-        // The 50 dB reference ratio is valid, but the zero-input runtime
-        // level produces a negative center.
-        frat: [[-49.0, 0.0], [1.0, 0.0]],
-        ..gcfb_v211::GcParam::default()
-    })
-    .unwrap();
-    assert!(matches!(
-        v211.process_sample(0.0),
-        Err(Error::InvalidParameter(_))
-    ));
-    assert!(matches!(
-        v211.process_sample(0.0),
-        Err(Error::Numerical(message)) if message.contains("cannot continue")
-    ));
-    assert_eq!(v211.samples_processed(), 0);
-
     let mut v234 = gcfb_v234::GcfbStream::new(gcfb_v234::GcParam {
         fs: 8_000.0,
         num_ch: 4,

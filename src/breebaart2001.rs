@@ -101,8 +101,7 @@ pub use stream::{
 
 #[cfg(test)]
 use crate::dsp;
-use crate::gcfb_v211::gcfb_v211::ControlMode;
-use crate::gcfb_v234::{GcParam, GcfbOutput, gcfb_v234};
+use crate::gcfb_v234::{ControlMode, GcParam, GcfbOutput, gcfb_v234};
 use crate::{Error, Result};
 
 /// The characteristic interaural parameters of one EI unit.

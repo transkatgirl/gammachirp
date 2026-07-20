@@ -6,14 +6,13 @@ use std::{fs, time::SystemTime};
 use approx::assert_relative_eq;
 use gammachirp_rs::{
     Error,
-    gcfb_v211::{
-        gammachirp::{self, Carrier, Normalization},
-        gcfb_v211::{self as fb211, AcfStatus, ControlMode, GcParam as Param211, SmoothSpecParam},
-        utils::{self as utils211, FrequencyScale},
-    },
     gcfb_v234::{
-        gcfb_v234::{self as fb234, DynHpaf, EmParam, GainReference, GcParam as Param234},
-        utils::{self as utils234, Floor, ParamTransFunc},
+        gammachirp::{self, Carrier, Normalization},
+        gcfb_v234::{
+            self as fb234, AcfStatus, ControlMode, DynHpaf, EmParam, GainReference,
+            GcParam as Param234, SmoothSpecParam,
+        },
+        utils::{self as utils234, Floor, FrequencyScale, ParamTransFunc},
     },
 };
 use ndarray::{Array1, Array2};
@@ -28,16 +27,6 @@ fn prepared_v234() -> Param234 {
     })
     .unwrap()
     .0
-}
-
-fn compact_v211() -> Param211 {
-    Param211 {
-        fs: 8_000.0,
-        num_ch: 4,
-        f_range: [200.0, 1_500.0],
-        out_mid_crct: "No".into(),
-        ..Param211::default()
-    }
 }
 
 fn compact_v234() -> Param234 {
@@ -60,7 +49,7 @@ fn read_wav_bytes(label: &str, bytes: &[u8]) -> gammachirp_rs::Result<(Array1<f6
         std::process::id()
     ));
     fs::write(&path, bytes).unwrap();
-    let result = utils211::audioread(&path);
+    let result = utils234::audioread(&path);
     fs::remove_file(path).unwrap();
     result
 }
@@ -80,7 +69,7 @@ fn smooth_spectrum_covers_both_windows_and_reports_frame_times() {
     for (method, window_seconds) in [(1, 0.025), (2, 0.010)] {
         let mut param = SmoothSpecParam::new(8_000.0);
         param.method = method;
-        let (smoothed, param) = fb211::cal_smooth_spec(&input, param).unwrap();
+        let (smoothed, param) = fb234::cal_smooth_spec(&input, param).unwrap();
 
         assert_eq!(smoothed.dim(), (2, 13));
         assert_eq!(param.temporal_positions.len(), 13);
@@ -97,7 +86,7 @@ fn smooth_spectrum_covers_both_windows_and_reports_frame_times() {
 
     let mut invalid = SmoothSpecParam::new(8_000.0);
     invalid.method = 3;
-    assert!(fb211::cal_smooth_spec(&input, invalid).is_err());
+    assert!(fb234::cal_smooth_spec(&input, invalid).is_err());
 }
 
 #[test]
@@ -291,7 +280,7 @@ fn valid_wav_with_an_odd_unknown_chunk_is_read_as_mono_pcm() {
         std::process::id()
     ));
     fs::write(&path, wav).unwrap();
-    let result = utils211::audioread(&path);
+    let result = utils234::audioread(&path);
     fs::remove_file(&path).unwrap();
 
     let (decoded, sample_rate) = result.unwrap();
@@ -302,7 +291,7 @@ fn valid_wav_with_an_odd_unknown_chunk_is_read_as_mono_pcm() {
     }
 
     let missing = path.with_extension("missing.wav");
-    assert!(matches!(utils211::audioread(missing), Err(Error::Io(_))));
+    assert!(matches!(utils234::audioread(missing), Err(Error::Io(_))));
 }
 
 #[test]
@@ -336,10 +325,6 @@ fn filterbanks_reject_non_finite_waveform_samples() {
     for invalid in [f64::NAN, f64::INFINITY] {
         let signal = [1.0, invalid, 0.0];
         assert!(matches!(
-            fb211::gcfb_v211(&signal, compact_v211()),
-            Err(Error::InvalidParameter(_))
-        ));
-        assert!(matches!(
             fb234::gcfb_v234(&signal, compact_v234()),
             Err(Error::InvalidParameter(_))
         ));
@@ -348,32 +333,6 @@ fn filterbanks_reject_non_finite_waveform_samples() {
 
 #[test]
 fn filterbank_preparation_rejects_non_finite_user_parameters() {
-    let mut v211_gain = compact_v211();
-    v211_gain.gain_cmpnst_db = f64::NAN;
-    let mut v211_reference = compact_v211();
-    v211_reference.gain_ref_db = f64::INFINITY;
-    let mut v211_static_level = compact_v211();
-    v211_static_level.level_db_scgcfb = f64::NEG_INFINITY;
-    let mut v211_coefficient = compact_v211();
-    v211_coefficient.b2[0][0] = f64::NAN;
-    let mut v211_level_estimation = compact_v211();
-    v211_level_estimation.lvl_est.weight = f64::INFINITY;
-    let mut v211_zero_decay = compact_v211();
-    v211_zero_decay.lvl_est.decay_hl = 0.0;
-    for invalid in [
-        v211_gain,
-        v211_reference,
-        v211_static_level,
-        v211_coefficient,
-        v211_level_estimation,
-        v211_zero_decay,
-    ] {
-        assert!(matches!(
-            fb211::set_param(invalid),
-            Err(Error::InvalidParameter(_))
-        ));
-    }
-
     let mut v234_gain = compact_v234();
     v234_gain.gain_cmpnst_db = f64::NAN;
     let mut v234_reference = compact_v234();
@@ -403,20 +362,6 @@ fn filterbank_preparation_rejects_non_finite_user_parameters() {
 
 #[test]
 fn parameter_preparation_overwrites_derived_caches_without_validating_them() {
-    let mut v211 = compact_v211();
-    v211.lvl_est.exp_decay_val = f64::NAN;
-    v211.lvl_est.erb_space1 = f64::NAN;
-    v211.lvl_est.n_ch_shift = isize::MAX;
-    v211.lvl_est.n_ch_lvl_est = Array1::from(vec![usize::MAX]);
-    v211.lvl_est.lvl_lin_min_lim = f64::NAN;
-    v211.lvl_est.lvl_lin_ref = f64::NAN;
-    let (v211, _) = fb211::set_param(v211).unwrap();
-    assert!(v211.lvl_est.exp_decay_val.is_finite());
-    assert!(v211.lvl_est.erb_space1.is_finite());
-    assert_eq!(v211.lvl_est.n_ch_lvl_est.len(), v211.num_ch);
-    assert!(v211.lvl_est.lvl_lin_min_lim.is_finite());
-    assert!(v211.lvl_est.lvl_lin_ref.is_finite());
-
     let mut v234 = compact_v234();
     v234.fr1 = Array1::from(vec![f64::NAN]);
     v234.hloss.compression_health = Array1::from(vec![f64::NAN]);
@@ -469,19 +414,19 @@ fn compression_health_accepts_only_the_closed_unit_interval() {
 
 #[test]
 fn public_signal_utilities_cover_empty_inputs_aliases_and_rejections() {
-    assert!(utils211::rms(&[]).is_nan());
-    assert!(utils211::eqlz2meddis_hc_level(&[0.0, 0.0], 60.0).is_err());
+    assert!(utils234::rms(&[]).is_nan());
+    assert!(utils234::eqlz2meddis_hc_level(&[0.0, 0.0], Some(60.0), None).is_err());
     for level in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        assert!(utils211::eqlz2meddis_hc_level(&[1.0, -1.0], level).is_err());
+        assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], Some(level), None).is_err());
         assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], Some(level), None).is_err());
         assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], None, Some(level)).is_err());
     }
     assert!(utils234::eqlz2meddis_hc_level(&[1.0, -1.0], Some(f64::NAN), Some(94.0)).is_ok());
-    assert_eq!(utils211::fftfilt(&[], &[1.0, 2.0]).to_vec(), vec![0.0, 0.0]);
-    assert!(utils211::isrow(&[1.0, 2.0]));
-    assert!(utils211::iscolumn(&Array2::<f64>::zeros((3, 1))));
-    assert!(!utils211::iscolumn(&Array2::<f64>::zeros((1, 3))));
-    assert!(utils211::rceps(&[]).is_err());
+    assert_eq!(utils234::fftfilt(&[], &[1.0, 2.0]).to_vec(), vec![0.0, 0.0]);
+    assert!(utils234::isrow(&[1.0, 2.0]));
+    assert!(utils234::iscolumn(&Array2::<f64>::zeros((3, 1))));
+    assert!(!utils234::iscolumn(&Array2::<f64>::zeros((1, 3))));
+    assert!(utils234::rceps(&[]).is_err());
 
     for scale in [
         FrequencyScale::Erb,
@@ -490,35 +435,35 @@ fn public_signal_utilities_cover_empty_inputs_aliases_and_rejections() {
         FrequencyScale::Log,
     ] {
         let (frequencies, positions) =
-            utils211::equal_freq_scale(scale, 4, [100.0, 1_600.0]).unwrap();
+            utils234::equal_freq_scale(scale, 4, [100.0, 1_600.0]).unwrap();
         assert_eq!(frequencies.len(), 4);
         assert_eq!(positions.len(), 4);
         assert_eq!(frequencies[0], 100.0);
         assert_eq!(frequencies[3], 1_600.0);
     }
-    assert!(utils211::equal_freq_scale(FrequencyScale::Linear, 1, [100.0, 200.0]).is_err());
+    assert!(utils234::equal_freq_scale(FrequencyScale::Linear, 1, [100.0, 200.0]).is_err());
 
-    let (gaussian, name) = utils211::taper_window(9, "Gaussian", Some(3), 2.5).unwrap();
+    let (gaussian, name) = utils234::taper_window(9, "Gaussian", Some(3), 2.5).unwrap();
     assert_eq!(name, "Gauss");
     assert_eq!(gaussian.len(), 9);
     assert_relative_eq!(gaussian[4], 1.0, epsilon = 1e-15);
-    assert!(utils211::taper_window(0, "Hamming", None, 1.0).is_err());
+    assert!(utils234::taper_window(0, "Hamming", None, 1.0).is_err());
 
     for invalid in [(0, Some(1)), (5, Some(1)), (4, Some(3))] {
-        assert!(utils211::set_frame4time_sequence(&[1.0], invalid.0, invalid.1).is_err());
+        assert!(utils234::set_frame4time_sequence(&[1.0], invalid.0, invalid.1).is_err());
     }
 
-    let (no_power, no_frequency, no_db) = utils211::out_mid_crct("NO", 0, 8_000.0).unwrap();
+    let (no_power, no_frequency, no_db) = utils234::out_mid_crct("NO", 0, 8_000.0).unwrap();
     assert_eq!(no_power.to_vec(), vec![1.0]);
     assert_eq!(no_frequency.to_vec(), vec![0.0]);
     assert_eq!(no_db.to_vec(), vec![0.0]);
-    assert!(utils211::out_mid_crct("unknown", 32, 8_000.0).is_err());
+    assert!(utils234::out_mid_crct("unknown", 32, 8_000.0).is_err());
 
-    let forward = utils211::out_mid_crct_filt("ELC", 8_000.0, 0).unwrap();
-    let inverse = utils211::out_mid_crct_filt("ELC", 8_000.0, 1).unwrap();
+    let forward = utils234::out_mid_crct_filt("ELC", 8_000.0, 0).unwrap();
+    let inverse = utils234::out_mid_crct_filt("ELC", 8_000.0, 1).unwrap();
     assert_eq!(forward.len(), inverse.len());
     assert_ne!(forward, inverse);
-    assert!(utils211::out_mid_crct_filt("ELC", 8_000.0, 3).is_err());
+    assert!(utils234::out_mid_crct_filt("ELC", 8_000.0, 3).is_err());
 }
 
 #[test]
@@ -576,38 +521,9 @@ fn transfer_function_selectors_filters_and_noise_floor_are_covered() {
 fn public_filterbank_modes_and_wrappers_have_smoke_coverage() {
     let signal = [1.0, 0.0, -0.25, 0.0, 0.125, 0.0, 0.0, 0.0];
 
-    let level211 = fb211::gcfb_v211(
-        &signal,
-        Param211 {
-            fs: 8_000.0,
-            num_ch: 4,
-            f_range: [200.0, 1_500.0],
-            out_mid_crct: "No".into(),
-            ctrl: ControlMode::Level,
-            ..Param211::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(level211.cgc_out.dim(), (4, signal.len()));
-    assert!(level211.cgc_out.iter().all(|value| value.is_finite()));
-
-    let corrected211 = fb211::gcfb_v211(
-        &signal,
-        Param211 {
-            fs: 8_000.0,
-            num_ch: 4,
-            f_range: [200.0, 1_500.0],
-            out_mid_crct: "ELC".into(),
-            ..Param211::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(corrected211.cgc_out.dim(), (4, signal.len()));
-    assert!(fb211::gcfb_v211(&[], Param211::default()).is_err());
-
-    let coefficients = fb211::make_asym_cmp_filters_v2(8_000.0, &[500.0], &[2.17], &[2.2]).unwrap();
+    let coefficients = fb234::make_asym_cmp_filters_v2(8_000.0, &[500.0], &[2.17], &[2.2]).unwrap();
     let mut state = AcfStatus::new(&coefficients);
-    let filtered = fb211::acfilterbank(&coefficients, &mut state, &[1.0], true).unwrap();
+    let filtered = fb234::acfilterbank(&coefficients, &mut state, &[1.0], true).unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(state.count, 1);
 

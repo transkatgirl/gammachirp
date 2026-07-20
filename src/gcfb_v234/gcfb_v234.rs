@@ -6,14 +6,15 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3, Axis, s};
 use num_complex::Complex64;
 
-use super::utils::{self, FrequencyScale};
-use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
-pub use crate::gcfb_v211::gcfb_v211::{ControlMode, LvlEst};
+use super::{
+    gammachirp::{self, Carrier, Normalization},
+    utils::{self, FrequencyScale},
+};
 use crate::{Error, Result, dsp};
 
-pub use crate::gcfb_v211::gcfb_v211::{
-    AcfCoef, AcfStatus, AsymCmpResponse, CgcResponse, SmoothSpecParam, acfilterbank,
-    asym_cmp_frsp_v2, cal_smooth_spec, cmprs_gc_frsp, fp2_to_fr1, fr1_to_fp2,
+pub use super::common::{
+    AcfCoef, AcfStatus, AsymCmpResponse, CgcResponse, ControlMode, LvlEst, SmoothSpecParam,
+    acfilterbank, asym_cmp_frsp_v2, cal_smooth_spec, cmprs_gc_frsp, fp2_to_fr1, fr1_to_fp2,
     make_asym_cmp_filters_v2,
 };
 

@@ -4,7 +4,7 @@ use ndarray::{Array1, Array2};
 
 use crate::{Error, Result, dsp};
 
-pub use crate::gcfb_v211::utils::{
+pub use super::base_utils::{
     FrequencyScale, audioread, erb2freq, fftfilt, freq2erb, freq2mel, iscolumn, isrow, mel2freq,
     nextpow2, out_mid_crct, out_mid_crct_filt, rceps, rms, set_frame4time_sequence, taper_window,
 };
@@ -85,7 +85,7 @@ pub fn eqlz2meddis_hc_level(
         let output = Array1::from_iter(snd.iter().map(|v| v * 10_f64.powf(compensation_db / 20.0)));
         Ok((output, [source_db, compensation_db, source_db]))
     } else {
-        crate::gcfb_v211::utils::eqlz2meddis_hc_level(
+        super::base_utils::eqlz2meddis_hc_level(
             snd,
             out_level_db.ok_or_else(|| {
                 Error::InvalidParameter("out_level_db is required without input_rms1_dbspl".into())
@@ -99,7 +99,7 @@ pub fn equal_freq_scale(
     num_ch: usize,
     range_freq: [f64; 2],
 ) -> Result<(Array1<f64>, Array1<f64>)> {
-    crate::gcfb_v211::utils::equal_freq_scale(scale, num_ch, range_freq)
+    super::base_utils::equal_freq_scale(scale, num_ch, range_freq)
 }
 
 pub fn interp1(x: &[f64], y: &[f64], x_new: &[f64], extrapolate: bool) -> Result<Array1<f64>> {
@@ -331,7 +331,7 @@ pub fn mk_filter_field2cochlea(
     let transfer = trans_func_field2cochlea(&param)?;
     let bins = transfer.freq.len();
     let fft_len = bins * 2;
-    let count = crate::gcfb_v211::utils::correction_filter_coefficient_count(fs, fft_len)?;
+    let count = super::base_utils::correction_filter_coefficient_count(fs, fft_len)?;
     let mut spectrum = vec![num_complex::Complex64::new(0., 0.); fft_len];
     let mags: Vec<f64> = transfer
         .field2cochlea_db

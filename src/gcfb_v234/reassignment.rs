@@ -56,13 +56,13 @@ use std::f64::consts::PI;
 use ndarray::{Array1, Array2};
 use num_complex::Complex64;
 
+use super::gammachirp::{self, Carrier, Normalization};
 use super::gcfb_v234::{
     AcfCoef, ControlMode, GcParam, GcfbOutput, cmprs_gc_frsp, gcfb_v234,
     gcfb_v234_with_bandwidth_peak_lock, make_asym_cmp_filters_v2, prepare_bandwidth_peak_grid,
     scale_bandwidths,
 };
 use super::utils;
-use crate::gcfb_v211::gammachirp::{self, Carrier, Normalization};
 use crate::{Error, Result, dsp};
 
 mod stream;

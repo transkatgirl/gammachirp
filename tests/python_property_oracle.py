@@ -45,18 +45,8 @@ def load_version(name):
         return utils, gammachirp, filterbank
     finally:
         sys.path.remove(str(directory))
-        for module in ("utils", "gammachirp", "gcfb_v211", "gcfb_v234"):
+        for module in ("utils", "gammachirp", "gcfb_v234"):
             sys.modules.pop(module, None)
-
-
-def make_v211_param(request):
-    param = Param()
-    param.fs = request["fs"]
-    param.num_ch = request["channels"]
-    param.f_range = np.asarray(request["f_range"], dtype=float)
-    param.out_mid_crct = "No"
-    param.ctrl = request["control"]
-    return param
 
 
 def make_v234_param(request):
@@ -77,16 +67,16 @@ def scales(request):
     frequencies = np.asarray(request["frequencies"], dtype=float)
     mel = np.asarray(request["mel"], dtype=float)
     signal = np.asarray(request["signal"], dtype=float)
-    rate, width = u211.freq2erb(frequencies)
-    inverse, inverse_width = u211.erb2freq(rate)
-    equal_frequency, equal_scale = u211.equal_freq_scale(
+    rate, width = u234.freq2erb(frequencies)
+    inverse, inverse_width = u234.erb2freq(rate)
+    equal_frequency, equal_scale = u234.equal_freq_scale(
         request["scale"], request["channels"], np.asarray(request["range"], dtype=float)
     )
     return {
-        "rms": float(u211.rms(signal)),
-        "nextpow2": int(u211.nextpow2(request["integer"])),
-        "freq2mel": encoded(u211.freq2mel(frequencies)),
-        "mel2freq": encoded(u211.mel2freq(mel)),
+        "rms": float(u234.rms(signal)),
+        "nextpow2": int(u234.nextpow2(request["integer"])),
+        "freq2mel": encoded(u234.freq2mel(frequencies)),
+        "mel2freq": encoded(u234.mel2freq(mel)),
         "erb_rate": encoded(rate),
         "erb_width": encoded(width),
         "erb_inverse": encoded(inverse),
@@ -100,16 +90,16 @@ def signal_utils(request):
     signal = np.asarray(request["signal"], dtype=float)
     coefficients = np.asarray(request["coefficients"], dtype=float)
     cepstrum_source = np.asarray(request["cepstrum"], dtype=float)
-    equalized, level = u211.eqlz2meddis_hc_level(signal, request["out_level_db"])
-    window, name = u211.taper_window(
+    equalized, level = u234.eqlz2meddis_hc_level(signal, request["out_level_db"])
+    window, name = u234.taper_window(
         request["window_length"],
         request["window_kind"],
         request["taper_length"],
         request["range_sigma"],
         0,
     )
-    cepstrum, minimum_phase = u211.rceps(cepstrum_source)
-    frames, centers = f211.set_frame4time_sequence(
+    cepstrum, minimum_phase = u234.rceps(cepstrum_source)
+    frames, centers = f234.set_frame4time_sequence(
         signal, request["frame_length"], request["frame_shift"]
     )
     return {
@@ -117,7 +107,7 @@ def signal_utils(request):
         "level": encoded(level),
         "window": encoded(window),
         "window_name": name,
-        "filtered": encoded(u211.fftfilt(coefficients, signal)),
+        "filtered": encoded(u234.fftfilt(coefficients, signal)),
         "cepstrum": encoded(cepstrum),
         "minimum_phase": encoded(minimum_phase),
         "frames": encoded(frames),
@@ -126,7 +116,7 @@ def signal_utils(request):
 
 
 def gammachirp_impulse(request):
-    output = gc211.gammachirp(
+    output = gc234.gammachirp(
         request["frequency"],
         request["fs"],
         request["order"],
@@ -147,7 +137,7 @@ def gammachirp_impulse(request):
 
 def gammachirp_response(request):
     frequencies = np.asarray(request["frequencies"], dtype=float)
-    output = gc211.gammachirp_frsp(
+    output = gc234.gammachirp_frsp(
         frequencies,
         request["fs"],
         request["order"],
@@ -169,16 +159,16 @@ def asymmetric_filters(request):
     frequencies = np.asarray(request["frequencies"], dtype=float)
     bandwidth = np.asarray(request["bandwidth"], dtype=float)
     chirp = np.asarray(request["chirp"], dtype=float)
-    coefficients = f211.make_asym_cmp_filters_v2(
+    coefficients = f234.make_asym_cmp_filters_v2(
         request["fs"], frequencies.reshape(-1, 1), bandwidth.reshape(-1, 1), chirp.reshape(-1, 1)
     )
-    response = f211.asym_cmp_frsp_v2(
+    response = f234.asym_cmp_frsp_v2(
         frequencies, request["fs"], bandwidth, chirp, request["bins"], 4
     )
-    _, status = f211.acfilterbank(coefficients, [])
+    _, status = f234.acfilterbank(coefficients, [])
     sequence = []
     for samples in request["samples"]:
-        output, status = f211.acfilterbank(coefficients, status, np.asarray(samples), request["reverse"])
+        output, status = f234.acfilterbank(coefficients, status, np.asarray(samples), request["reverse"])
         sequence.append(np.asarray(output)[:, 0])
     return {
         "ap": encoded(coefficients.ap),
@@ -197,7 +187,7 @@ def compressed_response(request):
     ratio = np.asarray(request["ratio"], dtype=float)
     b2 = np.asarray(request["b2"], dtype=float)
     c2 = np.asarray(request["c2"], dtype=float)
-    output = f211.cmprs_gc_frsp(
+    output = f234.cmprs_gc_frsp(
         frequencies,
         request["fs"],
         request["order"],
@@ -228,9 +218,9 @@ def frequency_conversion(request):
         request["order"], request["b1"], request["c1"], request["b2"],
         request["c2"], request["ratio"],
     )
-    peak, second_center = f211.fr1_to_fp2(*arguments, np.asarray([request["fr1"]]))
+    peak, second_center = f234.fr1_to_fp2(*arguments, np.asarray([request["fr1"]]))
     peak = float(np.real(np.asarray(peak).reshape(-1)[0]))
-    inverse_center, inverse_peak = f211.fp2_to_fr1(*arguments, peak)
+    inverse_center, inverse_peak = f234.fp2_to_fr1(*arguments, peak)
     return {
         "peak": peak,
         "second_center": float(np.real(np.asarray(second_center).reshape(-1)[0])),
@@ -332,19 +322,6 @@ def v234_asymmetric_io(request):
     }
 
 
-def v211_filterbank(request):
-    output = f211.gcfb_v211(np.asarray(request["signal"], dtype=float), make_v211_param(request))
-    cgc, pgc, _param, response = output
-    return {
-        "cgc": encoded(cgc),
-        "pgc": encoded(pgc),
-        "fr2": encoded(getattr(response, "fr2", [])),
-        "ratio": encoded(getattr(response, "frat_val", [])),
-        "level": encoded(getattr(response, "lvl_db", [])),
-        "gain": encoded(getattr(response, "gain_factor", [])),
-    }
-
-
 def v234_filterbank(request):
     output = f234.gcfb_v234(np.asarray(request["signal"], dtype=float), make_v234_param(request))
     dcgc, scgc, _param, response = output
@@ -375,13 +352,12 @@ OPERATIONS = {
     "modulation_filterbank": modulation_filterbank,
     "envelope_modulation_loss": envelope_modulation_loss,
     "v234_asymmetric_io": v234_asymmetric_io,
-    "v211_filterbank": v211_filterbank,
     "v234_filterbank": v234_filterbank,
 }
 
 
 def initialize():
-    global np, u211, gc211, f211, u234, gc234, f234
+    global np, u234, gc234, f234
 
     import numpy as np_module
 
@@ -401,7 +377,6 @@ def initialize():
         sys.modules["matplotlib"] = matplotlib
         sys.modules["matplotlib.pyplot"] = pyplot
 
-    u211, gc211, f211 = load_version("gcfb_v211")
     u234, gc234, f234 = load_version("gcfb_v234")
 
 

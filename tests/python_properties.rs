@@ -13,18 +13,15 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use gammachirp_rs::gcfb_v211::{
-    gammachirp::{self as gc, Carrier, Normalization},
-    gcfb_v211::{self as fb211, AcfStatus, ControlMode as Control211, GcParam as Param211},
-    utils::{self as utils211, FrequencyScale},
-};
 use gammachirp_rs::gcfb_v234::{
+    gammachirp::{self as gc, Carrier, Normalization},
     gcfb_v234::{
-        self as fb234, ControlMode as Control234, DynHpaf, EmParam, GainReference,
+        self as fb234, AcfStatus, ControlMode as Control234, DynHpaf, EmParam, GainReference,
         GcParam as Param234,
     },
-    utils::{self as utils234, Floor, ParamTransFunc},
+    utils::{self as utils234, Floor, FrequencyScale, ParamTransFunc},
 };
+
 use ndarray::{Array2, ArrayView2};
 use proptest::{
     prelude::*,
@@ -298,19 +295,19 @@ proptest! {
             "signal": signal, "integer": integer, "scale": "ERB",
             "channels": channels, "range": [low, low + span],
         })) else { return Ok(()) };
-        check_scalar("rms", utils211::rms(&signal), &expected["rms"], 2e-14, 2e-14)?;
-        prop_assert_eq!(utils211::nextpow2(integer) as u64, expected["nextpow2"].as_u64().unwrap());
-        let mel_actual: Vec<f64> = frequencies.iter().map(|&value| utils211::freq2mel(value)).collect();
+        check_scalar("rms", utils234::rms(&signal), &expected["rms"], 2e-14, 2e-14)?;
+        prop_assert_eq!(utils234::nextpow2(integer) as u64, expected["nextpow2"].as_u64().unwrap());
+        let mel_actual: Vec<f64> = frequencies.iter().map(|&value| utils234::freq2mel(value)).collect();
         check_array("freq2mel", &mel_actual, &[frequencies.len()], &expected["freq2mel"], 2e-12, 2e-13)?;
-        let frequency_actual: Vec<f64> = mel.iter().map(|&value| utils211::mel2freq(value)).collect();
+        let frequency_actual: Vec<f64> = mel.iter().map(|&value| utils234::mel2freq(value)).collect();
         check_array("mel2freq", &frequency_actual, &[mel.len()], &expected["mel2freq"], 2e-10, 2e-13)?;
-        let (rate, width) = utils211::freq2erb(&frequencies);
+        let (rate, width) = utils234::freq2erb(&frequencies);
         check_array("ERB rate", rate.as_slice().unwrap(), &[frequencies.len()], &expected["erb_rate"], 2e-12, 2e-13)?;
         check_array("ERB width", width.as_slice().unwrap(), &[frequencies.len()], &expected["erb_width"], 2e-11, 2e-13)?;
-        let (inverse, inverse_width) = utils211::erb2freq(rate.as_slice().unwrap());
+        let (inverse, inverse_width) = utils234::erb2freq(rate.as_slice().unwrap());
         check_array("ERB inverse", inverse.as_slice().unwrap(), &[frequencies.len()], &expected["erb_inverse"], 3e-10, 3e-13)?;
         check_array("ERB inverse width", inverse_width.as_slice().unwrap(), &[frequencies.len()], &expected["erb_inverse_width"], 3e-11, 3e-13)?;
-        let (equal_frequency, equal_scale) = utils211::equal_freq_scale(FrequencyScale::Erb, channels, [low, low + span]).unwrap();
+        let (equal_frequency, equal_scale) = utils234::equal_freq_scale(FrequencyScale::Erb, channels, [low, low + span]).unwrap();
         check_values("equal ERB frequency", equal_frequency.as_slice().unwrap(), &expected["equal_frequency"], 3e-9, 3e-12)?;
         check_values("equal ERB scale", equal_scale.as_slice().unwrap(), &expected["equal_scale"], 3e-12, 3e-13)?;
     }
@@ -349,18 +346,19 @@ proptest! {
             "frame_length": frame_length, "frame_shift": frame_shift,
         })) else { return Ok(()) };
 
-        let (equalized, level) = utils211::eqlz2meddis_hc_level(&signal, out_level).unwrap();
+        let (equalized, level) =
+            utils234::eqlz2meddis_hc_level(&signal, Some(out_level), None).unwrap();
         check_array("level-equalized signal", equalized.as_slice().unwrap(), &[signal.len()], &expected["equalized"], 2e-11, 3e-13)?;
         check_values("level metadata", &level, &expected["level"], 3e-12, 3e-13)?;
-        let (window, name) = utils211::taper_window(window_length, window_kind, Some(taper_length), sigma).unwrap();
+        let (window, name) = utils234::taper_window(window_length, window_kind, Some(taper_length), sigma).unwrap();
         prop_assert_eq!(name, expected["window_name"].as_str().unwrap());
         check_array("taper window", window.as_slice().unwrap(), &[window_length], &expected["window"], 3e-14, 3e-13)?;
-        let filtered = utils211::fftfilt(&coefficients, &signal);
+        let filtered = utils234::fftfilt(&coefficients, &signal);
         check_array("FFT filtering", filtered.as_slice().unwrap(), &[signal.len()], &expected["filtered"], 2e-12, 4e-12)?;
-        let (cep, minimum) = utils211::rceps(&cepstrum).unwrap();
+        let (cep, minimum) = utils234::rceps(&cepstrum).unwrap();
         check_values("real cepstrum", cep.as_slice().unwrap(), &expected["cepstrum"], 5e-12, 5e-12)?;
         check_values("minimum-phase signal", minimum.as_slice().unwrap(), &expected["minimum_phase"], 8e-12, 8e-12)?;
-        let (frames, centers) = fb211::set_frame4time_sequence(&signal, frame_length, Some(frame_shift)).unwrap();
+        let (frames, centers) = fb234::set_frame4time_sequence(&signal, frame_length, Some(frame_shift)).unwrap();
         check_array("framed signal", &flattened(frames.view()), &[frames.nrows(), frames.ncols()], &expected["frames"], 3e-15, 3e-15)?;
         let centers: Vec<f64> = centers.iter().map(|&value| value as f64).collect();
         check_values("frame centers", &centers, &expected["centers"], 0.0, 0.0)?;
@@ -439,10 +437,10 @@ proptest! {
             "bandwidth": bandwidth, "chirp": chirp, "bins": 256,
             "samples": samples, "reverse": reverse,
         })) else { return Ok(()) };
-        let coefficients = fb211::make_asym_cmp_filters_v2(fs, &frequencies, &bandwidth, &chirp).unwrap();
+        let coefficients = fb234::make_asym_cmp_filters_v2(fs, &frequencies, &bandwidth, &chirp).unwrap();
         check_array("asymmetric poles", coefficients.ap.as_slice().unwrap(), &[channels, 3, 4], &expected["ap"], 8e-13, 8e-13)?;
         check_array("asymmetric zeros", coefficients.bz.as_slice().unwrap(), &[channels, 3, 4], &expected["bz"], 8e-13, 8e-13)?;
-        let response = fb211::asym_cmp_frsp_v2(&frequencies, fs, &bandwidth, &chirp, 256, 4).unwrap();
+        let response = fb234::asym_cmp_frsp_v2(&frequencies, fs, &bandwidth, &chirp, 256, 4).unwrap();
         check_array("asymmetric response", &flattened(response.acf_frsp.view()), &[channels, 256], &expected["response"], 2e-9, 3e-9)?;
         check_values("asymmetric response frequency", response.freq.as_slice().unwrap(), &expected["response_frequency"], 2e-12, 2e-13)?;
         check_array("asymmetric function", &flattened(response.asym_func.view()), &[channels, 256], &expected["asymmetry"], 2e-11, 2e-11)?;
@@ -472,7 +470,7 @@ proptest! {
             "order": order, "b1": b1, "c1": c1, "ratio": ratio,
             "b2": b2, "c2": c2, "bins": 256,
         })) else { return Ok(()) };
-        let output = fb211::cmprs_gc_frsp(&frequencies, fs, order, &b1, &c1, &ratio, &b2, &c2, 256).unwrap();
+        let output = fb234::cmprs_gc_frsp(&frequencies, fs, order, &b1, &c1, &ratio, &b2, &c2, 256).unwrap();
         for (label, actual, key, atol, rtol) in [
             ("compressed PGC", output.pgc_frsp.as_slice().unwrap(), "pgc", 2e-11, 2e-11),
             ("compressed CGC", output.cgc_frsp.as_slice().unwrap(), "cgc", 3e-10, 3e-10),
@@ -504,8 +502,8 @@ proptest! {
             "op": "frequency_conversion", "order": order, "b1": b1, "c1": c1,
             "b2": b2, "c2": c2, "ratio": ratio, "fr1": fr1,
         })) else { return Ok(()) };
-        let (peak, second_center) = fb211::fr1_to_fp2(order, b1, c1, b2, c2, ratio, fr1).unwrap();
-        let (inverse_center, inverse_peak) = fb211::fp2_to_fr1(order, b1, c1, b2, c2, ratio, peak).unwrap();
+        let (peak, second_center) = fb234::fr1_to_fp2(order, b1, c1, b2, c2, ratio, fr1).unwrap();
+        let (inverse_center, inverse_peak) = fb234::fp2_to_fr1(order, b1, c1, b2, c2, ratio, peak).unwrap();
         check_scalar("compressive peak", peak, &expected["peak"], 1e-4, 5e-8)?;
         check_scalar("second center", second_center, &expected["second_center"], 1e-8, 2e-11)?;
         check_scalar("inverse center", inverse_center, &expected["inverse_center"], 1e-4, 5e-8)?;
@@ -677,17 +675,6 @@ proptest! {
     }
 }
 
-fn v211_param(control: Control211, fs: f64, channels: usize, f_range: [f64; 2]) -> Param211 {
-    Param211 {
-        fs,
-        num_ch: channels,
-        f_range,
-        out_mid_crct: "No".into(),
-        ctrl: control,
-        ..Param211::default()
-    }
-}
-
 fn v234_param(fs: f64, channels: usize, f_range: [f64; 2], hearing_loss: &str) -> Param234 {
     Param234 {
         fs,
@@ -708,34 +695,6 @@ fn v234_param(fs: f64, channels: usize, f_range: [f64; 2], hearing_loss: &str) -
 
 proptest! {
     #![proptest_config(property_config(12))]
-
-    #[test]
-    fn v211_filterbank_matches_python_for_generated_signals(
-        signal in prop::collection::vec(-1.5f64..1.5, 8..36),
-        channels in 3usize..7,
-        low in 100.0f64..500.0,
-        high in 1_000.0f64..3_200.0,
-        control_index in 0usize..3,
-    ) {
-        let signal = non_silent(signal);
-        let controls = [Control211::Static, Control211::Dynamic, Control211::Level];
-        let control_names = ["static", "dynamic", "level"];
-        let control = controls[control_index];
-        let control_name = control_names[control_index];
-        let Some(expected) = oracle(json!({
-            "op": "v211_filterbank", "signal": signal, "fs": 8_000.0,
-            "channels": channels, "f_range": [low, high], "control": control_name,
-        })) else { return Ok(()) };
-        let output = fb211::gcfb_v211(&signal, v211_param(control, 8_000.0, channels, [low, high])).unwrap();
-        check_array("v211 CGC", output.cgc_out.as_slice().unwrap(), &[channels, signal.len()], &expected["cgc"], 3e-9, 5e-8)?;
-        check_array("v211 PGC", output.pgc_out.as_slice().unwrap(), &[channels, signal.len()], &expected["pgc"], 5e-10, 5e-9)?;
-        check_values("v211 fr2", output.gc_resp.fr2.as_slice().unwrap(), &expected["fr2"], 2e-5, 5e-8)?;
-        check_values("v211 ratio", output.gc_resp.frat_val.as_slice().unwrap(), &expected["ratio"], 3e-8, 5e-8)?;
-        check_values("v211 level", output.gc_resp.lvl_db.as_slice().unwrap(), &expected["level"], 3e-7, 5e-8)?;
-        if !expected_values(&expected["gain"])?.is_empty() {
-            check_values("v211 gain", output.gc_resp.gain_factor.as_slice().unwrap(), &expected["gain"], 3e-8, 5e-8)?;
-        }
-    }
 
     #[test]
     fn v234_dynamic_frame_filterbank_matches_python_for_generated_signals(
