@@ -990,6 +990,18 @@ fn validate_lock_frequency(frequency: f64, sample_rate: f64, name: &str) -> Resu
     Ok(())
 }
 
+fn record_lock_evaluation(
+    evaluate: &mut impl FnMut(f64) -> Result<usize>,
+    samples: &mut Vec<(f64, usize)>,
+    value: f64,
+) -> Result<Option<(f64, usize)>> {
+    if let Some(bin) = optional_lock_evaluation(evaluate(value))? {
+        samples.push((value, bin));
+        return Ok(Some((value, bin)));
+    }
+    Ok(None)
+}
+
 fn exact_bin_root(
     seed: f64,
     target_bin: usize,
@@ -1000,8 +1012,11 @@ fn exact_bin_root(
     let minimum = (sample_rate * 1e-12).max(f64::MIN_POSITIVE);
     let maximum = sample_rate / 2.0 * (1.0 - 1e-12);
     let analytic_seed = seed.clamp(minimum, maximum);
-    let (seed, seed_bin) = if let Some(bin) = optional_lock_evaluation(evaluate(analytic_seed))? {
-        (analytic_seed, bin)
+    let mut samples = Vec::new();
+    let (seed, seed_bin) = if let Some(pair) =
+        record_lock_evaluation(&mut evaluate, &mut samples, analytic_seed)?
+    {
+        pair
     } else {
         let mut step =
             (analytic_seed.abs() * 0.02).max(sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64);
@@ -1009,15 +1024,13 @@ fn exact_bin_root(
         for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
             let lower = (analytic_seed - step).max(minimum);
             let upper = (analytic_seed + step).min(maximum);
-            let lower_bin = optional_lock_evaluation(evaluate(lower))?;
-            let upper_bin = if upper == lower {
+            let lower_pair = record_lock_evaluation(&mut evaluate, &mut samples, lower)?;
+            let upper_pair = if upper == lower {
                 None
             } else {
-                optional_lock_evaluation(evaluate(upper))?
+                record_lock_evaluation(&mut evaluate, &mut samples, upper)?
             };
-            valid = lower_bin
-                .map(|bin| (lower, bin))
-                .or_else(|| upper_bin.map(|bin| (upper, bin)));
+            valid = lower_pair.or(upper_pair);
             if valid.is_some() || (lower == minimum && upper == maximum) {
                 break;
             }
@@ -1042,8 +1055,8 @@ fn exact_bin_root(
     for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
         let next_lower = (seed - step).max(minimum);
         if can_expand_lower && next_lower < lower.0 {
-            if let Some(bin) = optional_lock_evaluation(evaluate(next_lower))? {
-                lower = (next_lower, bin);
+            if let Some(pair) = record_lock_evaluation(&mut evaluate, &mut samples, next_lower)? {
+                lower = pair;
                 if lower.1 == target_bin {
                     return Ok(lower);
                 }
@@ -1053,8 +1066,8 @@ fn exact_bin_root(
         }
         let next_upper = (seed + step).min(maximum);
         if can_expand_upper && next_upper > upper.0 {
-            if let Some(bin) = optional_lock_evaluation(evaluate(next_upper))? {
-                upper = (next_upper, bin);
+            if let Some(pair) = record_lock_evaluation(&mut evaluate, &mut samples, next_upper)? {
+                upper = pair;
                 if upper.1 == target_bin {
                     return Ok(upper);
                 }
@@ -1080,31 +1093,103 @@ fn exact_bin_root(
         }
         step *= 2.0;
     }
-    let Some((mut lower, mut upper)) = bracket else {
-        return Err(Error::Unsupported(format!(
-            "no finite, positive, sub-Nyquist {name} reaches bandwidth peak-grid bin {target_bin}"
-        )));
-    };
-    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
-        let midpoint = lower.0 + (upper.0 - lower.0) / 2.0;
-        if midpoint == lower.0 || midpoint == upper.0 {
-            break;
-        }
-        let middle = (midpoint, evaluate(midpoint)?);
-        if middle.1 == target_bin {
-            return Ok(middle);
-        }
-        if bin_is_between(target_bin, lower.1, middle.1) {
-            upper = middle;
-        } else if bin_is_between(target_bin, middle.1, upper.1) {
-            lower = middle;
-        } else {
-            break;
+    if let Some((mut lower, mut upper)) = bracket {
+        for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+            let midpoint = lower.0 + (upper.0 - lower.0) / 2.0;
+            if midpoint == lower.0 || midpoint == upper.0 {
+                break;
+            }
+            let Some(middle) = record_lock_evaluation(&mut evaluate, &mut samples, midpoint)?
+            else {
+                break;
+            };
+            if middle.1 == target_bin {
+                return Ok(middle);
+            }
+            if bin_is_between(target_bin, lower.1, middle.1) {
+                upper = middle;
+            } else if bin_is_between(target_bin, middle.1, upper.1) {
+                lower = middle;
+            } else {
+                break;
+            }
         }
     }
-    Err(Error::Unsupported(format!(
-        "no finite, positive, sub-Nyquist {name} reaches bandwidth peak-grid bin {target_bin}"
-    )))
+    // The discrete peak bin is a discontinuous step function of the solved
+    // value whose plateaus the bracketing steps can straddle or overshoot,
+    // and some target bins no value realizes at all. Fall back to the
+    // evaluated value whose bin is nearest the target so a narrow, missed
+    // plateau or an unrealizable bin does not terminate the analysis.
+    nearest_bin_root(seed, target_bin, name, &mut samples, &mut evaluate)
+}
+
+fn nearest_bin_root(
+    seed: f64,
+    target_bin: usize,
+    name: &str,
+    samples: &mut Vec<(f64, usize)>,
+    evaluate: &mut impl FnMut(f64) -> Result<usize>,
+) -> Result<(f64, usize)> {
+    let distance = |sample: &(f64, usize)| sample.1.abs_diff(target_bin);
+    let compare = |left: &(f64, usize), right: &(f64, usize)| {
+        distance(left).cmp(&distance(right)).then_with(|| {
+            (left.0 - seed)
+                .abs()
+                .total_cmp(&(right.0 - seed).abs())
+                .then_with(|| left.0.total_cmp(&right.0))
+        })
+    };
+    samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+    samples.dedup_by(|left, right| left.0 == right.0);
+    let mut best = *samples
+        .iter()
+        .min_by(|left, right| compare(left, right))
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "no finite, positive, sub-Nyquist {name} approaches bandwidth peak-grid bin {target_bin}"
+            ))
+        })?;
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        if best.1 == target_bin || samples.len() < 2 {
+            break;
+        }
+        let pair_distance =
+            |index: usize| distance(&samples[index]).min(distance(&samples[index + 1]));
+        let mut choice = 0;
+        for index in 1..samples.len() - 1 {
+            if pair_distance(index) < pair_distance(choice)
+                || (pair_distance(index) == pair_distance(choice)
+                    && samples[index + 1].0 - samples[index].0
+                        < samples[choice + 1].0 - samples[choice].0)
+            {
+                choice = index;
+            }
+        }
+        let start = samples[choice].0;
+        let end = samples[choice + 1].0;
+        let mut improved = false;
+        for point in 1..8 {
+            let value = start + (end - start) * point as f64 / 8.0;
+            if value == start || value == end {
+                continue;
+            }
+            if let Some(pair) = record_lock_evaluation(evaluate, samples, value)?
+                && compare(&pair, &best).is_lt()
+            {
+                best = pair;
+                improved = true;
+            }
+        }
+        if best.1 == target_bin {
+            break;
+        }
+        if !improved {
+            break;
+        }
+        samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+        samples.dedup_by(|left, right| left.0 == right.0);
+    }
+    Ok(best)
 }
 
 fn optional_lock_evaluation(result: Result<usize>) -> Result<Option<usize>> {
@@ -1250,7 +1335,7 @@ fn local_main_lobe_peak_bin(
 
 fn verify_peak_bin(actual: usize, target: usize) -> Result<()> {
     if actual != target {
-        return Err(Error::Numerical(format!(
+        return Err(Error::Unsupported(format!(
             "bandwidth peak lock missed its DFT bin: {actual} versus {target}"
         )));
     }

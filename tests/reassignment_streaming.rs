@@ -906,3 +906,42 @@ fn rolling_consensus_validates_configuration_and_input_atomically() {
         derived.max_buffered_scale_samples()
     );
 }
+
+#[test]
+fn rolling_consensus_tolerates_unreachable_discrete_peak_bins() {
+    let sample_rate = 16_000.0;
+    let samples = 64;
+    let mut stream = BandwidthConsensusStream::new(
+        GcParam {
+            fs: sample_rate,
+            num_ch: 16,
+            f_range: [100.0, 6_000.0],
+            out_mid_crct: "ELC".into(),
+            ctrl: ControlMode::Dynamic,
+            dyn_hpaf: DynHpaf {
+                str_prc: "sample-base".into(),
+                ..DynHpaf::default()
+            },
+            lvl_est: gammachirp_rs::gcfb_v234::gcfb_v234::LvlEst {
+                rms2spldb: 100.0,
+                ..Default::default()
+            },
+            ..GcParam::default()
+        },
+        BandwidthConsensusStreamConfig::default(),
+    )
+    .unwrap();
+    for sample in 0..samples {
+        let input = 0.2 * (2.0 * PI * 1_000.0 * sample as f64 / sample_rate).cos();
+        let step = stream.process_sample(input).unwrap();
+        if let Some(frame) = step.consensus {
+            assert!(
+                frame
+                    .salience
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            );
+        }
+    }
+    assert_eq!(stream.samples_processed(), samples);
+}
