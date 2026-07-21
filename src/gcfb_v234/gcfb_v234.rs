@@ -427,7 +427,33 @@ impl BandwidthPeakLock {
                 self.previous_scaled_peak_bins[ch],
                 self.grid.sample_rate,
                 self.grid.fft_len,
-            )?;
+            )
+            .or_else(|error| {
+                // The analytic inverse can seed the root solve a few bins off
+                // a narrow main lobe, so its fixed bracketing steps overshoot
+                // the lobe entirely. The previous center tracks the target
+                // bins (and was verified against them at preparation), so it
+                // is the more reliable seed whenever it differs.
+                if analytic_seed == self.previous_centers[ch] {
+                    return Err(error);
+                }
+                center_for_discrete_peak(
+                    &self.scaled_passive[ch],
+                    self.scaled_b2[ch],
+                    self.scaled_c2[ch],
+                    self.scaled_b1[ch],
+                    self.scaled_c1[ch],
+                    self.scaled_carriers[ch],
+                    self.grid.order,
+                    self.previous_centers[ch],
+                    analytic_target,
+                    target_bins[ch],
+                    self.previous_scaled_peak_bins[ch],
+                    self.grid.sample_rate,
+                    self.grid.fft_len,
+                )
+                .map_err(|_| error)
+            })?;
             centers[ch] = center;
             actual_bins[ch] = bin;
         }
