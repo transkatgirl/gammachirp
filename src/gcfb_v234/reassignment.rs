@@ -449,11 +449,12 @@ pub fn phase_reassign_gcfb_v234_with_config(
 /// returned, unscaled [`GcfbOutput`]. Other scales uniformly multiply `b1`,
 /// `b2`, and `lvl_est.b2`, then retune their internal passive carriers to keep
 /// the nominal baseline implemented-cascade peak bins on a shared DFT grid. In
-/// sample-dynamic mode, every scale derives its ratio from its own level
-/// history and locks to the unscaled reference response evaluated at that same
-/// ratio. The realized baseline can have a different ratio and peak at the same
-/// sample. The call fails if any requested conditional bin has no finite,
-/// positive, below-Nyquist solution.
+/// dynamic mode, the unscaled baseline also uses the peak-lock path. In
+/// sample-dynamic mode, every scale derives its ratio from its own level history
+/// and locks to the unscaled reference response evaluated at that same ratio.
+/// The realized baseline can have a different ratio and peak at the same sample.
+/// The call fails if any requested conditional bin has no finite, positive,
+/// below-Nyquist solution.
 pub fn gcfb_v234_with_bandwidth_consensus(
     snd_in: &[f64],
     gc_param: GcParam,
@@ -463,6 +464,16 @@ pub fn gcfb_v234_with_bandwidth_consensus(
     let output = gcfb_v234(snd_in, gc_param.clone())?;
     let peak_grid =
         prepare_bandwidth_peak_grid(&gc_param, &config.scales, &output.gc_param, &output.gc_resp)?;
+    let output = if output.gc_param.ctrl == ControlMode::Dynamic {
+        gcfb_v234_with_bandwidth_peak_lock(
+            snd_in,
+            gc_param.clone(),
+            &output.gc_param.hloss,
+            peak_grid.clone(),
+        )?
+    } else {
+        output
+    };
     let (nominal_ratios, _) =
         super::gcfb_v234::initial_asymmetric_ratio_and_centers(&output.gc_param, &output.gc_resp);
     let nominal_peaks = peak_grid.nominal_peak_frequencies_hz(&nominal_ratios)?;
@@ -2482,7 +2493,7 @@ mod tests {
         let fft_len = peak_grid.fft_len();
         let scaled = gcfb_v234_with_bandwidth_peak_lock(
             &signal,
-            scale_bandwidths(parameters, 1.2),
+            scale_bandwidths(parameters.clone(), 1.2),
             &baseline.gc_param.hloss,
             peak_grid,
         )
@@ -2540,5 +2551,28 @@ mod tests {
         }
         assert!(ratio_histories_diverged);
         assert!(realized_peak_bins_diverged);
+
+        let (locked_baseline, _) = gcfb_v234_with_bandwidth_consensus(
+            &signal,
+            parameters,
+            &BandwidthConsensusConfig {
+                scales: scales.to_vec(),
+                ..BandwidthConsensusConfig::default()
+            },
+        )
+        .unwrap();
+        let mut ratio_changed_while_center_was_held = false;
+        for update in (0..signal.len()).step_by(locked_baseline.gc_param.num_update_asym_cmp) {
+            let centers = locked_baseline.gc_resp.fr2.column(update).to_owned();
+            let ratios = locked_baseline.gc_resp.frat_val.column(update).to_owned();
+            for held in update + 1
+                ..(update + locked_baseline.gc_param.num_update_asym_cmp).min(signal.len())
+            {
+                assert_eq!(locked_baseline.gc_resp.fr2.column(held), centers.view());
+                ratio_changed_while_center_was_held |=
+                    locked_baseline.gc_resp.frat_val.column(held) != ratios.view();
+            }
+        }
+        assert!(ratio_changed_while_center_was_held);
     }
 }

@@ -368,7 +368,8 @@ impl ReassignmentStream {
 /// HP-AF centers match the unscaled reference response evaluated at that
 /// scale's own realized ratio on the shared DFT grid. Because the realized
 /// baseline ratio can differ, controller-induced peak drift remains part of
-/// rolling consensus; a failed conditional peak solve permanently terminates
+/// rolling consensus. Dynamic control also routes the unscaled baseline through
+/// this peak-lock path; a failed conditional peak solve permanently terminates
 /// the stream.
 #[derive(Clone, Debug)]
 pub struct BandwidthConsensusStream {
@@ -399,7 +400,7 @@ impl BandwidthConsensusStream {
             ));
         }
 
-        let baseline = ReassignmentStream::new(gc_param.clone())?;
+        let mut baseline = ReassignmentStream::new(gc_param.clone())?;
         let hearing_loss = baseline.gc_param().hloss.clone();
         let reference_param = baseline.gc_param().clone();
         let reference_response = baseline.gc_resp().clone();
@@ -409,6 +410,13 @@ impl BandwidthConsensusStream {
             &reference_param,
             &reference_response,
         )?;
+        if reference_param.ctrl == ControlMode::Dynamic {
+            baseline = ReassignmentStream::new_with_bandwidth_peak_lock(
+                gc_param.clone(),
+                &hearing_loss,
+                peak_grid.clone(),
+            )?;
+        }
         let (nominal_ratios, _) =
             initial_asymmetric_ratio_and_centers(&reference_param, &reference_response);
         let nominal_peaks = peak_grid.nominal_peak_frequencies_hz(&nominal_ratios)?;

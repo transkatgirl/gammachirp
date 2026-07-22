@@ -2,7 +2,7 @@ use std::f64::consts::PI;
 
 use gammachirp_rs::gcfb_v234::{
     BandwidthConsensusConfig, BandwidthConsensusStream, BandwidthConsensusStreamConfig,
-    BandwidthConsensusStreamFrame, ControlMode, DynHpaf, GcParam, ReassignmentStream,
+    BandwidthConsensusStreamFrame, ControlMode, DcgcEvent, DynHpaf, GcParam, ReassignmentStream,
     gcfb_v234_with_bandwidth_consensus, gcfb_v234_with_phase_reassignment, reassign_gcfb_v234,
 };
 use ndarray::Array2;
@@ -910,7 +910,7 @@ fn rolling_consensus_validates_configuration_and_input_atomically() {
 #[test]
 fn rolling_consensus_tolerates_unreachable_discrete_peak_bins() {
     let sample_rate = 16_000.0;
-    let samples = 64;
+    let samples = 64_usize;
     let mut stream = BandwidthConsensusStream::new(
         GcParam {
             fs: sample_rate,
@@ -926,14 +926,33 @@ fn rolling_consensus_tolerates_unreachable_discrete_peak_bins() {
                 rms2spldb: 100.0,
                 ..Default::default()
             },
+            num_update_asym_cmp: 3,
             ..GcParam::default()
         },
         BandwidthConsensusStreamConfig::default(),
     )
     .unwrap();
+    let mut held_centers = None;
+    let mut update_ratios = None;
+    let mut ratio_changed_while_center_was_held = false;
     for sample in 0..samples {
         let input = 0.2 * (2.0 * PI * 1_000.0 * sample as f64 / sample_rate).cos();
         let step = stream.process_sample(input).unwrap();
+        let Some(DcgcEvent::Sample {
+            frat_val: Some(ratios),
+            fr2: Some(centers),
+            ..
+        }) = step.baseline().filterbank.event.as_ref()
+        else {
+            panic!("dynamic consensus baseline must emit sample-domain centers and ratios");
+        };
+        if sample.is_multiple_of(3) {
+            held_centers = Some(centers.clone());
+            update_ratios = Some(ratios.clone());
+        } else {
+            assert_eq!(centers, held_centers.as_ref().unwrap());
+            ratio_changed_while_center_was_held |= ratios != update_ratios.as_ref().unwrap();
+        }
         if let Some(frame) = step.consensus {
             assert!(
                 frame
@@ -943,5 +962,6 @@ fn rolling_consensus_tolerates_unreachable_discrete_peak_bins() {
             );
         }
     }
+    assert!(ratio_changed_while_center_was_held);
     assert_eq!(stream.samples_processed(), samples);
 }
