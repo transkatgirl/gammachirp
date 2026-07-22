@@ -357,7 +357,7 @@ pub fn cmprs_gc_frsp(
     let mut pgc_frsp = Array2::zeros((fr1.len(), n_frq_rsl));
     let mut fp1 = Array1::zeros(fr1.len());
     for ch in 0..fr1.len() {
-        let impulse = gammachirp::gammachirp(
+        let impulse = gammachirp::gammachirp_reference_peak(
             &[fr1[ch]],
             fs,
             n,
@@ -365,7 +365,6 @@ pub fn cmprs_gc_frsp(
             c1[ch],
             0.0,
             gammachirp::Carrier::Cosine,
-            gammachirp::Normalization::Peak,
         )?;
         fp1[ch] = impulse.fps[0];
         let mut spectrum = vec![Complex64::new(0.0, 0.0); fft_len];
@@ -435,7 +434,7 @@ mod response_tests {
             bins,
         )
         .unwrap();
-        let impulse = gammachirp::gammachirp(
+        let impulse = gammachirp::gammachirp_reference_peak(
             &[1_000.0],
             fs,
             4.0,
@@ -443,7 +442,6 @@ mod response_tests {
             -2.96,
             0.0,
             gammachirp::Carrier::Cosine,
-            gammachirp::Normalization::Peak,
         )
         .unwrap();
         let coefficients =

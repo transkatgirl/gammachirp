@@ -13,6 +13,13 @@ Filterbank matrices use the same channel-major orientation as Python: rows are
 channels and columns are samples or frames. Parameters are typed structs, and
 invalid inputs return `gammachirp_rs::Result`.
 
+For direct FIR generation, `gammachirp::Normalization::Peak` normalizes the
+actual continuous-frequency peak of the finite sampled impulse response.
+`Gammachirp::fps` still reports the theoretical continuous-time peak used by
+the auditory model. The GCFB pipeline internally retains the original
+Python-compatible normalization at the FFT bin nearest that theoretical peak,
+so direct FIR normalization does not change filterbank calibration.
+
 ```rust
 use gammachirp_rs::gcfb_v234::{GcParam, gcfb_v234};
 

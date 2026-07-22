@@ -58,7 +58,7 @@ use std::f64::consts::PI;
 use ndarray::{Array1, Array2};
 use num_complex::Complex64;
 
-use super::gammachirp::{self, Carrier, Normalization};
+use super::gammachirp::{self, Carrier};
 use super::gcfb_v234::{
     AcfCoef, ControlMode, GcParam, GcfbOutput, gcfb_v234, gcfb_v234_with_bandwidth_peak_lock,
     make_asym_cmp_filters_v2, prepare_bandwidth_peak_grid, prepare_passive_impulses,
@@ -770,7 +770,7 @@ fn analysis_fft_len(
 }
 
 fn real_pgc(param: &GcParam, output: &GcfbOutput, ch: usize) -> Result<Vec<f64>> {
-    let impulse = gammachirp::gammachirp(
+    let impulse = gammachirp::gammachirp_reference_peak(
         &[output.gc_resp.fr1[ch]],
         param.fs,
         param.n,
@@ -778,7 +778,6 @@ fn real_pgc(param: &GcParam, output: &GcfbOutput, ch: usize) -> Result<Vec<f64>>
         output.gc_resp.c1_val[ch],
         0.0,
         Carrier::Cosine,
-        Normalization::Peak,
     )?;
     Ok(impulse
         .gc

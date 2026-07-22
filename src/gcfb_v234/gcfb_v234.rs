@@ -7,7 +7,7 @@ use ndarray::{Array1, Array2, Array3, Axis, s};
 use num_complex::Complex64;
 
 use super::{
-    gammachirp::{self, Carrier, Normalization},
+    gammachirp::{self, Carrier},
     utils::{self, FrequencyScale},
 };
 use crate::{Error, Result, dsp};
@@ -841,7 +841,7 @@ fn passive_impulse(
     b1: f64,
     c1: f64,
 ) -> Result<Vec<f64>> {
-    Ok(gammachirp::gammachirp(
+    Ok(gammachirp::gammachirp_reference_peak(
         &[carrier],
         sample_rate,
         order,
@@ -849,7 +849,6 @@ fn passive_impulse(
         c1,
         0.0,
         Carrier::Cosine,
-        Normalization::Peak,
     )?
     .gc
     .row(0)
@@ -1626,7 +1625,7 @@ pub(super) fn prepare_passive_impulses(
 ) -> Result<Vec<Vec<f64>>> {
     (0..param.num_ch)
         .map(|ch| {
-            let impulse = gammachirp::gammachirp(
+            let impulse = gammachirp::gammachirp_reference_peak(
                 &[response.fr1[ch]],
                 param.fs,
                 param.n,
@@ -1634,7 +1633,6 @@ pub(super) fn prepare_passive_impulses(
                 response.c1_val[ch],
                 0.0,
                 Carrier::Cosine,
-                Normalization::Peak,
             )?;
             Ok(impulse.gc.row(0).to_vec())
         })

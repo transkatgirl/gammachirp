@@ -955,7 +955,7 @@ fn causal_atoms(
             response.b1_val[ch],
             response.c1_val[ch],
         );
-        let cosine_peak = gammachirp::gammachirp(
+        let cosine_peak = gammachirp::gammachirp_reference_peak(
             arguments.0,
             arguments.1,
             arguments.2,
@@ -963,7 +963,6 @@ fn causal_atoms(
             arguments.4,
             0.0,
             Carrier::Cosine,
-            Normalization::Peak,
         )?;
         let cosine_raw = gammachirp::gammachirp(
             arguments.0,

@@ -66,6 +66,25 @@ fn assert_value_slices(label: &str, actual: &[f64], expected: &[f64], atol: f64,
     }
 }
 
+fn assert_scaled_values(label: &str, actual: &[f64], expected: &Value, atol: f64, rtol: f64) {
+    let reference = expected_values(expected);
+    assert_eq!(
+        actual.len(),
+        reference.len(),
+        "{label}: Rust and Python lengths differ"
+    );
+    let denominator = reference.iter().map(|value| value * value).sum::<f64>();
+    let scale = actual
+        .iter()
+        .zip(&reference)
+        .map(|(value, reference)| value * reference)
+        .sum::<f64>()
+        / denominator;
+    assert!(scale.is_finite() && scale > 0.0);
+    let scaled: Vec<f64> = reference.iter().map(|value| scale * value).collect();
+    assert_value_slices(label, actual, &scaled, atol, rtol);
+}
+
 fn assert_scalar(label: &str, actual: f64, expected: f64, atol: f64, rtol: f64) {
     let tolerance = atol + rtol * expected.abs();
     assert!(
@@ -412,13 +431,17 @@ fn gammachirp_impulses_and_carriers_match_python() {
             normalization,
         )
         .unwrap();
-        assert_values(
-            name,
-            &flattened(output.gc.view()),
-            &carriers[name],
-            5e-13,
-            5e-13,
-        );
+        if normalization == Normalization::Peak {
+            assert_channelwise_scaled_values(name, output.gc.view(), &carriers[name], 5e-13, 5e-13);
+        } else {
+            assert_values(
+                name,
+                &flattened(output.gc.view()),
+                &carriers[name],
+                5e-13,
+                5e-13,
+            );
+        }
     }
 }
 
@@ -528,7 +551,7 @@ fn discrete_pgc_fir_and_digital_acf_responses_match_python() {
                 .norm_sqr()
         })
         .collect();
-    assert_values(
+    assert_scaled_values(
         "discrete cosine-pGC FIR power",
         &pgc_power,
         &expected["pgc_power"],
