@@ -104,9 +104,12 @@ pub struct ReassignmentStreamStep {
     pub source_energy: Array1<f64>,
     /// Causal reassigned time in seconds, per source channel.
     pub t_hat: Array1<f64>,
-    /// Causal reassigned frequency in hertz, per source channel. Dynamic mode
-    /// uses the wrapped backward phase increment of consecutive realized
-    /// coefficients, so the first nonzero coefficient has no valid frequency.
+    /// Causal reassigned frequency in hertz, per source channel. A finite
+    /// frequency can be reported even when [`Self::coordinate_mask`] is false
+    /// because that mask additionally requires a finite time coordinate.
+    /// Dynamic mode uses the wrapped backward phase increment of consecutive
+    /// realized coefficients, so the first nonzero coefficient has no valid
+    /// frequency.
     pub f_hat: Array1<f64>,
     /// Whether the corresponding coefficient is nonzero and both coordinates
     /// are finite. No relative coefficient floor is applied online.
@@ -145,7 +148,7 @@ impl ReassignmentStream {
         Self::new_internal(gc_param, None, None)
     }
 
-    pub(super) fn new_with_bandwidth_peak_lock(
+    pub(crate) fn new_with_bandwidth_peak_lock(
         gc_param: GcParam,
         hearing_loss: &HLoss,
         peak_grid: Arc<BandwidthPeakGrid>,
@@ -289,11 +292,13 @@ impl ReassignmentStream {
             } else {
                 (derivative[ch] / coefficient[ch]).im / (2.0 * PI)
             };
+            if frequency.is_finite() {
+                f_hat[ch] = frequency;
+            }
             if !time.is_finite() || !frequency.is_finite() {
                 continue;
             }
             t_hat[ch] = time;
-            f_hat[ch] = frequency;
             coordinate_mask[ch] = true;
             let phase = PI * (centers[ch] + frequency) * (time - source_time);
             phase_contribution[ch] =

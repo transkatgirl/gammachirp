@@ -6,6 +6,7 @@ pub mod gammachirp;
 pub mod gcfb_v234;
 pub mod reassignment;
 mod stream;
+pub mod synchrosqueezing;
 pub mod utils;
 
 pub use gcfb_v234::{
@@ -21,3 +22,8 @@ pub use reassignment::{
     phase_reassign_gcfb_v234_with_config, reassign_gcfb_v234, reassign_gcfb_v234_with_config,
 };
 pub use stream::{DcgcEvent, GcfbStream, StreamStep};
+pub use synchrosqueezing::{
+    SynchrosqueezingConfig, SynchrosqueezingMode, SynchrosqueezingResult, SynchrosqueezingStream,
+    SynchrosqueezingStreamStep, gcfb_v234_with_synchrosqueezing, synchrosqueeze_gcfb_v234,
+    synchrosqueeze_gcfb_v234_with_config,
+};

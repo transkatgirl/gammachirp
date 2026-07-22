@@ -358,6 +358,17 @@ struct CoefficientAnalysis {
     analysis_fft_len: usize,
 }
 
+/// Shared complex coefficients and instantaneous-frequency estimates used by
+/// frequency-only post-processing such as synchrosqueezing.
+pub(super) struct FrequencyAnalysis {
+    pub(super) coefficient: Array2<Complex64>,
+    pub(super) power: Array2<f64>,
+    pub(super) f_hat: Array2<f64>,
+    pub(super) validity_mask: Array2<bool>,
+    pub(super) mode: ReassignmentMode,
+    pub(super) analysis_fft_len: usize,
+}
+
 struct OperatorOutputs {
     coefficient: Array2<Complex64>,
     time_weighted: Array2<Complex64>,
@@ -753,6 +764,17 @@ fn conditioned_operator_outputs(snd_in: &[f64], output: &GcfbOutput) -> Result<O
     }
 }
 
+/// Run the reassignment implementation's conditioned complex analysis while
+/// retaining only the quantities needed for frequency-only transport.
+pub(super) fn conditioned_frequency_analysis(
+    snd_in: &[f64],
+    output: &GcfbOutput,
+    relative_floor: f64,
+) -> Result<FrequencyAnalysis> {
+    let operator = conditioned_operator_outputs(snd_in, output)?;
+    analyze_frequencies(operator, relative_floor, output.gc_param.fs)
+}
+
 fn analysis_fft_len(
     signal_len: usize,
     correction_len: usize,
@@ -1122,6 +1144,49 @@ fn analyze_coefficients(
     })
 }
 
+fn analyze_frequencies(
+    operator: OperatorOutputs,
+    relative_floor: f64,
+    sample_rate: f64,
+) -> Result<FrequencyAnalysis> {
+    let dimensions = operator.coefficient.dim();
+    let realized_derivative = if operator.mode == ReassignmentMode::SampleConditional {
+        Some(differentiate_realized_coefficients(
+            &operator.coefficient,
+            sample_rate,
+            operator.analysis_fft_len,
+        ))
+    } else {
+        None
+    };
+    let mut power = Array2::zeros(dimensions);
+    let mut f_hat = Array2::from_elem(dimensions, f64::NAN);
+    for ch in 0..dimensions.0 {
+        for sample in 0..dimensions.1 {
+            let coefficient = operator.coefficient[[ch, sample]];
+            let norm = coefficient.norm_sqr();
+            power[[ch, sample]] = norm / 2.0;
+            if norm > 0.0 && norm.is_finite() {
+                let derivative = realized_derivative
+                    .as_ref()
+                    .map_or(operator.derivative[[ch, sample]], |values| {
+                        values[[ch, sample]]
+                    });
+                f_hat[[ch, sample]] = (derivative / coefficient).im / (2.0 * PI);
+            }
+        }
+    }
+    let validity_mask = apply_frequency_floor(&power, &f_hat, relative_floor)?;
+    Ok(FrequencyAnalysis {
+        coefficient: operator.coefficient,
+        power,
+        f_hat,
+        validity_mask,
+        mode: operator.mode,
+        analysis_fft_len: operator.analysis_fft_len,
+    })
+}
+
 fn differentiate_realized_coefficients(
     coefficients: &Array2<Complex64>,
     sample_rate: f64,
@@ -1179,6 +1244,37 @@ fn apply_floor(
                 if !t_hat[[ch, sample]].is_finite() || !f_hat[[ch, sample]].is_finite() {
                     return Err(Error::Numerical(format!(
                         "non-finite reassignment coordinate above the coefficient floor at channel {ch}, sample {sample}"
+                    )));
+                }
+                mask[[ch, sample]] = true;
+            }
+        }
+    }
+    Ok(mask)
+}
+
+fn apply_frequency_floor(
+    power: &Array2<f64>,
+    f_hat: &Array2<f64>,
+    relative_floor: f64,
+) -> Result<Array2<bool>> {
+    let mut mask = Array2::from_elem(power.dim(), false);
+    for ch in 0..power.nrows() {
+        if power.row(ch).iter().any(|value| !value.is_finite()) {
+            return Err(Error::Numerical(format!(
+                "non-finite analytic power in synchrosqueezing channel {ch}"
+            )));
+        }
+        let maximum = power.row(ch).iter().copied().fold(0.0, f64::max);
+        if maximum <= 0.0 {
+            continue;
+        }
+        let threshold = relative_floor * maximum;
+        for sample in 0..power.ncols() {
+            if power[[ch, sample]] >= threshold {
+                if !f_hat[[ch, sample]].is_finite() {
+                    return Err(Error::Numerical(format!(
+                        "non-finite synchrosqueezing frequency above the coefficient floor at channel {ch}, sample {sample}"
                     )));
                 }
                 mask[[ch, sample]] = true;

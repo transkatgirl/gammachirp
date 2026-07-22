@@ -510,6 +510,109 @@ cargo clippy --all-targets -- -D warnings
 cargo test --doc
 ```
 
+### Synchrosqueezed dcGC analysis
+
+The v2.34 filterbank also provides first-order, frequency-only
+synchrosqueezing based on the general filter-bank construction of
+[Holighaus, Prusa, and Sondergaard](https://ltfat.org/notes/ltfatnote041.pdf).
+Unlike reassignment, it preserves every accepted coefficient's source sample
+and sums the gained complex coefficient into the nearest `fr1` channel to its
+instantaneous frequency. Nearest-channel distance is measured in hertz; an
+exact midpoint selects the lower channel. Frequencies outside the configured
+GCFB range are discarded rather than clamped to an edge channel.
+
+`SynchrosqueezingResult::complex_map` is the phase-carrying coefficient sum.
+Its squared magnitude is not an energy representation when multiple source
+channels collide and interfere. The separate `energy_map` sums
+`gain^2 * |C|^2 / 2` and provides floor/boundary accounting with the invariant
+`source_energy = retained_energy() + discarded_energy` up to floating-point
+roundoff.
+
+```rust
+use gammachirp_rs::gcfb_v234::{
+    ControlMode, GcParam, gcfb_v234_with_synchrosqueezing,
+};
+
+let input = [1.0, 0.0, 0.0, 0.0];
+let (filterbank, squeezed) = gcfb_v234_with_synchrosqueezing(
+    &input,
+    GcParam {
+        num_ch: 32,
+        out_mid_crct: "No".into(),
+        ctrl: ControlMode::Static,
+        ..GcParam::default()
+    },
+)?;
+
+assert_eq!(filterbank.dcgc_out.nrows(), 32);
+assert_eq!(squeezed.energy_map.dim(), (32, input.len()));
+assert!((squeezed.source_energy
+    - squeezed.retained_energy()
+    - squeezed.discarded_energy).abs() < 1e-10);
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+Static, level-control, and dynamic sample-base processing are supported.
+Dynamic frame-base processing is rejected because synchrosqueezing retains a
+full-rate time grid and does not define frame-to-sample gain interpolation.
+Dynamic batch and streaming analyses always use the continuous-DTFT peak-lock
+path; the convenience batch wrapper returns that peak-locked GCFB output.
+Batch processing uses the same offline/acausal analytic coefficients and
+finite-DFT frequency derivative as reassignment. Sample-dynamic frequencies
+are conditional on the recorded nonlinear HP-AF history.
+
+`SynchrosqueezingStream` provides the corresponding bounded-memory causal
+analysis. Every input immediately yields complex and energy target columns as
+well as the source coefficients, energies, instantaneous frequencies, and
+validity mask used to form them. The stream has no whole-input relative floor;
+the first nonzero dynamic coefficient in a channel has no backward phase
+increment and is reported as `frequency_unresolved_energy`.
+
+```rust
+use gammachirp_rs::gcfb_v234::{
+    ControlMode, GcParam, SynchrosqueezingStream,
+};
+
+let mut analysis = SynchrosqueezingStream::new(GcParam {
+    num_ch: 32,
+    out_mid_crct: "No".into(),
+    ctrl: ControlMode::Static,
+    ..GcParam::default()
+})?;
+
+for sample in [1.0, 0.0, 0.0, 0.0] {
+    let step = analysis.process_sample(sample)?;
+    assert_eq!(step.complex_column.len(), 32);
+    assert_eq!(step.energy_column.len(), 32);
+}
+assert_eq!(analysis.latency_samples(), 0);
+# Ok::<(), gammachirp_rs::Error>(())
+```
+
+Render a three-panel comparison of causal source energy, streaming
+synchrosqueezed energy, and the corresponding complex-map power with:
+
+```bash
+cargo run --example v234_synchrosqueezing_spectrogram
+```
+
+The example writes `target/v234_synchrosqueezing_spectrogram.png` by default.
+Pass an alternative PNG path after `--` to choose the destination:
+
+```bash
+cargo run --example v234_synchrosqueezing_spectrogram -- /tmp/squeezed.png
+```
+
+The source and squeezed-energy panels share a decibel reference; the complex
+panel has its own reference because phase interference can make its power
+differ from the nonnegative energy sum. The example also reports retained,
+frequency-unresolved, and boundary-discarded energy, effective support, causal
+latency, and the fixed atom-history memory bound.
+
+Both APIs are analysis-only. The nonlinear GCFB has no established frame
+inverse, so synchrosqueezing does not add waveform reconstruction, component
+recovery, ridge extraction, higher-order squeezing, or bandwidth consensus.
+
 ### Rust/Python parity properties
 
 In addition to fixed Python-generated regression fixtures, the integration
