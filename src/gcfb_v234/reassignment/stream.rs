@@ -366,11 +366,12 @@ impl ReassignmentStream {
 /// similar rather than identical to [`super::gcfb_v234_with_bandwidth_consensus`].
 /// Scaled streams use their own causal level histories. At each update, their
 /// HP-AF centers match the unscaled reference response evaluated at that
-/// scale's own realized ratio on the shared DFT grid. Because the realized
-/// baseline ratio can differ, controller-induced peak drift remains part of
-/// rolling consensus. Dynamic control also routes the unscaled baseline through
-/// this peak-lock path; a failed conditional peak solve permanently terminates
-/// the stream.
+/// scale's own realized ratio at its continuous-DTFT main-lobe maximum. The
+/// internal FFT only brackets that maximum. Because the realized baseline ratio
+/// can differ, controller-induced peak drift remains part of rolling consensus.
+/// Dynamic control also routes the unscaled baseline through this peak-lock
+/// path; an unbracketed or unverifiable conditional solve permanently
+/// terminates the stream.
 #[derive(Clone, Debug)]
 pub struct BandwidthConsensusStream {
     streams: Vec<ReassignmentStream>,
@@ -457,8 +458,6 @@ impl BandwidthConsensusStream {
                     scale,
                     carrier_frequencies_hz: stream.gc_resp().fr1.clone(),
                     nominal_peak_frequencies_hz: nominal_peaks.clone(),
-                    peak_grid_fft_len: peak_grid.fft_len(),
-                    peak_grid_spacing_hz: peak_grid.spacing_hz(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -674,7 +673,7 @@ impl BandwidthConsensusStream {
         self.baseline_index
     }
 
-    /// Retuned carriers and nominal discrete peak-grid frequencies for every scale.
+    /// Retuned carriers and nominal continuous peak frequencies for every scale.
     pub fn scale_metadata(&self) -> &[BandwidthScaleMetadata] {
         &self.scale_metadata
     }

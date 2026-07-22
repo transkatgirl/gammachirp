@@ -1,8 +1,9 @@
 use std::f64::consts::PI;
 
+use gammachirp_rs::Error;
 use gammachirp_rs::gcfb_v234::{
     BandwidthConsensusConfig, BandwidthConsensusStream, BandwidthConsensusStreamConfig,
-    BandwidthConsensusStreamFrame, ControlMode, DcgcEvent, DynHpaf, GcParam, ReassignmentStream,
+    BandwidthConsensusStreamFrame, ControlMode, DynHpaf, GcParam, ReassignmentStream,
     gcfb_v234_with_bandwidth_consensus, gcfb_v234_with_phase_reassignment, reassign_gcfb_v234,
 };
 use ndarray::Array2;
@@ -866,15 +867,9 @@ fn rolling_consensus_validates_configuration_and_input_atomically() {
     assert_eq!(stream.scale_metadata().len(), stream.scales().len());
     let baseline_peaks =
         &stream.scale_metadata()[stream.baseline_index()].nominal_peak_frequencies_hz;
-    let peak_fft_len = stream.scale_metadata()[stream.baseline_index()].peak_grid_fft_len;
-    let peak_spacing = stream.scale_metadata()[stream.baseline_index()].peak_grid_spacing_hz;
-    assert!(peak_fft_len >= 65_536);
-    assert!(peak_fft_len.is_power_of_two());
     for (scale, metadata) in stream.scales().iter().zip(stream.scale_metadata()) {
         close(metadata.scale, *scale);
         assert_eq!(&metadata.nominal_peak_frequencies_hz, baseline_peaks);
-        assert_eq!(metadata.peak_grid_fft_len, peak_fft_len);
-        assert_eq!(metadata.peak_grid_spacing_hz, peak_spacing);
     }
     assert!(stream.process_sample(f64::NAN).is_err());
     assert_eq!(stream.samples_processed(), 0);
@@ -908,9 +903,8 @@ fn rolling_consensus_validates_configuration_and_input_atomically() {
 }
 
 #[test]
-fn rolling_consensus_tolerates_unreachable_discrete_peak_bins() {
+fn rolling_consensus_rejects_an_unreachable_continuous_lock() {
     let sample_rate = 16_000.0;
-    let samples = 64_usize;
     let mut stream = BandwidthConsensusStream::new(
         GcParam {
             fs: sample_rate,
@@ -932,36 +926,17 @@ fn rolling_consensus_tolerates_unreachable_discrete_peak_bins() {
         BandwidthConsensusStreamConfig::default(),
     )
     .unwrap();
-    let mut held_centers = None;
-    let mut update_ratios = None;
-    let mut ratio_changed_while_center_was_held = false;
-    for sample in 0..samples {
+    let mut failure = None;
+    for sample in 0..64 {
         let input = 0.2 * (2.0 * PI * 1_000.0 * sample as f64 / sample_rate).cos();
-        let step = stream.process_sample(input).unwrap();
-        let Some(DcgcEvent::Sample {
-            frat_val: Some(ratios),
-            fr2: Some(centers),
-            ..
-        }) = step.baseline().filterbank.event.as_ref()
-        else {
-            panic!("dynamic consensus baseline must emit sample-domain centers and ratios");
-        };
-        if sample.is_multiple_of(3) {
-            held_centers = Some(centers.clone());
-            update_ratios = Some(ratios.clone());
-        } else {
-            assert_eq!(centers, held_centers.as_ref().unwrap());
-            ratio_changed_while_center_was_held |= ratios != update_ratios.as_ref().unwrap();
-        }
-        if let Some(frame) = step.consensus {
-            assert!(
-                frame
-                    .salience
-                    .iter()
-                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-            );
+        if let Err(error) = stream.process_sample(input) {
+            failure = Some(error);
+            break;
         }
     }
-    assert!(ratio_changed_while_center_was_held);
-    assert_eq!(stream.samples_processed(), samples);
+    assert!(matches!(failure, Some(Error::Unsupported(_))));
+    assert!(matches!(
+        stream.process_sample(0.0),
+        Err(Error::Numerical(_))
+    ));
 }

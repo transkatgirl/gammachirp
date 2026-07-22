@@ -192,11 +192,26 @@ pub struct GcfbOutput {
 }
 
 const MINIMUM_PEAK_GRID_FFT_LEN: usize = 65_536;
-const MAXIMUM_PEAK_LOCK_ITERATIONS: usize = 64;
+const MAXIMUM_PEAK_LOCK_ITERATIONS: usize = 128;
+
+fn peak_lock_tolerance_hz(sample_rate: f64) -> f64 {
+    4096.0 * f64::EPSILON * sample_rate.max(1.0)
+}
+
+fn peak_search_tolerance_hz(sample_rate: f64) -> f64 {
+    32.0 * f64::EPSILON * sample_rate.max(1.0)
+}
 
 #[derive(Clone, Debug)]
 struct PassiveSpectrum {
+    impulse: Vec<f64>,
     power: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CascadePeak {
+    frequency_hz: f64,
+    log_power: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -245,7 +260,7 @@ pub(super) fn realized_cascade_peaks(
             response.fr1[ch],
         )?
         .0;
-        let peak_bin = peak_bin_from_impulse(
+        let peak = continuous_peak_from_impulse(
             &passive_impulses[ch],
             &coefficients,
             analytic_peak,
@@ -253,15 +268,13 @@ pub(super) fn realized_cascade_peaks(
             param.fs,
             fft_len,
         )?;
-        let passive_power = passive_power_at_bin(&passive_impulses[ch], peak_bin, fft_len);
-        let peak_value =
-            (passive_power * hpaf_power_at_bin(&coefficients, peak_bin, fft_len)).sqrt();
+        let peak_value = (0.5 * peak.log_power).exp();
         if !peak_value.is_finite() || peak_value <= 0.0 {
             return Err(Error::Numerical(
                 "implemented compressive-gammachirp peak is not finite and positive".into(),
             ));
         }
-        frequency_hz[ch] = peak_bin as f64 * param.fs / fft_len as f64;
+        frequency_hz[ch] = peak.frequency_hz;
         value[ch] = peak_value;
     }
     let normalization = value.mapv(|peak| 1.0 / peak);
@@ -272,7 +285,7 @@ pub(super) fn realized_cascade_peaks(
     })
 }
 
-/// Shared discrete-frequency definition and baseline pGC spectra for one
+/// Shared FFT bracketing grid and baseline pGC spectra for one
 /// bandwidth-consensus ensemble.
 #[derive(Clone, Debug)]
 pub(crate) struct BandwidthPeakGrid {
@@ -289,17 +302,13 @@ pub(crate) struct BandwidthPeakGrid {
 }
 
 impl BandwidthPeakGrid {
+    #[cfg(test)]
     pub(crate) fn fft_len(&self) -> usize {
         self.fft_len
     }
 
-    pub(crate) fn spacing_hz(&self) -> f64 {
-        self.sample_rate / self.fft_len as f64
-    }
-
     pub(crate) fn nominal_peak_frequencies_hz(&self, ratios: &Array1<f64>) -> Result<Array1<f64>> {
-        let bins = self.reference_peak_bins_at_ratios(ratios, None)?;
-        Ok(bins.mapv(|bin| bin as f64 * self.spacing_hz()))
+        self.reference_peak_frequencies_at_ratios(ratios, None)
     }
 
     /// Measure the unscaled reference cascade at the supplied ratio vector.
@@ -307,19 +316,19 @@ impl BandwidthPeakGrid {
     /// For sample-dynamic consensus, callers deliberately supply each scale's
     /// independently realized ratios. This is a conditional reference curve,
     /// not the realized baseline scale's ratio history at the same sample.
-    fn reference_peak_bins_at_ratios(
+    fn reference_peak_frequencies_at_ratios(
         &self,
         ratios: &Array1<f64>,
-        previous: Option<&Array1<usize>>,
-    ) -> Result<Array1<usize>> {
+        previous: Option<&Array1<f64>>,
+    ) -> Result<Array1<f64>> {
         if ratios.len() != self.reference_carriers.len()
             || previous.is_some_and(|bins| bins.len() != ratios.len())
         {
             return Err(Error::InvalidParameter(
-                "bandwidth peak grid received a mismatched ratio vector".into(),
+                "bandwidth peak search received a mismatched ratio vector".into(),
             ));
         }
-        let mut bins = Array1::zeros(ratios.len());
+        let mut peaks = Array1::zeros(ratios.len());
         for ch in 0..ratios.len() {
             let center = ratios[ch] * self.reference_fp1[ch];
             validate_lock_frequency(center, self.sample_rate, "baseline HP-AF center")?;
@@ -339,16 +348,17 @@ impl BandwidthPeakGrid {
                 self.reference_carriers[ch],
             )?
             .0;
-            bins[ch] = peak_bin_from_spectrum(
+            peaks[ch] = continuous_peak_from_spectrum(
                 &self.reference_passive[ch],
                 &coefficients,
                 analytic_peak,
                 previous.map(|values| values[ch]),
                 self.sample_rate,
                 self.fft_len,
-            )?;
+            )?
+            .frequency_hz;
         }
-        Ok(bins)
+        Ok(peaks)
     }
 }
 
@@ -365,8 +375,8 @@ pub(crate) struct BandwidthPeakLock {
     scaled_b2: Array1<f64>,
     scaled_c2: Array1<f64>,
     previous_centers: Array1<f64>,
-    previous_reference_peak_bins: Array1<usize>,
-    previous_scaled_peak_bins: Array1<usize>,
+    previous_reference_peaks_hz: Array1<f64>,
+    previous_scaled_peaks_hz: Array1<f64>,
 }
 
 impl BandwidthPeakLock {
@@ -384,11 +394,12 @@ impl BandwidthPeakLock {
                 "bandwidth peak lock received a mismatched ratio vector".into(),
             ));
         }
-        let target_bins = self
-            .grid
-            .reference_peak_bins_at_ratios(ratios, Some(&self.previous_reference_peak_bins))?;
+        let target_peaks = self.grid.reference_peak_frequencies_at_ratios(
+            ratios,
+            Some(&self.previous_reference_peaks_hz),
+        )?;
         let mut centers = Array1::zeros(ratios.len());
-        let mut actual_bins = Array1::zeros(ratios.len());
+        let mut actual_peaks = Array1::zeros(ratios.len());
         for ch in 0..ratios.len() {
             let analytic_target = fr1_to_fp2(
                 self.grid.order,
@@ -413,7 +424,7 @@ impl BandwidthPeakLock {
                 self.previous_centers[ch],
             )
             .unwrap_or(self.previous_centers[ch]);
-            let (center, bin) = center_for_discrete_peak(
+            let (center, peak) = center_for_continuous_peak(
                 &self.scaled_passive[ch],
                 self.scaled_b2[ch],
                 self.scaled_c2[ch],
@@ -423,21 +434,20 @@ impl BandwidthPeakLock {
                 self.grid.order,
                 analytic_seed,
                 analytic_target,
-                target_bins[ch],
-                self.previous_scaled_peak_bins[ch],
+                target_peaks[ch],
+                self.previous_scaled_peaks_hz[ch],
                 self.grid.sample_rate,
                 self.grid.fft_len,
             )
             .or_else(|error| {
-                // The analytic inverse can seed the root solve a few bins off
-                // a narrow main lobe, so its fixed bracketing steps overshoot
-                // the lobe entirely. The previous center tracks the target
-                // bins (and was verified against them at preparation), so it
+                // The analytic inverse can seed the root solve away from a
+                // narrow main lobe. The previous center tracks the target
+                // frequency (and was verified against it at preparation), so it
                 // is the more reliable seed whenever it differs.
                 if analytic_seed == self.previous_centers[ch] {
                     return Err(error);
                 }
-                center_for_discrete_peak(
+                center_for_continuous_peak(
                     &self.scaled_passive[ch],
                     self.scaled_b2[ch],
                     self.scaled_c2[ch],
@@ -447,19 +457,19 @@ impl BandwidthPeakLock {
                     self.grid.order,
                     self.previous_centers[ch],
                     analytic_target,
-                    target_bins[ch],
-                    self.previous_scaled_peak_bins[ch],
+                    target_peaks[ch],
+                    self.previous_scaled_peaks_hz[ch],
                     self.grid.sample_rate,
                     self.grid.fft_len,
                 )
                 .map_err(|_| error)
             })?;
             centers[ch] = center;
-            actual_bins[ch] = bin;
+            actual_peaks[ch] = peak;
         }
         self.previous_centers.assign(&centers);
-        self.previous_reference_peak_bins.assign(&target_bins);
-        self.previous_scaled_peak_bins.assign(&actual_bins);
+        self.previous_reference_peaks_hz.assign(&target_peaks);
+        self.previous_scaled_peaks_hz.assign(&actual_peaks);
         Ok(centers)
     }
 
@@ -565,10 +575,11 @@ pub(crate) fn scale_bandwidths(mut parameters: GcParam, scale: f64) -> GcParam {
     parameters
 }
 
-/// Prepare the common DFT grid and baseline passive spectra used by every
-/// scale in one consensus analysis. If a numerically locked scaled impulse is
-/// longer than the current grid, all locks are recomputed on the next power of
-/// two so no scale is measured on a different frequency grid.
+/// Prepare the common FFT bracketing grid and baseline passive spectra used by
+/// every scale in one consensus analysis. If a numerically locked scaled
+/// impulse is longer than the current grid, all locks are recomputed on the
+/// next power of two. The FFT only locates the intended main lobe; all peak
+/// measurements and locks use the continuous DTFT.
 pub(crate) fn prepare_bandwidth_peak_grid(
     unprepared_reference: &GcParam,
     scales: &[f64],
@@ -600,7 +611,7 @@ pub(crate) fn prepare_bandwidth_peak_grid(
             )
             .map_err(|error| {
                 Error::Unsupported(format!(
-                    "bandwidth scale {scale} has no valid discrete peak-lock preparation: {error}"
+                    "bandwidth scale {scale} has no valid continuous peak-lock preparation: {error}"
                 ))
             })?;
             let solutions = solve_scaled_passive_channels(&scaled_param, &scaled_response, &grid)?;
@@ -622,7 +633,7 @@ pub(crate) fn prepare_bandwidth_peak_grid(
         );
     }
     Err(Error::Unsupported(
-        "bandwidth peak grid did not stabilize within 64 iterations".into(),
+        "bandwidth peak grid did not stabilize within 128 iterations".into(),
     ))
 }
 
@@ -641,7 +652,7 @@ pub(crate) fn prepare_bandwidth_peak_lock(
     }
     let (ratios, _) = initial_asymmetric_ratio_and_centers(param, response);
     let (scaled_b2, scaled_c2) = peak_path_coefficients(param, response);
-    let target_bins = grid.reference_peak_bins_at_ratios(&ratios, None)?;
+    let target_peaks = grid.reference_peak_frequencies_at_ratios(&ratios, None)?;
     let solutions = solve_scaled_passive_channels(param, response, &grid)?;
     let scaled_carriers = Array1::from_iter(solutions.iter().map(|solution| solution.carrier));
     let scaled_fp1 = Array1::from_iter(solutions.iter().map(|solution| solution.fp1));
@@ -673,7 +684,7 @@ pub(crate) fn prepare_bandwidth_peak_lock(
             .map(|solution| passive_spectrum(&solution.impulse, grid.fft_len))
             .collect::<Result<Vec<_>>>()?,
     );
-    let mut actual_bins = Array1::zeros(param.num_ch);
+    let mut actual_peaks = Array1::zeros(param.num_ch);
     for ch in 0..param.num_ch {
         let coefficients = make_asym_cmp_filters_v2(
             param.fs,
@@ -691,15 +702,16 @@ pub(crate) fn prepare_bandwidth_peak_lock(
             scaled_carriers[ch],
         )?
         .0;
-        actual_bins[ch] = peak_bin_from_spectrum(
+        actual_peaks[ch] = continuous_peak_from_spectrum(
             &scaled_passive[ch],
             &coefficients,
             analytic_peak,
             None,
             param.fs,
             grid.fft_len,
-        )?;
-        verify_peak_bin(actual_bins[ch], target_bins[ch])?;
+        )?
+        .frequency_hz;
+        verify_peak_frequency(actual_peaks[ch], target_peaks[ch], param.fs)?;
     }
     Ok(BandwidthPeakLock {
         grid,
@@ -711,8 +723,8 @@ pub(crate) fn prepare_bandwidth_peak_lock(
         scaled_b2,
         scaled_c2,
         previous_centers,
-        previous_reference_peak_bins: target_bins,
-        previous_scaled_peak_bins: actual_bins,
+        previous_reference_peaks_hz: target_peaks,
+        previous_scaled_peaks_hz: actual_peaks,
     })
 }
 
@@ -770,6 +782,7 @@ fn passive_spectrum(impulse: &[f64], fft_len: usize) -> Result<PassiveSpectrum> 
     }
     dsp::fft(&mut spectrum, false);
     Ok(PassiveSpectrum {
+        impulse: impulse.to_vec(),
         power: spectrum[..=fft_len / 2]
             .iter()
             .map(Complex64::norm_sqr)
@@ -778,22 +791,22 @@ fn passive_spectrum(impulse: &[f64], fft_len: usize) -> Result<PassiveSpectrum> 
 }
 
 #[allow(dead_code)]
-pub(crate) fn discrete_cascade_peak_bins(
+pub(crate) fn continuous_cascade_peak_frequencies(
     param: &GcParam,
     response: &GcResp,
     centers: &Array1<f64>,
     b2: &Array1<f64>,
     c2: &Array1<f64>,
     fft_len: usize,
-) -> Result<Array1<usize>> {
+) -> Result<Array1<f64>> {
     if centers.len() != param.num_ch || b2.len() != param.num_ch || c2.len() != param.num_ch {
         return Err(Error::InvalidParameter(
-            "discrete cascade measurement requires one center and HP-AF parameter per channel"
+            "continuous cascade measurement requires one center and HP-AF parameter per channel"
                 .into(),
         ));
     }
     let impulses = prepare_passive_impulses(param, response)?;
-    let mut bins = Array1::zeros(param.num_ch);
+    let mut peaks = Array1::zeros(param.num_ch);
     for ch in 0..param.num_ch {
         let coefficients =
             make_asym_cmp_filters_v2(param.fs, &[centers[ch]], &[b2[ch]], &[c2[ch]])?;
@@ -808,16 +821,17 @@ pub(crate) fn discrete_cascade_peak_bins(
             response.fr1[ch],
         )?
         .0;
-        bins[ch] = peak_bin_from_impulse(
+        peaks[ch] = continuous_peak_from_impulse(
             &impulses[ch],
             &coefficients,
             analytic_peak,
             None,
             param.fs,
             fft_len,
-        )?;
+        )?
+        .frequency_hz;
     }
-    Ok(bins)
+    Ok(peaks)
 }
 
 fn passive_impulse(
@@ -854,7 +868,7 @@ fn solve_scaled_passive_channels(
 ) -> Result<Vec<PassiveCarrierSolution>> {
     let (ratios, _) = initial_asymmetric_ratio_and_centers(param, response);
     let (scaled_b2, scaled_c2) = peak_path_coefficients(param, response);
-    let target_bins = grid.reference_peak_bins_at_ratios(&ratios, None)?;
+    let target_peaks = grid.reference_peak_frequencies_at_ratios(&ratios, None)?;
     let mut solutions = Vec::with_capacity(param.num_ch);
     for ch in 0..param.num_ch {
         let analytic_target = fr1_to_fp2(
@@ -878,7 +892,7 @@ fn solve_scaled_passive_channels(
         )
         .map(|solution| solution.0)
         .unwrap_or(grid.reference_carriers[ch]);
-        let evaluate = |carrier: f64| -> Result<usize> {
+        let evaluate = |carrier: f64| -> Result<f64> {
             validate_lock_frequency(carrier, param.fs, "peak-locked passive carrier")?;
             let fp1 =
                 passive_peak_frequency(carrier, param.n, response.b1_val[ch], response.c1_val[ch]);
@@ -904,7 +918,7 @@ fn solve_scaled_passive_channels(
                 carrier,
             )?
             .0;
-            peak_bin_from_impulse(
+            continuous_peak_from_impulse(
                 &impulse,
                 &coefficients,
                 analytic_peak,
@@ -912,15 +926,16 @@ fn solve_scaled_passive_channels(
                 param.fs,
                 grid.fft_len,
             )
+            .map(|peak| peak.frequency_hz)
         };
-        let (carrier, bin) = exact_bin_root(
+        let (carrier, peak) = continuous_frequency_root(
             analytic_seed,
-            target_bins[ch],
+            target_peaks[ch],
             param.fs,
             "passive carrier",
             evaluate,
         )?;
-        verify_peak_bin(bin, target_bins[ch])?;
+        verify_peak_frequency(peak, target_peaks[ch], param.fs)?;
         let fp1 =
             passive_peak_frequency(carrier, param.n, response.b1_val[ch], response.c1_val[ch]);
         validate_lock_frequency(fp1, param.fs, "peak-locked passive peak")?;
@@ -941,7 +956,7 @@ fn solve_scaled_passive_channels(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn center_for_discrete_peak(
+fn center_for_continuous_peak(
     passive: &PassiveSpectrum,
     b2: f64,
     c2: f64,
@@ -951,30 +966,31 @@ fn center_for_discrete_peak(
     order: f64,
     analytic_seed: f64,
     analytic_target: f64,
-    target_bin: usize,
-    previous_peak_bin: usize,
+    target_peak_hz: f64,
+    previous_peak_hz: f64,
     sample_rate: f64,
     fft_len: usize,
-) -> Result<(f64, usize)> {
-    let evaluate = |center: f64| -> Result<usize> {
+) -> Result<(f64, f64)> {
+    let evaluate = |center: f64| -> Result<f64> {
         validate_lock_frequency(center, sample_rate, "peak-locked HP-AF center")?;
         let coefficients = make_asym_cmp_filters_v2(sample_rate, &[center], &[b2], &[c2])?;
         let fp1 = passive_peak_frequency(carrier, order, b1, c1);
         let analytic_peak = fr1_to_fp2(order, b1, c1, b2, c2, center / fp1, carrier)
             .map(|value| value.0)
             .unwrap_or(analytic_target);
-        peak_bin_from_spectrum(
+        continuous_peak_from_spectrum(
             passive,
             &coefficients,
             analytic_peak,
-            Some(previous_peak_bin),
+            Some(previous_peak_hz),
             sample_rate,
             fft_len,
         )
+        .map(|peak| peak.frequency_hz)
     };
-    exact_bin_root(
+    continuous_frequency_root(
         analytic_seed,
-        target_bin,
+        target_peak_hz,
         sample_rate,
         "HP-AF center",
         evaluate,
@@ -984,286 +1000,294 @@ fn center_for_discrete_peak(
 fn validate_lock_frequency(frequency: f64, sample_rate: f64, name: &str) -> Result<()> {
     if !frequency.is_finite() || frequency <= 0.0 || frequency >= sample_rate / 2.0 {
         return Err(Error::Unsupported(format!(
-            "no finite, positive, sub-Nyquist {name} realizes the requested discrete peak"
+            "no finite, positive, sub-Nyquist {name} realizes the requested continuous peak"
         )));
     }
     Ok(())
 }
 
-fn record_lock_evaluation(
-    evaluate: &mut impl FnMut(f64) -> Result<usize>,
-    samples: &mut Vec<(f64, usize)>,
-    value: f64,
-) -> Result<Option<(f64, usize)>> {
-    if let Some(bin) = optional_lock_evaluation(evaluate(value))? {
-        samples.push((value, bin));
-        return Ok(Some((value, bin)));
-    }
-    Ok(None)
-}
-
-fn exact_bin_root(
-    seed: f64,
-    target_bin: usize,
-    sample_rate: f64,
-    name: &str,
-    mut evaluate: impl FnMut(f64) -> Result<usize>,
-) -> Result<(f64, usize)> {
-    let minimum = (sample_rate * 1e-12).max(f64::MIN_POSITIVE);
-    let maximum = sample_rate / 2.0 * (1.0 - 1e-12);
-    let analytic_seed = seed.clamp(minimum, maximum);
-    let mut samples = Vec::new();
-    let (seed, seed_bin) = if let Some(pair) =
-        record_lock_evaluation(&mut evaluate, &mut samples, analytic_seed)?
-    {
-        pair
-    } else {
-        let mut step =
-            (analytic_seed.abs() * 0.02).max(sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64);
-        let mut valid = None;
-        for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
-            let lower = (analytic_seed - step).max(minimum);
-            let upper = (analytic_seed + step).min(maximum);
-            let lower_pair = record_lock_evaluation(&mut evaluate, &mut samples, lower)?;
-            let upper_pair = if upper == lower {
-                None
-            } else {
-                record_lock_evaluation(&mut evaluate, &mut samples, upper)?
-            };
-            valid = lower_pair.or(upper_pair);
-            if valid.is_some() || (lower == minimum && upper == maximum) {
-                break;
-            }
-            step *= 2.0;
-        }
-        valid.ok_or_else(|| {
-            Error::Unsupported(format!(
-                "no finite, positive, sub-Nyquist {name} can be evaluated for bandwidth peak-grid bin {target_bin}"
-            ))
-        })?
-    };
-    if seed_bin == target_bin {
-        return Ok((seed, seed_bin));
-    }
-
-    let mut lower = (seed, seed_bin);
-    let mut upper = (seed, seed_bin);
-    let mut can_expand_lower = true;
-    let mut can_expand_upper = true;
-    let mut step = (seed.abs() * 0.02).max(sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64);
-    let mut bracket = None;
-    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
-        let next_lower = (seed - step).max(minimum);
-        if can_expand_lower && next_lower < lower.0 {
-            if let Some(pair) = record_lock_evaluation(&mut evaluate, &mut samples, next_lower)? {
-                lower = pair;
-                if lower.1 == target_bin {
-                    return Ok(lower);
-                }
-            } else {
-                can_expand_lower = false;
-            }
-        }
-        let next_upper = (seed + step).min(maximum);
-        if can_expand_upper && next_upper > upper.0 {
-            if let Some(pair) = record_lock_evaluation(&mut evaluate, &mut samples, next_upper)? {
-                upper = pair;
-                if upper.1 == target_bin {
-                    return Ok(upper);
-                }
-            } else {
-                can_expand_upper = false;
-            }
-        }
-        for pair in [
-            (lower, (seed, seed_bin)),
-            ((seed, seed_bin), upper),
-            (lower, upper),
-        ] {
-            if bin_is_between(target_bin, pair.0.1, pair.1.1) {
-                bracket = Some(pair);
-                break;
-            }
-        }
-        if bracket.is_some()
-            || ((!can_expand_lower || lower.0 == minimum)
-                && (!can_expand_upper || upper.0 == maximum))
-        {
-            break;
-        }
-        step *= 2.0;
-    }
-    if let Some((mut lower, mut upper)) = bracket {
-        for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
-            let midpoint = lower.0 + (upper.0 - lower.0) / 2.0;
-            if midpoint == lower.0 || midpoint == upper.0 {
-                break;
-            }
-            let Some(middle) = record_lock_evaluation(&mut evaluate, &mut samples, midpoint)?
-            else {
-                break;
-            };
-            if middle.1 == target_bin {
-                return Ok(middle);
-            }
-            if bin_is_between(target_bin, lower.1, middle.1) {
-                upper = middle;
-            } else if bin_is_between(target_bin, middle.1, upper.1) {
-                lower = middle;
-            } else {
-                break;
-            }
-        }
-    }
-    // The discrete peak bin is a discontinuous step function of the solved
-    // value whose plateaus the bracketing steps can straddle or overshoot,
-    // and some target bins no value realizes at all. Fall back to the
-    // evaluated value whose bin is nearest the target so a narrow, missed
-    // plateau or an unrealizable bin does not terminate the analysis.
-    nearest_bin_root(seed, target_bin, name, &mut samples, &mut evaluate)
-}
-
-fn nearest_bin_root(
-    seed: f64,
-    target_bin: usize,
-    name: &str,
-    samples: &mut Vec<(f64, usize)>,
-    evaluate: &mut impl FnMut(f64) -> Result<usize>,
-) -> Result<(f64, usize)> {
-    let distance = |sample: &(f64, usize)| sample.1.abs_diff(target_bin);
-    let compare = |left: &(f64, usize), right: &(f64, usize)| {
-        distance(left).cmp(&distance(right)).then_with(|| {
-            (left.0 - seed)
-                .abs()
-                .total_cmp(&(right.0 - seed).abs())
-                .then_with(|| left.0.total_cmp(&right.0))
-        })
-    };
-    samples.sort_by(|left, right| left.0.total_cmp(&right.0));
-    samples.dedup_by(|left, right| left.0 == right.0);
-    let mut best = *samples
-        .iter()
-        .min_by(|left, right| compare(left, right))
-        .ok_or_else(|| {
-            Error::Unsupported(format!(
-                "no finite, positive, sub-Nyquist {name} approaches bandwidth peak-grid bin {target_bin}"
-            ))
-        })?;
-    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
-        if best.1 == target_bin || samples.len() < 2 {
-            break;
-        }
-        let pair_distance =
-            |index: usize| distance(&samples[index]).min(distance(&samples[index + 1]));
-        let mut choice = 0;
-        for index in 1..samples.len() - 1 {
-            if pair_distance(index) < pair_distance(choice)
-                || (pair_distance(index) == pair_distance(choice)
-                    && samples[index + 1].0 - samples[index].0
-                        < samples[choice + 1].0 - samples[choice].0)
-            {
-                choice = index;
-            }
-        }
-        let start = samples[choice].0;
-        let end = samples[choice + 1].0;
-        let mut improved = false;
-        for point in 1..8 {
-            let value = start + (end - start) * point as f64 / 8.0;
-            if value == start || value == end {
-                continue;
-            }
-            if let Some(pair) = record_lock_evaluation(evaluate, samples, value)?
-                && compare(&pair, &best).is_lt()
-            {
-                best = pair;
-                improved = true;
-            }
-        }
-        if best.1 == target_bin {
-            break;
-        }
-        if !improved {
-            break;
-        }
-        samples.sort_by(|left, right| left.0.total_cmp(&right.0));
-        samples.dedup_by(|left, right| left.0 == right.0);
-    }
-    Ok(best)
-}
-
-fn optional_lock_evaluation(result: Result<usize>) -> Result<Option<usize>> {
+fn optional_lock_evaluation(result: Result<f64>) -> Result<Option<f64>> {
     match result {
-        Ok(bin) => Ok(Some(bin)),
+        Ok(value) if value.is_finite() => Ok(Some(value)),
+        Ok(_) => Err(Error::Numerical(
+            "continuous bandwidth peak evaluation returned a non-finite frequency".into(),
+        )),
         Err(Error::Unsupported(_)) | Err(Error::InvalidParameter(_)) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-fn bin_is_between(target: usize, left: usize, right: usize) -> bool {
-    (left <= target && target <= right) || (right <= target && target <= left)
+type FrequencyResidual = (f64, f64, f64);
+
+fn record_frequency_residual(
+    evaluate: &mut impl FnMut(f64) -> Result<f64>,
+    samples: &mut Vec<FrequencyResidual>,
+    parameter: f64,
+    target_peak_hz: f64,
+) -> Result<Option<(f64, f64, f64)>> {
+    if samples.iter().any(|sample| sample.0 == parameter) {
+        return Ok(None);
+    }
+    if let Some(peak) = optional_lock_evaluation(evaluate(parameter))? {
+        let sample = (parameter, peak - target_peak_hz, peak);
+        samples.push(sample);
+        Ok(Some(sample))
+    } else {
+        Ok(None)
+    }
 }
 
-fn peak_bin_from_spectrum(
+fn residual_bracket(
+    samples: &mut [FrequencyResidual],
+    seed: f64,
+) -> Option<(FrequencyResidual, FrequencyResidual)> {
+    samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+    samples
+        .windows(2)
+        .filter(|pair| pair[0].1.is_sign_negative() != pair[1].1.is_sign_negative())
+        .min_by(|left, right| {
+            let left_distance = ((left[0].0 + left[1].0) * 0.5 - seed).abs();
+            let right_distance = ((right[0].0 + right[1].0) * 0.5 - seed).abs();
+            left_distance.total_cmp(&right_distance)
+        })
+        .map(|pair| (pair[0], pair[1]))
+}
+
+fn continuous_frequency_root(
+    seed: f64,
+    target_peak_hz: f64,
+    sample_rate: f64,
+    name: &str,
+    mut evaluate: impl FnMut(f64) -> Result<f64>,
+) -> Result<(f64, f64)> {
+    validate_lock_frequency(target_peak_hz, sample_rate, "reference peak")?;
+    let minimum = (sample_rate * 1e-12).max(f64::MIN_POSITIVE);
+    let maximum = sample_rate / 2.0 * (1.0 - 1e-12);
+    let seed = seed.clamp(minimum, maximum);
+    let tolerance = peak_lock_tolerance_hz(sample_rate);
+    let mut samples = Vec::new();
+    if let Some(sample) =
+        record_frequency_residual(&mut evaluate, &mut samples, seed, target_peak_hz)?
+        && sample.1.abs() <= tolerance
+    {
+        return Ok((sample.0, sample.2));
+    }
+
+    let mut step = (seed.abs() * 0.02).max(sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64);
+    let mut bracket = None;
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        let lower = (seed - step).max(minimum);
+        let upper = (seed + step).min(maximum);
+        for parameter in [lower, upper] {
+            if let Some(sample) =
+                record_frequency_residual(&mut evaluate, &mut samples, parameter, target_peak_hz)?
+                && sample.1.abs() <= tolerance
+            {
+                return Ok((sample.0, sample.2));
+            }
+        }
+        bracket = residual_bracket(&mut samples, seed);
+        if bracket.is_some() || (lower == minimum && upper == maximum) {
+            break;
+        }
+        step *= 2.0;
+    }
+    let (mut lower, mut upper) = bracket.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "no finite, positive, sub-Nyquist {name} brackets the requested continuous peak at {target_peak_hz} Hz"
+        ))
+    })?;
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        let midpoint = lower.0 + (upper.0 - lower.0) * 0.5;
+        let width = upper.0 - lower.0;
+        let secant = lower.0 - lower.1 * width / (upper.1 - lower.1);
+        let guard = 0.01 * width;
+        let parameter =
+            if secant.is_finite() && secant > lower.0 + guard && secant < upper.0 - guard {
+                secant
+            } else {
+                midpoint
+            };
+        if parameter == lower.0 || parameter == upper.0 {
+            break;
+        }
+        let peak = optional_lock_evaluation(evaluate(parameter))?.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{name} became invalid inside its continuous peak-lock bracket"
+            ))
+        })?;
+        let middle = (parameter, peak - target_peak_hz, peak);
+        if middle.1.abs() <= tolerance {
+            return Ok((middle.0, middle.2));
+        }
+        if lower.1.is_sign_negative() != middle.1.is_sign_negative() {
+            upper = middle;
+        } else {
+            lower = middle;
+        }
+    }
+    let best = if lower.1.abs() <= upper.1.abs() {
+        lower
+    } else {
+        upper
+    };
+    verify_peak_frequency(best.2, target_peak_hz, sample_rate)?;
+    Ok((best.0, best.2))
+}
+
+fn continuous_peak_from_spectrum(
     passive: &PassiveSpectrum,
     coefficients: &AcfCoef,
     analytic_peak_hz: f64,
-    previous_peak_bin: Option<usize>,
+    previous_peak_hz: Option<f64>,
     sample_rate: f64,
     fft_len: usize,
-) -> Result<usize> {
-    local_main_lobe_peak_bin(
+) -> Result<CascadePeak> {
+    let bin = local_main_lobe_peak_bin(
         analytic_peak_hz,
-        previous_peak_bin,
-        fft_len,
-        sample_rate,
-        |bin| Ok(passive.power[bin] * hpaf_power_at_bin(coefficients, bin, fft_len)),
-    )
-}
-
-fn peak_bin_from_impulse(
-    impulse: &[f64],
-    coefficients: &AcfCoef,
-    analytic_peak_hz: f64,
-    previous_peak_bin: Option<usize>,
-    sample_rate: f64,
-    fft_len: usize,
-) -> Result<usize> {
-    let mut passive_cache = HashMap::new();
-    local_main_lobe_peak_bin(
-        analytic_peak_hz,
-        previous_peak_bin,
+        previous_peak_hz,
         fft_len,
         sample_rate,
         |bin| {
-            let passive_power = if let Some(&power) = passive_cache.get(&bin) {
-                power
-            } else {
-                let power = passive_power_at_bin(impulse, bin, fft_len);
-                passive_cache.insert(bin, power);
-                power
-            };
-            Ok(passive_power * hpaf_power_at_bin(coefficients, bin, fft_len))
+            let passive_power = passive.power[bin];
+            if !passive_power.is_finite() || passive_power <= 0.0 {
+                return Err(Error::Numerical(
+                    "non-positive FIR response on the bandwidth peak bracketing grid".into(),
+                ));
+            }
+            let frequency = bin as f64 * sample_rate / fft_len as f64;
+            Ok(passive_power.ln()
+                + hpaf_log_power_and_derivative(coefficients, frequency, sample_rate)?.0)
         },
-    )
+    )?;
+    refine_main_lobe_peak(bin, fft_len, sample_rate, |frequency| {
+        cascade_log_power_and_derivative(&passive.impulse, coefficients, frequency, sample_rate)
+    })
 }
 
-fn passive_power_at_bin(impulse: &[f64], bin: usize, fft_len: usize) -> f64 {
-    let omega = 2.0 * std::f64::consts::PI * bin as f64 / fft_len as f64;
-    impulse
-        .iter()
-        .enumerate()
-        .fold(Complex64::new(0.0, 0.0), |sum, (sample, &value)| {
-            sum + Complex64::from_polar(value, -omega * sample as f64)
-        })
-        .norm_sqr()
+fn continuous_peak_from_impulse(
+    impulse: &[f64],
+    coefficients: &AcfCoef,
+    analytic_peak_hz: f64,
+    previous_peak_hz: Option<f64>,
+    sample_rate: f64,
+    fft_len: usize,
+) -> Result<CascadePeak> {
+    let mut log_power_cache = HashMap::new();
+    let bin = local_main_lobe_peak_bin(
+        analytic_peak_hz,
+        previous_peak_hz,
+        fft_len,
+        sample_rate,
+        |bin| {
+            if let Some(&log_power) = log_power_cache.get(&bin) {
+                return Ok(log_power);
+            }
+            let frequency = bin as f64 * sample_rate / fft_len as f64;
+            let log_power =
+                cascade_log_power_and_derivative(impulse, coefficients, frequency, sample_rate)?.0;
+            log_power_cache.insert(bin, log_power);
+            Ok(log_power)
+        },
+    )?;
+    refine_main_lobe_peak(bin, fft_len, sample_rate, |frequency| {
+        cascade_log_power_and_derivative(impulse, coefficients, frequency, sample_rate)
+    })
 }
 
-fn hpaf_power_at_bin(coefficients: &AcfCoef, bin: usize, fft_len: usize) -> f64 {
-    let omega = -2.0 * std::f64::consts::PI * bin as f64 / fft_len as f64;
-    let z1 = Complex64::from_polar(1.0, omega);
+fn kahan_add(sum: &mut f64, compensation: &mut f64, value: f64) {
+    let corrected = value - *compensation;
+    let next = *sum + corrected;
+    *compensation = (next - *sum) - corrected;
+    *sum = next;
+}
+
+fn fir_log_power_and_derivative(
+    impulse: &[f64],
+    frequency_hz: f64,
+    sample_rate: f64,
+) -> Result<(f64, f64)> {
+    if impulse.is_empty()
+        || !frequency_hz.is_finite()
+        || frequency_hz < 0.0
+        || frequency_hz > sample_rate / 2.0
+    {
+        return Err(Error::InvalidParameter(
+            "FIR DTFT evaluation requires a non-empty impulse and a finite frequency from DC through Nyquist"
+                .into(),
+        ));
+    }
+    let radians_per_hz = std::f64::consts::TAU / sample_rate;
+    let mut response_re = 0.0;
+    let mut response_im = 0.0;
+    let mut derivative_re = 0.0;
+    let mut derivative_im = 0.0;
+    let mut response_re_compensation = 0.0;
+    let mut response_im_compensation = 0.0;
+    let mut derivative_re_compensation = 0.0;
+    let mut derivative_im_compensation = 0.0;
+    for (sample, &coefficient) in impulse.iter().enumerate() {
+        let phase = radians_per_hz * frequency_hz * sample as f64;
+        let (sin, cos) = phase.sin_cos();
+        kahan_add(
+            &mut response_re,
+            &mut response_re_compensation,
+            coefficient * cos,
+        );
+        kahan_add(
+            &mut response_im,
+            &mut response_im_compensation,
+            -coefficient * sin,
+        );
+        let scale = coefficient * radians_per_hz * sample as f64;
+        kahan_add(
+            &mut derivative_re,
+            &mut derivative_re_compensation,
+            -scale * sin,
+        );
+        kahan_add(
+            &mut derivative_im,
+            &mut derivative_im_compensation,
+            -scale * cos,
+        );
+    }
+    let power = response_re.mul_add(response_re, response_im * response_im);
+    if !power.is_finite() || power <= 0.0 {
+        return Err(Error::Numerical(
+            "FIR DTFT power is not finite and positive near the selected main lobe".into(),
+        ));
+    }
+    let derivative = 2.0 * response_re.mul_add(derivative_re, response_im * derivative_im) / power;
+    if !derivative.is_finite() {
+        return Err(Error::Numerical(
+            "FIR DTFT log-power derivative is not finite near the selected main lobe".into(),
+        ));
+    }
+    Ok((power.ln(), derivative))
+}
+
+fn hpaf_log_power_and_derivative(
+    coefficients: &AcfCoef,
+    frequency_hz: f64,
+    sample_rate: f64,
+) -> Result<(f64, f64)> {
+    if coefficients.bz.dim() != (1, 3, 4)
+        || coefficients.ap.dim() != (1, 3, 4)
+        || !frequency_hz.is_finite()
+        || frequency_hz < 0.0
+        || frequency_hz > sample_rate / 2.0
+    {
+        return Err(Error::InvalidParameter(
+            "HP-AF DTFT evaluation requires one four-section filter and a finite frequency from DC through Nyquist"
+                .into(),
+        ));
+    }
+    let radians_per_hz = std::f64::consts::TAU / sample_rate;
+    let z1 = Complex64::from_polar(1.0, -radians_per_hz * frequency_hz);
     let z2 = z1 * z1;
-    let mut power = 1.0;
+    let derivative_factor = Complex64::new(0.0, -radians_per_hz);
+    let mut log_power = 0.0;
+    let mut derivative = 0.0;
     for section in 0..4 {
         let numerator = coefficients.bz[[0, 0, section]]
             + coefficients.bz[[0, 1, section]] * z1
@@ -1271,31 +1295,71 @@ fn hpaf_power_at_bin(coefficients: &AcfCoef, bin: usize, fft_len: usize) -> f64 
         let denominator = coefficients.ap[[0, 0, section]]
             + coefficients.ap[[0, 1, section]] * z1
             + coefficients.ap[[0, 2, section]] * z2;
-        power *= numerator.norm_sqr() / denominator.norm_sqr();
+        let numerator_derivative = derivative_factor
+            * (coefficients.bz[[0, 1, section]] * z1 + 2.0 * coefficients.bz[[0, 2, section]] * z2);
+        let denominator_derivative = derivative_factor
+            * (coefficients.ap[[0, 1, section]] * z1 + 2.0 * coefficients.ap[[0, 2, section]] * z2);
+        let numerator_power = numerator.norm_sqr();
+        let denominator_power = denominator.norm_sqr();
+        if !numerator_power.is_finite()
+            || numerator_power <= 0.0
+            || !denominator_power.is_finite()
+            || denominator_power <= 0.0
+        {
+            return Err(Error::Numerical(
+                "HP-AF DTFT contains a zero or non-finite section response".into(),
+            ));
+        }
+        log_power += numerator_power.ln() - denominator_power.ln();
+        derivative += 2.0
+            * ((numerator_derivative / numerator).re - (denominator_derivative / denominator).re);
     }
-    power
+    if !log_power.is_finite() || !derivative.is_finite() {
+        return Err(Error::Numerical(
+            "HP-AF DTFT log-power or its derivative is not finite".into(),
+        ));
+    }
+    Ok((log_power, derivative))
+}
+
+fn cascade_log_power_and_derivative(
+    impulse: &[f64],
+    coefficients: &AcfCoef,
+    frequency_hz: f64,
+    sample_rate: f64,
+) -> Result<(f64, f64)> {
+    let fir = fir_log_power_and_derivative(impulse, frequency_hz, sample_rate)?;
+    let hpaf = hpaf_log_power_and_derivative(coefficients, frequency_hz, sample_rate)?;
+    let value = (fir.0 + hpaf.0, fir.1 + hpaf.1);
+    if !value.0.is_finite() || !value.1.is_finite() {
+        return Err(Error::Numerical(
+            "implemented-cascade DTFT log-power or its derivative is not finite".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn local_main_lobe_peak_bin(
     analytic_peak_hz: f64,
-    previous_peak_bin: Option<usize>,
+    previous_peak_hz: Option<f64>,
     fft_len: usize,
     sample_rate: f64,
-    mut power_at_bin: impl FnMut(usize) -> Result<f64>,
+    mut log_power_at_bin: impl FnMut(usize) -> Result<f64>,
 ) -> Result<usize> {
-    if !analytic_peak_hz.is_finite() {
+    if !analytic_peak_hz.is_finite() || previous_peak_hz.is_some_and(|value| !value.is_finite()) {
         return Err(Error::Unsupported(
-            "the analytic seed for the discrete main-lobe search is not finite".into(),
+            "the continuous main-lobe search received a non-finite frequency hint".into(),
         ));
     }
     let last_bin = fft_len / 2;
     let analytic_bin = analytic_peak_hz / sample_rate * fft_len as f64;
+    let previous_bin = previous_peak_hz.map(|value| value / sample_rate * fft_len as f64);
     let mut current = analytic_bin.round().clamp(0.0, last_bin as f64) as usize;
     for _ in 0..=last_bin {
-        let current_power = power_at_bin(current)?;
+        let current_power = log_power_at_bin(current)?;
         if !current_power.is_finite() {
             return Err(Error::Numerical(
-                "non-finite implemented-cascade response on the bandwidth peak grid".into(),
+                "non-finite implemented-cascade response on the FFT bracketing grid".into(),
             ));
         }
         let mut best = (current, current_power);
@@ -1306,16 +1370,16 @@ fn local_main_lobe_peak_bin(
         .into_iter()
         .flatten()
         {
-            let power = power_at_bin(neighbor)?;
+            let power = log_power_at_bin(neighbor)?;
             if !power.is_finite() {
                 return Err(Error::Numerical(
-                    "non-finite implemented-cascade response on the bandwidth peak grid".into(),
+                    "non-finite implemented-cascade response on the FFT bracketing grid".into(),
                 ));
             }
             let preferred = |bin: usize| {
                 (
                     (bin as f64 - analytic_bin).abs(),
-                    previous_peak_bin.map_or(0, |previous| bin.abs_diff(previous)),
+                    previous_bin.map_or(0.0, |previous| (bin as f64 - previous).abs()),
                     bin,
                 )
             };
@@ -1324,19 +1388,113 @@ fn local_main_lobe_peak_bin(
             }
         }
         if best.0 == current {
+            if current == 0 || current == last_bin {
+                return Err(Error::Unsupported(
+                    "the intended implemented-cascade main lobe has no interior FFT-grid maximum"
+                        .into(),
+                ));
+            }
             return Ok(current);
         }
         current = best.0;
     }
     Err(Error::Numerical(
-        "discrete main-lobe peak search did not converge".into(),
+        "FFT-grid main-lobe search did not converge".into(),
     ))
 }
 
-fn verify_peak_bin(actual: usize, target: usize) -> Result<()> {
-    if actual != target {
+fn refine_main_lobe_peak(
+    peak_bin: usize,
+    fft_len: usize,
+    sample_rate: f64,
+    mut evaluate: impl FnMut(f64) -> Result<(f64, f64)>,
+) -> Result<CascadePeak> {
+    let spacing = sample_rate / fft_len as f64;
+    let selected = peak_bin as f64 * spacing;
+    let mut samples = Vec::new();
+    let selected_value = evaluate(selected)?;
+    if selected_value.1 == 0.0 {
+        return Ok(CascadePeak {
+            frequency_hz: selected,
+            log_power: selected_value.0,
+        });
+    }
+    samples.push((selected, selected_value.1));
+    let mut bracket = None;
+    for radius in 1..=MAXIMUM_PEAK_LOCK_ITERATIONS {
+        for subdivision in 1..=8 {
+            let offset = ((radius - 1) * 8 + subdivision) as f64 * spacing / 8.0;
+            for frequency in [selected - offset, selected + offset] {
+                if frequency <= 0.0 || frequency >= sample_rate / 2.0 {
+                    continue;
+                }
+                let derivative = evaluate(frequency)?.1;
+                if derivative == 0.0 {
+                    return Ok(CascadePeak {
+                        frequency_hz: frequency,
+                        log_power: evaluate(frequency)?.0,
+                    });
+                }
+                samples.push((frequency, derivative));
+            }
+        }
+        samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+        samples.dedup_by(|left, right| left.0 == right.0);
+        bracket = samples
+            .windows(2)
+            .filter(|pair| pair[0].1 > 0.0 && pair[1].1 < 0.0)
+            .min_by(|left, right| {
+                let left_distance = ((left[0].0 + left[1].0) * 0.5 - selected).abs();
+                let right_distance = ((right[0].0 + right[1].0) * 0.5 - selected).abs();
+                left_distance.total_cmp(&right_distance)
+            })
+            .map(|pair| (pair[0], pair[1]));
+        if bracket.is_some() {
+            break;
+        }
+    }
+    let (mut lower, mut upper) = bracket.ok_or_else(|| {
+        Error::Unsupported(
+            "could not bracket the continuous-DTFT derivative zero for the intended main lobe"
+                .into(),
+        )
+    })?;
+    for _ in 0..MAXIMUM_PEAK_LOCK_ITERATIONS {
+        let midpoint = lower.0 + (upper.0 - lower.0) * 0.5;
+        if midpoint == lower.0
+            || midpoint == upper.0
+            || upper.0 - lower.0 <= peak_search_tolerance_hz(sample_rate)
+        {
+            let result = evaluate(midpoint)?;
+            return Ok(CascadePeak {
+                frequency_hz: midpoint,
+                log_power: result.0,
+            });
+        }
+        let middle = evaluate(midpoint)?;
+        if middle.1 == 0.0 {
+            return Ok(CascadePeak {
+                frequency_hz: midpoint,
+                log_power: middle.0,
+            });
+        }
+        if middle.1 > 0.0 {
+            lower = (midpoint, middle.1);
+        } else {
+            upper = (midpoint, middle.1);
+        }
+    }
+    Err(Error::Numerical(
+        "continuous-DTFT main-lobe maximum did not converge within 128 iterations".into(),
+    ))
+}
+
+fn verify_peak_frequency(actual: f64, target: f64, sample_rate: f64) -> Result<()> {
+    let tolerance = peak_lock_tolerance_hz(sample_rate);
+    if !actual.is_finite() || !target.is_finite() || (actual - target).abs() > tolerance {
         return Err(Error::Unsupported(format!(
-            "bandwidth peak lock missed its DFT bin: {actual} versus {target}"
+            "bandwidth peak lock residual {} Hz exceeds the {tolerance} Hz tolerance",
+            actual - target
         )));
     }
     Ok(())
@@ -2479,6 +2637,139 @@ mod tests {
     use super::*;
     use crate::gcfb_v234::stream::{DcgcEvent, GcfbStream};
     use approx::assert_relative_eq;
+
+    fn value_only_cascade_log_power(
+        impulse: &[f64],
+        coefficients: &AcfCoef,
+        frequency_hz: f64,
+        sample_rate: f64,
+    ) -> f64 {
+        let omega = std::f64::consts::TAU * frequency_hz / sample_rate;
+        let fir = impulse.iter().enumerate().fold(
+            Complex64::new(0.0, 0.0),
+            |sum, (sample, &coefficient)| {
+                sum + coefficient * Complex64::from_polar(1.0, -omega * sample as f64)
+            },
+        );
+        let z1 = Complex64::from_polar(1.0, -omega);
+        let z2 = z1 * z1;
+        let mut log_power = fir.norm_sqr().ln();
+        for section in 0..4 {
+            let numerator = coefficients.bz[[0, 0, section]]
+                + coefficients.bz[[0, 1, section]] * z1
+                + coefficients.bz[[0, 2, section]] * z2;
+            let denominator = coefficients.ap[[0, 0, section]]
+                + coefficients.ap[[0, 1, section]] * z1
+                + coefficients.ap[[0, 2, section]] * z2;
+            log_power += numerator.norm_sqr().ln() - denominator.norm_sqr().ln();
+        }
+        log_power
+    }
+
+    #[test]
+    fn continuous_dtft_derivatives_match_centered_finite_differences() {
+        let sample_rate = 48_000.0;
+        let impulse = passive_impulse(1_200.0, sample_rate, 4.0, 1.81, -2.96).unwrap();
+        let coefficients =
+            make_asym_cmp_filters_v2(sample_rate, &[1_300.0], &[2.17], &[2.2]).unwrap();
+        let frequency = 1_050.25;
+        let step = 1e-3;
+
+        let fir = fir_log_power_and_derivative(&impulse, frequency, sample_rate).unwrap();
+        let fir_difference =
+            (fir_log_power_and_derivative(&impulse, frequency + step, sample_rate)
+                .unwrap()
+                .0
+                - fir_log_power_and_derivative(&impulse, frequency - step, sample_rate)
+                    .unwrap()
+                    .0)
+                / (2.0 * step);
+        assert_relative_eq!(fir.1, fir_difference, epsilon = 2e-9);
+
+        let hpaf = hpaf_log_power_and_derivative(&coefficients, frequency, sample_rate).unwrap();
+        let hpaf_difference =
+            (hpaf_log_power_and_derivative(&coefficients, frequency + step, sample_rate)
+                .unwrap()
+                .0
+                - hpaf_log_power_and_derivative(&coefficients, frequency - step, sample_rate)
+                    .unwrap()
+                    .0)
+                / (2.0 * step);
+        assert_relative_eq!(hpaf.1, hpaf_difference, epsilon = 2e-9);
+    }
+
+    #[test]
+    fn continuous_peak_matches_value_only_search_and_amplitude() {
+        let sample_rate = 48_000.0;
+        let carrier = 1_200.0;
+        let impulse = passive_impulse(carrier, sample_rate, 4.0, 1.81, -2.96).unwrap();
+        let fp1 = passive_peak_frequency(carrier, 4.0, 1.81, -2.96);
+        let ratio = 1.08;
+        let coefficients =
+            make_asym_cmp_filters_v2(sample_rate, &[ratio * fp1], &[2.17], &[2.2]).unwrap();
+        let analytic_peak = fr1_to_fp2(4.0, 1.81, -2.96, 2.17, 2.2, ratio, carrier)
+            .unwrap()
+            .0;
+        let peak = continuous_peak_from_impulse(
+            &impulse,
+            &coefficients,
+            analytic_peak,
+            None,
+            sample_rate,
+            MINIMUM_PEAK_GRID_FFT_LEN,
+        )
+        .unwrap();
+
+        let spacing = sample_rate / MINIMUM_PEAK_GRID_FFT_LEN as f64;
+        let mut lower = peak.frequency_hz - spacing;
+        let mut upper = peak.frequency_hz + spacing;
+        let golden = (5.0_f64.sqrt() - 1.0) * 0.5;
+        let mut left = upper - golden * (upper - lower);
+        let mut right = lower + golden * (upper - lower);
+        let mut left_value =
+            value_only_cascade_log_power(&impulse, &coefficients, left, sample_rate);
+        let mut right_value =
+            value_only_cascade_log_power(&impulse, &coefficients, right, sample_rate);
+        for _ in 0..128 {
+            if left_value < right_value {
+                lower = left;
+                left = right;
+                left_value = right_value;
+                right = lower + golden * (upper - lower);
+                right_value =
+                    value_only_cascade_log_power(&impulse, &coefficients, right, sample_rate);
+            } else {
+                upper = right;
+                right = left;
+                right_value = left_value;
+                left = upper - golden * (upper - lower);
+                left_value =
+                    value_only_cascade_log_power(&impulse, &coefficients, left, sample_rate);
+            }
+        }
+        let searched_peak = lower + (upper - lower) * 0.5;
+        assert!(
+            (peak.frequency_hz - searched_peak).abs() < 1e-5,
+            "derivative peak {} Hz versus value-only peak {} Hz",
+            peak.frequency_hz,
+            searched_peak
+        );
+        let value_only =
+            value_only_cascade_log_power(&impulse, &coefficients, peak.frequency_hz, sample_rate);
+        assert_relative_eq!(peak.log_power, value_only, epsilon = 2e-12);
+        let amplitude = (0.5 * peak.log_power).exp();
+        assert_relative_eq!(amplitude * amplitude, value_only.exp(), epsilon = 2e-12);
+    }
+
+    #[test]
+    fn continuous_root_rejects_an_unreachable_frequency() {
+        let error = continuous_frequency_root(1_000.0, 1_200.0, 48_000.0, "test parameter", |_| {
+            Ok(1_000.0)
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+    }
+
     #[test]
     fn nh_parameters_match_expected_health() {
         let p = GcParam {
@@ -2603,7 +2894,7 @@ mod tests {
                 assert_relative_eq!(
                     centers[ch],
                     batch.gc_resp.fr2[[ch, sample_index]],
-                    epsilon = 2e-10
+                    epsilon = peak_lock_tolerance_hz(batch.gc_param.fs)
                 );
             }
         }

@@ -329,8 +329,7 @@ bandwidth scale and keeps a bounded rolling target map. Once its normalization
 window is full, each input finalizes one oldest agreement, mask, and salience
 column. The individual scale steps remain immediate; consensus latency is one
 less than the resolved window length. `scale_metadata()` reports each scale's
-retuned passive carriers, measured nominal composite peaks, and the shared
-peak-grid FFT length and spacing.
+retuned passive carriers and measured continuous-DTFT nominal composite peaks.
 
 ```rust
 use gammachirp_rs::gcfb_v234::{
@@ -417,14 +416,15 @@ Each scale multiplies both coefficients of `b1`, every coefficient of `b2`, and
 `lvl_est.b2`; chirp, compression, level-control, hearing-loss, and target-grid
 parameters remain fixed. Each scaled analysis retunes its internal passive
 carriers so the implemented cosine-pGC FIR plus four-section digital HP-AF
-cascade has the same nominal main-lobe peak bin as the baseline. The peak is
-the grid-local maximum selected nearest the Python analytic peak, measured on
-one shared DFT grid of at least 65,536 points; `scale_metadata` reports that
-grid's FFT length and hertz spacing as well as the nominal measured bin
-frequencies. If any prepared passive impulse is too long, the whole ensemble
-moves to the next power-of-two grid. Thus "exact" means identical reported DFT
-bins at the stated control ratio, not identical continuous-DTFT maxima between
-bins.
+cascade has the same continuous-DTFT main-lobe peak frequency as the baseline.
+An internal FFT of at least 65,536 points locates the intended lobe nearest the
+analytic or previously tracked peak; compensated arbitrary-frequency DTFT sums
+and analytic HP-AF derivatives then bracket and bisect its continuous maximum.
+The FFT is only a bracketing aid, and `scale_metadata` reports the resulting
+continuous peak frequencies rather than grid information. If a maximum or
+matching root cannot be bracketed, or the final frequency residual exceeds
+`4096 * f64::EPSILON * max(sample_rate, 1)` Hz, preparation or processing
+returns an error instead of selecting a nearby FFT bin.
 
 In sample-dynamic mode, every scale keeps its own level history. At each
 coefficient update, a scaled filter solves for the peak of the unscaled
@@ -434,7 +434,8 @@ but it does not force equality with the simultaneously realized baseline peak:
 the baseline may have a different level-derived ratio. Consensus therefore
 treats controller-induced drift as bandwidth instability, and the analysis
 fails only when no positive sub-Nyquist center reaches the conditional target
-bin. This nonlinear behavior is a GCFB-specific extension of the paper's
+within that strict continuous-frequency tolerance. This nonlinear behavior is
+a GCFB-specific extension of the paper's
 fixed-bandwidth-window consensus. At 1 kHz and 50 dB, the endpoint scales produce
 composite-filter ERBs of approximately `0.81` and `1.19` times the baseline,
 bracketing the roughly 10% to 18% between-listener variation reported for normal

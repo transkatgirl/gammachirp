@@ -38,10 +38,12 @@
 //! `lvl_est.b2`). The target channel grid, chirp, compression, level control,
 //! and hearing-loss parameters stay fixed, while each scaled filter's internal
 //! passive carrier is retuned so its implemented cosine-pGC FIR plus digital
-//! HP-AF cascade has the same nominal main-lobe peak bin as the baseline on one
-//! shared, high-resolution DFT grid. Sample-dynamic filters retain independent
-//! level histories: at each update, a scaled filter matches the unscaled
-//! reference response evaluated at that scaled filter's own realized ratio.
+//! HP-AF cascade has the same continuous-DTFT main-lobe peak frequency as the
+//! baseline. A shared, high-resolution FFT only locates the intended lobe;
+//! peak measurement and retuning use arbitrary-frequency DTFT evaluations.
+//! Sample-dynamic filters retain independent level histories: at each update,
+//! a scaled filter matches the unscaled reference response evaluated at that
+//! scaled filter's own realized ratio.
 //! It does not necessarily match the simultaneously realized baseline peak, so
 //! controller-induced drift remains part of the consensus stability test.
 //! Batch complex and consensus analyses remain offline/acausal.
@@ -290,9 +292,9 @@ impl SparsityComparison {
 pub struct BandwidthConsensusConfig {
     /// Multipliers applied to `b1`, `b2`, and `lvl_est.b2`. At the nominal
     /// control ratio, each nonbaseline scale is rejected if retuning cannot
-    /// preserve the baseline discrete implemented-cascade peak bins on every
-    /// channel. Sample-dynamic locking is conditional on each scale's own
-    /// realized ratio.
+    /// preserve the baseline continuous implemented-cascade peak frequency on
+    /// every channel. Sample-dynamic locking is conditional on each scale's
+    /// own realized ratio.
     pub scales: Vec<f64>,
     /// A normalized scale map supports a bin only when it exceeds this value.
     pub relative_support_floor: f64,
@@ -308,16 +310,12 @@ pub struct BandwidthConsensusConfig {
 pub struct BandwidthScaleMetadata {
     /// Bandwidth multiplier used for this analysis.
     pub scale: f64,
-    /// Passive-gammachirp carrier frequencies after discrete-peak retuning.
+    /// Passive-gammachirp carrier frequencies after continuous-peak retuning.
     pub carrier_frequencies_hz: Array1<f64>,
-    /// Composite-filter peaks at the mode's nominal control ratio. These match
-    /// the baseline implemented-cascade peak bins across every successfully
-    /// prepared scale.
+    /// Continuous implemented-cascade peaks at the mode's nominal control
+    /// ratio. These match the baseline across every successfully prepared
+    /// scale.
     pub nominal_peak_frequencies_hz: Array1<f64>,
-    /// Shared DFT length on which implemented-cascade peak equality is exact.
-    pub peak_grid_fft_len: usize,
-    /// Frequency spacing of the shared peak grid.
-    pub peak_grid_spacing_hz: f64,
 }
 
 impl Default for BandwidthConsensusConfig {
@@ -340,7 +338,7 @@ pub struct BandwidthConsensusResult {
     pub analyses: Vec<PhaseReassignmentResult>,
     /// Index of the unique unscaled (`1.0`) analysis.
     pub baseline_index: usize,
-    /// Retuned carriers and nominal discrete peak-grid frequencies for every scale.
+    /// Retuned carriers and nominal continuous peak frequencies for every scale.
     pub scale_metadata: Vec<BandwidthScaleMetadata>,
     /// Fraction of normalized scale maps above the support floor per bin.
     pub agreement_map: Array2<f64>,
@@ -448,13 +446,14 @@ pub fn phase_reassign_gcfb_v234_with_config(
 /// Exactly one scale must be `1.0`; its phase analysis is computed from the
 /// returned, unscaled [`GcfbOutput`]. Other scales uniformly multiply `b1`,
 /// `b2`, and `lvl_est.b2`, then retune their internal passive carriers to keep
-/// the nominal baseline implemented-cascade peak bins on a shared DFT grid. In
+/// the nominal baseline implemented-cascade peak frequencies in the continuous
+/// DTFT. An internal FFT only locates each intended main lobe. In
 /// dynamic mode, the unscaled baseline also uses the peak-lock path. In
 /// sample-dynamic mode, every scale derives its ratio from its own level history
 /// and locks to the unscaled reference response evaluated at that same ratio.
 /// The realized baseline can have a different ratio and peak at the same sample.
-/// The call fails if any requested conditional bin has no finite, positive,
-/// below-Nyquist solution.
+/// The call fails if a main-lobe maximum or requested conditional lock cannot
+/// be bracketed and verified to the implementation's frequency tolerance.
 pub fn gcfb_v234_with_bandwidth_consensus(
     snd_in: &[f64],
     gc_param: GcParam,
@@ -483,7 +482,7 @@ pub fn gcfb_v234_with_bandwidth_consensus(
         let (analysis, metadata) = if index == baseline_index {
             (
                 phase_reassign_gcfb_v234_with_config(snd_in, &output, &config.reassignment_config)?,
-                bandwidth_scale_metadata(scale, &output, &nominal_peaks, &peak_grid),
+                bandwidth_scale_metadata(scale, &output, &nominal_peaks),
             )
         } else {
             let scaled_output = gcfb_v234_with_bandwidth_peak_lock(
@@ -498,7 +497,7 @@ pub fn gcfb_v234_with_bandwidth_consensus(
                     &scaled_output,
                     &config.reassignment_config,
                 )?,
-                bandwidth_scale_metadata(scale, &scaled_output, &nominal_peaks, &peak_grid),
+                bandwidth_scale_metadata(scale, &scaled_output, &nominal_peaks),
             )
         };
         scale_metadata.push(metadata);
@@ -527,14 +526,11 @@ fn bandwidth_scale_metadata(
     scale: f64,
     output: &GcfbOutput,
     nominal_peaks: &Array1<f64>,
-    peak_grid: &super::gcfb_v234::BandwidthPeakGrid,
 ) -> BandwidthScaleMetadata {
     BandwidthScaleMetadata {
         scale,
         carrier_frequencies_hz: output.gc_resp.fr1.clone(),
         nominal_peak_frequencies_hz: nominal_peaks.clone(),
-        peak_grid_fft_len: peak_grid.fft_len(),
-        peak_grid_spacing_hz: peak_grid.spacing_hz(),
     }
 }
 
@@ -1443,7 +1439,7 @@ mod tests {
 
     use super::*;
     use crate::gcfb_v234::gcfb_v234::{
-        cmprs_gc_frsp, discrete_cascade_peak_bins, fp2_to_fr1, fr1_to_fp2,
+        cmprs_gc_frsp, continuous_cascade_peak_frequencies, fp2_to_fr1, fr1_to_fp2,
         initial_asymmetric_ratio_and_centers,
     };
     use crate::gcfb_v234::{DynHpaf, GainReference, GcParam};
@@ -2270,26 +2266,15 @@ mod tests {
         assert_eq!(consensus.scale_metadata.len(), 3);
         let baseline_peaks =
             &consensus.scale_metadata[consensus.baseline_index].nominal_peak_frequencies_hz;
-        let peak_fft_len = consensus.scale_metadata[consensus.baseline_index].peak_grid_fft_len;
-        let peak_spacing = consensus.scale_metadata[consensus.baseline_index].peak_grid_spacing_hz;
-        assert!(peak_fft_len >= 65_536);
-        assert!(peak_fft_len.is_power_of_two());
-        assert_eq!(peak_spacing, sample_rate / peak_fft_len as f64);
         for (scale, metadata) in config.scales.iter().zip(&consensus.scale_metadata) {
             assert_eq!(*scale, metadata.scale);
             assert_eq!(metadata.nominal_peak_frequencies_hz, *baseline_peaks);
-            assert_eq!(metadata.peak_grid_fft_len, peak_fft_len);
-            assert_eq!(metadata.peak_grid_spacing_hz, peak_spacing);
-            assert!(
-                metadata
-                    .nominal_peak_frequencies_hz
-                    .iter()
-                    .all(|frequency| {
-                        let bin = frequency / peak_spacing;
-                        (bin - bin.round()).abs() <= f64::EPSILON * bin.abs().max(1.0)
-                    })
-            );
         }
+        let minimum_grid_spacing = sample_rate / 65_536.0;
+        assert!(baseline_peaks.iter().any(|frequency| {
+            let bin = frequency / minimum_grid_spacing;
+            (bin - bin.round()).abs() > 1e-6
+        }));
         assert_eq!(
             consensus.analyses[consensus.baseline_index]
                 .reassignment
@@ -2353,7 +2338,7 @@ mod tests {
         assert!(consensus_bins < consensus.consensus_mask.len());
     }
 
-    fn assert_fixed_mode_discrete_locks(parameters: GcParam, scales: &[f64]) {
+    fn assert_fixed_mode_continuous_locks(parameters: GcParam, scales: &[f64]) {
         let signal = [1.0, 0.0, 0.0, 0.0];
         let baseline = gcfb_v234(&signal, parameters.clone()).unwrap();
         let peak_grid =
@@ -2394,7 +2379,7 @@ mod tests {
                 ),
                 _ => unreachable!(),
             };
-            let target_bins = discrete_cascade_peak_bins(
+            let target_peaks = continuous_cascade_peak_frequencies(
                 &baseline.gc_param,
                 &baseline.gc_resp,
                 &baseline_centers,
@@ -2403,7 +2388,7 @@ mod tests {
                 peak_grid.fft_len(),
             )
             .unwrap();
-            let actual_bins = discrete_cascade_peak_bins(
+            let actual_peaks = continuous_cascade_peak_frequencies(
                 &scaled.gc_param,
                 &scaled.gc_resp,
                 &scaled_centers,
@@ -2412,14 +2397,17 @@ mod tests {
                 peak_grid.fft_len(),
             )
             .unwrap();
-            assert_eq!(actual_bins, target_bins);
+            let tolerance = 4096.0 * f64::EPSILON * baseline.gc_param.fs.max(1.0);
+            for (&actual, &target) in actual_peaks.iter().zip(&target_peaks) {
+                assert!((actual - target).abs() <= tolerance);
+            }
         }
     }
 
     #[test]
-    fn static_and_level_consensus_lock_the_discrete_cascade() {
+    fn static_and_level_consensus_lock_the_continuous_cascade() {
         for ctrl in [ControlMode::Static, ControlMode::Level] {
-            assert_fixed_mode_discrete_locks(
+            assert_fixed_mode_continuous_locks(
                 GcParam {
                     num_ch: 6,
                     out_mid_crct: "No".into(),
@@ -2432,8 +2420,8 @@ mod tests {
     }
 
     #[test]
-    fn valid_near_nyquist_consensus_has_no_discrete_peak_drift() {
-        assert_fixed_mode_discrete_locks(
+    fn valid_near_nyquist_consensus_has_no_continuous_peak_drift() {
+        assert_fixed_mode_continuous_locks(
             GcParam {
                 fs: 8_000.0,
                 num_ch: 5,
@@ -2499,7 +2487,7 @@ mod tests {
         )
         .unwrap();
         let mut ratio_histories_diverged = false;
-        let mut realized_peak_bins_diverged = false;
+        let mut realized_peaks_diverged = false;
         for sample in (0..signal.len()).step_by(scaled.gc_param.num_update_asym_cmp) {
             let scaled_ratios = scaled.gc_resp.frat_val.column(sample).to_owned();
             let realized_baseline_ratios = baseline.gc_resp.frat_val.column(sample);
@@ -2513,7 +2501,7 @@ mod tests {
             // baseline cascade at its independently derived ratio.
             let conditional_reference_centers = &scaled_ratios * &baseline.gc_resp.fp1;
             let scaled_centers = scaled.gc_resp.fr2.column(sample).to_owned();
-            let conditional_target_bins = discrete_cascade_peak_bins(
+            let conditional_target_peaks = continuous_cascade_peak_frequencies(
                 &baseline.gc_param,
                 &baseline.gc_resp,
                 &conditional_reference_centers,
@@ -2522,7 +2510,7 @@ mod tests {
                 fft_len,
             )
             .unwrap();
-            let actual_bins = discrete_cascade_peak_bins(
+            let actual_peaks = continuous_cascade_peak_frequencies(
                 &scaled.gc_param,
                 &scaled.gc_resp,
                 &scaled_centers,
@@ -2531,10 +2519,13 @@ mod tests {
                 fft_len,
             )
             .unwrap();
-            assert_eq!(actual_bins, conditional_target_bins);
+            let tolerance = 4096.0 * f64::EPSILON * baseline.gc_param.fs.max(1.0);
+            for (&actual, &target) in actual_peaks.iter().zip(&conditional_target_peaks) {
+                assert!((actual - target).abs() <= tolerance);
+            }
 
             let realized_baseline_centers = baseline.gc_resp.fr2.column(sample).to_owned();
-            let realized_baseline_bins = discrete_cascade_peak_bins(
+            let realized_baseline_peaks = continuous_cascade_peak_frequencies(
                 &baseline.gc_param,
                 &baseline.gc_resp,
                 &realized_baseline_centers,
@@ -2543,14 +2534,17 @@ mod tests {
                 fft_len,
             )
             .unwrap();
-            realized_peak_bins_diverged |= actual_bins != realized_baseline_bins;
+            realized_peaks_diverged |= actual_peaks
+                .iter()
+                .zip(&realized_baseline_peaks)
+                .any(|(&actual, &baseline)| (actual - baseline).abs() > tolerance);
             for held in sample + 1..(sample + scaled.gc_param.num_update_asym_cmp).min(signal.len())
             {
                 assert_eq!(scaled.gc_resp.fr2.column(held), scaled_centers.view());
             }
         }
         assert!(ratio_histories_diverged);
-        assert!(realized_peak_bins_diverged);
+        assert!(realized_peaks_diverged);
 
         let (locked_baseline, _) = gcfb_v234_with_bandwidth_consensus(
             &signal,
