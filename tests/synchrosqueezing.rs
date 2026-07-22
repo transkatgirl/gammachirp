@@ -137,6 +137,17 @@ fn batch_complex_and_energy_maps_scale_linearly_and_quadratically() {
 }
 
 #[test]
+fn subnormal_signals_keep_relative_floors_scale_safe() {
+    let signal = tone(700.0, 128, 1e-160);
+    let output = gcfb_v234(&signal, static_parameters()).unwrap();
+    let reassigned = reassign_gcfb_v234(&signal, &output).unwrap();
+    let squeezed = synchrosqueeze_gcfb_v234(&signal, &output).unwrap();
+
+    assert!(reassigned.source_energy > 0.0);
+    assert!(squeezed.source_energy > 0.0);
+}
+
+#[test]
 fn sample_dynamic_batch_is_conditional_and_energy_conserving() {
     let signal = tone(650.0, 256, 0.15);
     let (_, squeezed) = gcfb_v234_with_synchrosqueezing(&signal, sample_parameters()).unwrap();

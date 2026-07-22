@@ -1238,9 +1238,9 @@ fn apply_floor(
         if maximum <= 0.0 {
             continue;
         }
-        let threshold = relative_floor * maximum;
         for sample in 0..power.ncols() {
-            if power[[ch, sample]] >= threshold {
+            let sample_power = power[[ch, sample]];
+            if sample_power > 0.0 && sample_power / maximum >= relative_floor {
                 if !t_hat[[ch, sample]].is_finite() || !f_hat[[ch, sample]].is_finite() {
                     return Err(Error::Numerical(format!(
                         "non-finite reassignment coordinate above the coefficient floor at channel {ch}, sample {sample}"
@@ -1269,9 +1269,9 @@ fn apply_frequency_floor(
         if maximum <= 0.0 {
             continue;
         }
-        let threshold = relative_floor * maximum;
         for sample in 0..power.ncols() {
-            if power[[ch, sample]] >= threshold {
+            let sample_power = power[[ch, sample]];
+            if sample_power > 0.0 && sample_power / maximum >= relative_floor {
                 if !f_hat[[ch, sample]].is_finite() {
                     return Err(Error::Numerical(format!(
                         "non-finite synchrosqueezing frequency above the coefficient floor at channel {ch}, sample {sample}"
@@ -1960,6 +1960,23 @@ mod tests {
             coefficient_floor: 0.0,
         };
         assert!(reassign_gcfb_v234_with_config(&signal, &output, &config).is_err());
+    }
+
+    #[test]
+    fn relative_floors_are_scale_safe_for_subnormal_power() {
+        let power = array![[0.0, 1e-322, 1e-320]];
+        let time = array![[f64::NAN, f64::NAN, 0.25]];
+        let frequency = array![[f64::NAN, f64::NAN, 700.0]];
+        let expected = array![[false, false, true]];
+
+        assert_eq!(
+            apply_floor(&power, &time, &frequency, 0.1).unwrap(),
+            expected
+        );
+        assert_eq!(
+            apply_frequency_floor(&power, &frequency, 0.1).unwrap(),
+            expected
+        );
     }
 
     #[test]
